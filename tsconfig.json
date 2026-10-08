@@ -1,0 +1,29 @@
+/*
+ *   Copyright (c) 2026 妙码学院 @Heyi
+ *   All rights reserved.
+ *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
+ */
+{
+    "compilerOptions": {
+        "alwaysStrict": false,
+        "declaration": true,
+        "declarationMap": true,
+        "downlevelIteration": true,
+        "importHelpers": true,
+        "inlineSources": true,
+        "isolatedModules": true,
+        "lib": ["ESNext"],
+        "moduleResolution": "bundler",
+        "noErrorTruncation": true,
+        "noFallthroughCasesInSwitch": true,
+        "noImplicitReturns": true,
+        "noUnusedLocals": false,
+        "noUnusedParameters": false,
+        "preserveWatchOutput": true,
+        "sourceMap": true,
+        "strict": true,
+        "strictBindCallApply": false,
+        "target": "esnext",
+        "noUncheckedIndexedAccess": true
+    }
+}

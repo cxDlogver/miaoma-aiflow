@@ -1,0 +1,257 @@
+{
+  "folderUrl": "https://u19tul1sz9g.feishu.cn/drive/folder/KR3Yfz3t3lsrbmd9JDlczHlKnNe",
+  "exportedAt": "2026-07-27T03:23:33.409Z",
+  "items": [
+    {
+      "created_time": "1767881560",
+      "modified_time": "1783087751",
+      "name": "企业级类扣子、Dify AI 应用引擎架构设计与实践面试专项突击",
+      "owner_id": "ou_c13b25bb19ad52c54e041d576e6ef731",
+      "parent_token": "KR3Yfz3t3lsrbmd9JDlczHlKnNe",
+      "token": "CfiJdvsMuo39FHx0Pccc7KESnXf",
+      "type": "docx",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/CfiJdvsMuo39FHx0Pccc7KESnXf",
+      "path": "企业级类扣子、Dify AI 应用引擎架构设计与实践面试专项突击"
+    },
+    {
+      "created_time": "1767331208",
+      "modified_time": "1783054015",
+      "name": "1.需求分析、项目架构设计与工作流引擎编辑器核心剖析",
+      "owner_id": "ou_c13b25bb19ad52c54e041d576e6ef731",
+      "parent_token": "KR3Yfz3t3lsrbmd9JDlczHlKnNe",
+      "token": "ZXrRdsyYxoMKGHxyNUHcZh62nBc",
+      "type": "docx",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/ZXrRdsyYxoMKGHxyNUHcZh62nBc",
+      "path": "1.需求分析、项目架构设计与工作流引擎编辑器核心剖析"
+    },
+    {
+      "created_time": "1767338529",
+      "modified_time": "1780121134",
+      "name": "2.大模型基础、LangChainjs 与 Langgraphjs 框架进阶",
+      "owner_id": "ou_c13b25bb19ad52c54e041d576e6ef731",
+      "parent_token": "KR3Yfz3t3lsrbmd9JDlczHlKnNe",
+      "token": "LackdM0PUofJBKx2qqec4nnEnze",
+      "type": "docx",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/LackdM0PUofJBKx2qqec4nnEnze",
+      "path": "2.大模型基础、LangChainjs 与 Langgraphjs 框架进阶"
+    },
+    {
+      "created_time": "1767881459",
+      "modified_time": "1768202741",
+      "name": "3.AI 工作流引擎编辑器与执行器架构设计与实践",
+      "owner_id": "ou_c13b25bb19ad52c54e041d576e6ef731",
+      "parent_token": "KR3Yfz3t3lsrbmd9JDlczHlKnNe",
+      "token": "AlyEdYv3uogG5hxbnbOcHi67nSh",
+      "type": "docx",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/AlyEdYv3uogG5hxbnbOcHi67nSh",
+      "path": "3.AI 工作流引擎编辑器与执行器架构设计与实践"
+    },
+    {
+      "created_time": "1767881486",
+      "modified_time": "1768202736",
+      "name": "4.AI 工作流引擎日志、AI API 服务化与 AI 应用开发部署实践",
+      "owner_id": "ou_c13b25bb19ad52c54e041d576e6ef731",
+      "parent_token": "KR3Yfz3t3lsrbmd9JDlczHlKnNe",
+      "token": "QapEdfvMpo8CIOxOo5wcH3Q9n0e",
+      "type": "docx",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/QapEdfvMpo8CIOxOo5wcH3Q9n0e",
+      "path": "4.AI 工作流引擎日志、AI API 服务化与 AI 应用开发部署实践"
+    }
+  ],
+  "exported": [
+    {
+      "name": "企业级类扣子、Dify AI 应用引擎架构设计与实践面试专项突击",
+      "type": "docx",
+      "token": "CfiJdvsMuo39FHx0Pccc7KESnXf",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/CfiJdvsMuo39FHx0Pccc7KESnXf",
+      "path": "企业级类扣子、Dify AI 应用引擎架构设计与实践面试专项突击",
+      "file": "企业级类扣子、Dify AI 应用引擎架构设计与实践面试专项突击.md",
+      "bytes": 22655,
+      "headingCount": 36,
+      "tableLineCount": 0,
+      "codeFenceMarkers": 2,
+      "hasMedia": true,
+      "mediaCounts": {
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0,
+        "sheet": 0,
+        "bitable": 0,
+        "readonlyBlock": 1,
+        "mermaid": 1,
+        "catalog": 0,
+        "markdownImage": 0,
+        "renderedSvg": 0
+      },
+      "mermaidBlockCount": 1,
+      "markdownImageCount": 0,
+      "residualTags": {
+        "callout": 0,
+        "cite": 0,
+        "readonlyBlock": 0,
+        "title": 0,
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0
+      }
+    },
+    {
+      "name": "1.需求分析、项目架构设计与工作流引擎编辑器核心剖析",
+      "type": "docx",
+      "token": "ZXrRdsyYxoMKGHxyNUHcZh62nBc",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/ZXrRdsyYxoMKGHxyNUHcZh62nBc",
+      "path": "1.需求分析、项目架构设计与工作流引擎编辑器核心剖析",
+      "file": "1.需求分析、项目架构设计与工作流引擎编辑器核心剖析.md",
+      "bytes": 51016,
+      "headingCount": 84,
+      "tableLineCount": 59,
+      "codeFenceMarkers": 58,
+      "hasMedia": true,
+      "mediaCounts": {
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0,
+        "sheet": 0,
+        "bitable": 0,
+        "readonlyBlock": 7,
+        "mermaid": 6,
+        "catalog": 1,
+        "markdownImage": 0,
+        "renderedSvg": 0
+      },
+      "mermaidBlockCount": 6,
+      "markdownImageCount": 0,
+      "residualTags": {
+        "callout": 0,
+        "cite": 0,
+        "readonlyBlock": 0,
+        "title": 0,
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0
+      }
+    },
+    {
+      "name": "2.大模型基础、LangChainjs 与 Langgraphjs 框架进阶",
+      "type": "docx",
+      "token": "LackdM0PUofJBKx2qqec4nnEnze",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/LackdM0PUofJBKx2qqec4nnEnze",
+      "path": "2.大模型基础、LangChainjs 与 Langgraphjs 框架进阶",
+      "file": "2.大模型基础、LangChainjs 与 Langgraphjs 框架进阶.md",
+      "bytes": 74263,
+      "headingCount": 118,
+      "tableLineCount": 118,
+      "codeFenceMarkers": 120,
+      "hasMedia": true,
+      "mediaCounts": {
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0,
+        "sheet": 0,
+        "bitable": 0,
+        "readonlyBlock": 14,
+        "mermaid": 13,
+        "catalog": 1,
+        "markdownImage": 0,
+        "renderedSvg": 0
+      },
+      "mermaidBlockCount": 13,
+      "markdownImageCount": 0,
+      "residualTags": {
+        "callout": 0,
+        "cite": 0,
+        "readonlyBlock": 0,
+        "title": 0,
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0
+      }
+    },
+    {
+      "name": "3.AI 工作流引擎编辑器与执行器架构设计与实践",
+      "type": "docx",
+      "token": "AlyEdYv3uogG5hxbnbOcHi67nSh",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/AlyEdYv3uogG5hxbnbOcHi67nSh",
+      "path": "3.AI 工作流引擎编辑器与执行器架构设计与实践",
+      "file": "3.AI 工作流引擎编辑器与执行器架构设计与实践.md",
+      "bytes": 73670,
+      "headingCount": 87,
+      "tableLineCount": 28,
+      "codeFenceMarkers": 100,
+      "hasMedia": true,
+      "mediaCounts": {
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0,
+        "sheet": 0,
+        "bitable": 0,
+        "readonlyBlock": 11,
+        "mermaid": 10,
+        "catalog": 1,
+        "markdownImage": 0,
+        "renderedSvg": 0
+      },
+      "mermaidBlockCount": 10,
+      "markdownImageCount": 0,
+      "residualTags": {
+        "callout": 0,
+        "cite": 0,
+        "readonlyBlock": 0,
+        "title": 0,
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0
+      }
+    },
+    {
+      "name": "4.AI 工作流引擎日志、AI API 服务化与 AI 应用开发部署实践",
+      "type": "docx",
+      "token": "QapEdfvMpo8CIOxOo5wcH3Q9n0e",
+      "url": "https://u19tul1sz9g.feishu.cn/docx/QapEdfvMpo8CIOxOo5wcH3Q9n0e",
+      "path": "4.AI 工作流引擎日志、AI API 服务化与 AI 应用开发部署实践",
+      "file": "4.AI 工作流引擎日志、AI API 服务化与 AI 应用开发部署实践.md",
+      "bytes": 64150,
+      "headingCount": 74,
+      "tableLineCount": 0,
+      "codeFenceMarkers": 54,
+      "hasMedia": true,
+      "mediaCounts": {
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0,
+        "sheet": 0,
+        "bitable": 0,
+        "readonlyBlock": 3,
+        "mermaid": 2,
+        "catalog": 1,
+        "markdownImage": 0,
+        "renderedSvg": 0
+      },
+      "mermaidBlockCount": 2,
+      "markdownImageCount": 0,
+      "residualTags": {
+        "callout": 0,
+        "cite": 0,
+        "readonlyBlock": 0,
+        "title": 0,
+        "img": 0,
+        "source": 0,
+        "whiteboard": 0
+      }
+    }
+  ],
+  "skipped": [],
+  "repairedAt": "2026-07-27T03:48:05.625Z",
+  "repairNotes": [
+    "Feishu readonly-block add-on blocks were queried through Docx Block API.",
+    "Mermaid add-on records were converted to standard fenced mermaid Markdown blocks.",
+    "Catalog add-on records were converted to Markdown heading lists.",
+    "Feishu-specific tags such as cite/callout/readonly-block/title were removed outside fenced code blocks."
+  ],
+  "assetsDir": null,
+  "mermaidRenderedAt": "2026-07-27T03:58:36.303Z",
+  "cleanupNotes": [
+    "Duplicate SVG image references were removed because the adjacent Mermaid workflow code is the canonical source.",
+    "The Markdown files now keep Mermaid workflow code blocks only for those diagrams."
+  ]
+}
