@@ -1,8 +1,9 @@
 # RAG 检索能力评测与证据标注源码学习记录
 
-## 【文档定位与讨论规则】
+## 【文档定位与知识链路】
 
-本篇是《[RAG 知识库构建与向量检索源码学习记录](./RAG知识库构建与向量检索源码学习记录.md)》后续的**项目分析与面试讨论记录**，以已经掌握的文档切分、Embedding、Qdrant 向量存储、HNSW 与 Top-K 为基础，研究如何为 RAG 检索建立可验证的质量基线。采用“问题背景 → 知识概述 → 运行机制 → 数据示例 → 真实项目链路 → 验证与边界 → 标准回答”的写法。每次只归档**已讨论并确认的一个问题**；下一题先在对话中讨论，不提前把猜测、提问提纲或中间分析写成既定结论。
+
+本篇是《[RAG 知识库构建与向量检索源码学习记录](./RAG知识库构建与向量检索源码学习记录.md)》后续的**项目分析与面试讨论记录**，以已经掌握的文档切分、Embedding、Qdrant 向量存储、HNSW 与 Top-K 为基础，研究如何为 RAG 检索建立可验证的质量基线。按照知识点自身的需要保留完整原理、公式推导、具体示例、真实项目链路、验收和面试回答，**不强制每个知识点使用相同排版**。历史单题讨论被重组为连续的知识链路，完整保留已讨论的问题与回答；尚未讨论的方向仍不预先编造标准答案。
 
 原理和方法应脱离项目独立成立；**妙码 AI Flow** 的业务上下文、源码与实现现状仅在相应节点作实战验证。源码的存在只能证明该功能已实现，不能自动证明检索指标达标。涉及项目的未实现部分明确标为**建议方案**，未执行的数值例子明确标为**教学示例**，不虚构实验数据。
 
@@ -10,11 +11,18 @@
 
 - [RAG 与知识库工程完整知识体系](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)：离线知识供给、在线检索生成、评测反馈和横切治理的完整主线。
 - [向量知识表示、存储与索引完整链路](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/X-向量知识表示存储与索引完整链路.md)：Chunking、Embedding、向量距离、HNSW、Payload Filter 和 Segment 聚合的通用机制。
-- 本篇聚焦**如何定义正确证据、怎样得到检索评测基线、如何解释不同失效层**。混合检索、Rerank、答案忠实度等专项尚未完整展开，不会为了凑齐体系而假定已经掌握或实现。
+- 本篇已沿着**正确证据与 Ground Truth → 检索索引 → 在线召回和权限过滤 → RRF/Rerank → Context Construction → Evidence Verifier 与受控补检 → 质量归因**展开完整讨论。最终生成答案的 Faithfulness、Answer Correctness 和 Citation Accuracy 仍保留为下一轮研究方向；不将建议设计或尚未完成的评测冒充已落地功能。
 
-## 【第一题：如何定义 RAG 检索能力，并判断知识库是否真正找到了正确证据】
+## 【一、RAG 检索的目标与评价基础】
 
-### 【提问与知识目标】
+先明确“找到正确证据”到底意味着什么，再构建可审核的 Ground Truth，最后学习 Hit、Recall、Precision、MRR 与 nDCG 如何分别衡量候选覆盖和排序质量。
+
+### 【1.1 检索能力、证据相关性与正确证据】
+
+*原讨论问题：如何定义 RAG 检索能力，并判断知识库是否真正找到了正确证据*
+
+
+#### 【提问与知识目标】
 
 我们已掌握的一条典型向量检索链路是：
 
@@ -36,7 +44,7 @@ Top-K：返回最多 K 条排序后的 Chunk 候选
 
 本题只为**现有向量检索**建立可重复评测的最小基础，不要求先完成 BM25、Hybrid Search、Rerank 或完整 RAG 自动评测平台。
 
-### 【知识概述：检索能力应同时考虑相关性、覆盖性、有效性和效率】
+#### 【知识概述：检索能力应同时考虑相关性、覆盖性、有效性和效率】
 
 定义：RAG 检索能力是系统在给定的知识范围、用户问题、身份和资源约束下，能否找到足以支持回答的有效证据，并以可接受的查询开销返回。
 
@@ -57,7 +65,7 @@ Top-K：返回最多 K 条排序后的 Chunk 候选
 
 若 `TopK=2`，系统返回 A/B，可能完全符合向量距离排序，但没有包含 C。**向量检索在当前索引距离定义下排序正确，不等于业务证据召回成功。**这组分数为解释机制而假设，不是模型真实运行结果。
 
-### 【Ground Truth、Qrels 与评测集的输入输出】
+#### 【Ground Truth、Qrels 与评测集的输入输出】
 
 Ground Truth 是评测所使用的参考真值；用于检索相关性评价时，通常存成**问题与证据项之间的相关性标注（Qrels，Query Relevance Judgments）**。标签可为二元的相关/不相关，也可使用 0、1、2 等分级相关性。NIST TREC 明确把相关性标注视为检索评测集合的重要组成部分，Qdrant 的检索相关性指南也采用查询与预期相关文档配对的标注集合。参见文末资料 [1][2]。
 
@@ -108,7 +116,7 @@ Ground Truth 是评测所使用的参考真值；用于检索相关性评价时�
 
 关键不变量：**评测语料、标注 ID、查询身份/权限、知识库版本与实际检索环境必须匹配**。不能在标注依据是 v1 文档时，对随时更新的 v3 文档直接比较相同的 Chunk ID 得分。NIST TREC 也强调检索语料与 Qrels 的一致性，参见 [1]。
 
-### 【Hit、Recall 与证据完整性如何区分】
+#### 【Hit、Recall 与证据完整性如何区分】
 
 仍以 q2 为例：
 
@@ -133,7 +141,7 @@ Ground Truth：{C1, C2}
 
 **Document 粒度与 Chunk 粒度需要区分：**如果返回的是“员工休假制度”中的病假片段，而问题问年假时限，Document-level 命中可能为真，但 Chunk-level 相关性应为假。应该根据实际下游消费的是文件、段落还是证据集合，明确评价单位。
 
-### 【项目实践：妙码 AI Flow 目前已经具备哪些基础数据】
+#### 【项目实践：妙码 AI Flow 目前已经具备哪些基础数据】
 
 业务上下文：系统从文档处理模块得到 Chunk 和对应 Embedding，写入 Qdrant 中的 `knowledge_chunks` Collection；用户问题在线生成 Query Vector 后，经 Retriever/VectorStore 搜索得到 Chunk 候选，交给后续工作流。此处关注**向量存储搜索接口返回的可验证证据 ID**，不假定应用已接入完整评测模块。
 
@@ -174,7 +182,7 @@ const response = await this.client.search(this.collectionName, {
 4. 如更换 Chunking 或重新入库，`document-processor.ts` 使用 `documentId + index` 构造 Chunk ID；索引位置可能变化，必须重新对齐标注，不能把跨版本 ID 相同当成同一事实。
 5. Qdrant 返回的 `score` 是向量相关性信号，**不是标注的业务相关性分数**。
 
-### 【最小评测方法：先用现有 VectorStore 建立基线】
+#### 【最小评测方法：先用现有 VectorStore 建立基线】
 
 **建议方案（未实施）**：先独立保存测试案例，不改动业务检索逻辑；以可复现的固定文档/模型/索引版本运行，记录每次搜索的实际 Chunk 排名。最小测试用例可以采用：
 
@@ -224,7 +232,7 @@ Hit@3 = 1；Evidence Recall@3 = 1
 
 这证明同一有序候选在不同 K 下会得到不同结果，**不是实际项目跑出的测试数据**。
 
-### 【诊断边界：精确向量近邻与业务参考证据不应混为一谈】
+#### 【诊断边界：精确向量近邻与业务参考证据不应混为一谈】
 
 当正确证据没有进入 Top-K，应按输入→处理→输出顺序追查：
 
@@ -242,13 +250,13 @@ Hit@3 = 1；Evidence Recall@3 = 1
 
 假设 HNSW 与 Exact kNN 完全一致，但它们都优先返回“年假申请入口”和“年假审批人”，漏掉“提前三个工作日”。ANN Recall@K 可能是 100%，Evidence Recall@K 却仍然不足。此时不能靠继续调 `hnsw_ef` 从根本上修复业务语义表示问题。Qdrant 将这两类评测明确分层，参见资料 [2][3]。
 
-### 【实践边界与下一步验收】
+#### 【实践边界与下一步验收】
 
 目前可以完成**独立的基础检索相关性评测**，但尚不能用它直接断言完整 RAG 系统的答案忠实度、业务成功率或生成质量。那些能力要求额外捕获模型实际收到的上下文和最终输出。
 
 评测集的基本质量门禁应包括：真实且多样的查询、准确的参考证据、标注粒度一致、源文档版本可追溯、用户权限匹配。对于未标注的候选，**“没有列在 Qrels 中”不必然等于人工确认不相关**：真实大语料很难穷举全部相关文档，应通过多路检索结果池化、人工复核与补标逐步提高 Ground Truth 覆盖。对精确编号、多证据、否定、过期文件、无答案查询应单独查看失败案例，避免平均分掩盖问题。
 
-### 【面试标准回答】
+#### 【面试标准回答】
 
 RAG 检索评测首先要明确评价的不是向量距离本身，而是用户问题与所需证据之间的相关性。应先构建 Query—Evidence 的 Ground Truth/Qrels，声明评价粒度是 Document、Chunk 还是原子事实及证据集合，再在固定知识库版本、权限范围和检索配置下执行查询，形成有序结果 Run。
 
@@ -256,7 +264,7 @@ RAG 检索评测首先要明确评价的不是向量距离本身，而是用户�
 
 最后要分开 ANN Recall 与业务 Evidence Recall：前者以精确向量 Top-K 为基准，衡量近似索引误差；后者以人工证据标注为基准，判断检索是否真正满足业务问题。这样才能确定问题出在知识源、切分、语义表示、索引近似、排序还是下游证据使用，而不是盲目增大 Top-K 或修改 HNSW 参数。
 
-### 【本轮权威依据与项目源码】
+#### 【本轮权威依据与项目源码】
 
 1. NIST TREC：[Relevance Judgments](https://trec.nist.gov/data/reljudge_eng.html)。相关性标注与检索语料/问题的匹配原则。
 2. Qdrant：[Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/)。Gold Query Set、Qrels/Run、文档/片段标注与检索相关性评价。
@@ -266,377 +274,18 @@ RAG 检索评测首先要明确评价的不是向量距离本身，而是用户�
 
 ---
 
-## 【第二题：Recall@K、Precision@K、Hit@K、MRR 与 nDCG 分别衡量什么】
+### 【1.2 Ground Truth、Qrels 与必要事实标注】
 
-### 【提问与知识目标】
+*原讨论问题：如何构建可靠的 RAG Ground Truth 评测数据集*
 
-上一题已经建立：给定查询 Query、人工标注的正确证据集合 Ground Truth/Qrels，以及按得分排序的检索结果 Run，可以判断系统是否检索到了有效证据。本题进一步讨论：为什么不能只用一个分数衡量所有检索能力，**候选覆盖、无关噪声与排序先后**应分别用什么指标观察？
 
-统一教学场景：员工提问“年假需要提前多久申请、由谁审批？”；假设资料已经审核，正确证据分别为 C1（提前三个工作日申请）和 C2（由直属主管审批）。某检索器的有序结果为：
-
-| 名次 | Chunk ID | 内容（简写） | 二元相关性 |
-|---:|---|---|---:|
-| 1 | C3 | 年假申请入口 | 0 |
-| 2 | C1 | 年假申请时限 | 1 |
-| 3 | C4 | 病假医疗证明 | 0 |
-| 4 | C2 | 年假审批人 | 1 |
-| 5 | C5 | 考勤打卡规则 | 0 |
-
-~~~text
-Ground Truth（正确证据）：{C1, C2}
-Run（实际排序）：[C3, C1, C4, C2, C5]
-~~~
-
-以下计算全部基于这组**教学数据**，不是项目运行结果；在没有其他相关证据且标注完备的假设下，Ground Truth 的正确证据数是 2。现实中还应考虑未标注但同样正确的替代证据。
-
-### 【知识概述：五种指标在回答不同问题】
-
-| 指标 | 实际判断 | 适用重点 | 无法单独证明什么 |
-|---|---|---|---|
-| Hit@K | 前 K 条有没有至少一条正确结果 | FAQ、单答案/至少一次命中 | 多证据问题是否找齐 |
-| Recall@K | 全部正确证据中找到了多少 | 候选召回阶段，避免漏证据 | 排序是否靠前、噪声多少 |
-| Precision@K | 返回的前 K 条有多少是相关的 | 候选噪声/有限上下文利用 | 有没有找齐语料中的所有证据 |
-| RR / MRR | 第一条正确证据的位置是否靠前 | 单答案、用户优先使用首条 | 第二、第三条必要证据在哪里 |
-| nDCG@K | 重要证据是否排在前面、整体排序是否接近理想 | 重排、融合、分级相关性 | 数据未入库或事实是否正确 |
-
-**K 是同一运行结果的前缀截断深度，不是 HNSW 的 `hnsw_ef` 或 Embedding 维度**。初始检索可能返回 50 条候选，而最终送入 LLM 的只有 5 条，因此两阶段应分别评价 `Recall@50` 和 `Context 证据覆盖@5`，不能用前者代替后者。
-
-### 【Hit@K：前 K 条有没有任何一条正确证据】
-
-对单个 Query：
-
-~~~text
-Hit@K(q) = 1，前 K 条至少出现一条相关证据
-Hit@K(q) = 0，否则
-~~~
-
-示例：Top-1 只有无关的 C3，故 `Hit@1=0`；Top-2 有 C1，`Hit@2=1`；Top-3 与 Top-5 依然为 1。
-
-如果存在 100 个 Query，其中 80 个 Query 的 Top-5 至少包含一条相关证据，则 `Hit Rate@5=80/100=80%`。它直观但不能表示多证据问题找得够不够完整：对当前场景 `Hit@2=1`，尽管 C2 完全没出现。
-
-### 【Recall@K：标注的全部正确证据被覆盖多少】
-
-对单个 Query，在二元标注、按唯一证据 ID 计算的条件下：
-
-~~~text
-Evidence Recall@K(q)
- = |TopK(q) ∩ Relevant(q)| / |Relevant(q)|
-~~~
-
-示例结果：
-
-| K | 前 K 条的相关证据数 | Ground Truth 总数 | Recall@K |
-|---:|---:|---:|---:|
-| 1 | 0 | 2 | 0% |
-| 2 | 1 | 2 | 50% |
-| 3 | 1 | 2 | 50% |
-| 4 | 2 | 2 | 100% |
-| 5 | 2 | 2 | 100% |
-
-这说明检索深度为 3 时，只覆盖了“申请时限”，未覆盖“审批人”，不能完整回答问题。
-
-**为何第一阶段应重视 Recall？**检索器没有返回的证据，后续仅作用于已有候选的 Reranker 无法恢复。提高 Top-K 可能改善覆盖，但也会增加候选噪声与计算成本，不能只凭更高 K 声称质量更好。
-
-**边界**：若查询没有任何相关证据，分母为零，普通 Recall 公式不适用，应把无答案识别、拒答和误召回作为独立评测目标；若存在很多等价证据，必须先规定文档/Chunk/事实的去重与标签口径。
-
-### 【Precision@K：前 K 条中有多少条真正相关】
-
-~~~text
-Precision@K(q)
- = |TopK(q) ∩ Relevant(q)| / K
-~~~
-
-示例：
-
-- `Precision@2 = 1/2 = 50%`。
-- `Precision@3 = 1/3 ≈ 33.3%`。
-- `Precision@5 = 2/5 = 40%`。
-
-Top-3 比 Top-2 额外加入了无关的病假内容，召回仍为 50%，但 Precision 反而下降。这表示候选噪声增加，而不是检索进步。
-
-如果实际返回少于 K 条，某些评测实现仍按固定 K 作分母，另一些报告实际结果条数；必须**写清评测工具的计算口径**，否则相同 Run 也可能得出不同 Precision。
-
-Precision 可以间接反映“塞给模型多少不相干文本”，但不直接等于最终 Prompt 的利用效率：去重、父子扩展、压缩或上下文裁剪会改变真正进入 LLM 的材料。
-
-### 【MRR：第一条正确结果排在第几名】
-
-单个 Query 使用 **RR（Reciprocal Rank，倒数排名）**：
-
-~~~text
-RR(q) = 1 / rank_firstRelevant(q)
-
-没有任何正确结果进入本次评测范围时，该查询的 RR 记为 0。
-MRR = (所有 Query 的 RR 之和) / Query 总数
-~~~
-
-示例的首条正确证据 C1 在第 2 名，因此 `RR(q)=1/2=0.5`。如果另一条 Query 首条正确证据排第 1，`RR=1`；两条 Query 的 `MRR=(0.5+1)/2=0.75`。
-
-若采用截断 `MRR@K`，只有 Top-K 内出现的首条正确结果才贡献分数；当前示例 `RR@1=0`、`RR@2=0.5`。单个 Query 的结果应称 RR，不要把一个查询的 0.5 错称“MRR=0.5”。
-
-**适用边界**：MRR 适合用户只需要一条答案或只看第一条搜索结果的场景；但对于“申请时限+审批人”这样必须找齐两条事实的问题，MRR 在找到 C1 后不再关注 C2，所以不应单独作为能力目标。
-
-### 【nDCG@K：同时考虑相关性等级与结果位置】
-
-nDCG（Normalized Discounted Cumulative Gain）先给每条候选标注相关性等级，再对后面名次施加折损。常见、但非唯一的增益定义：
-
-~~~text
-DCG@K = Σ[ (2^rel_i - 1) / log2(i+1) ]，i 从 1 到 K
-IDCG@K = 相同相关性标签在理想排序下的 DCG@K
-nDCG@K = DCG@K / IDCG@K
-~~~
-
-假设人工把 C1 标为“高度相关”（`rel=2`）、C2 标为“相关”（`rel=1`），其余为无关（`rel=0`）。当前排序 `[C3, C1, C4, C2, C5]` 的实际增益为：
-
-| 排名 | Chunk | rel | 增益/折损贡献 |
-|---:|---|---:|---:|
-| 1 | C3 | 0 | 0 |
-| 2 | C1 | 2 | `3/log2(3) ≈ 1.893` |
-| 3 | C4 | 0 | 0 |
-| 4 | C2 | 1 | `1/log2(5) ≈ 0.431` |
-| 5 | C5 | 0 | 0 |
-
-~~~text
-DCG@5 ≈ 1.893 + 0.431 = 2.323
-理想排序：C1（第一名）、C2（第二名）
-IDCG@5 = 3 + 1/log2(3) ≈ 3.631
-nDCG@5 ≈ 2.323 / 3.631 ≈ 0.640
-~~~
-
-这个数衡量当前排序与**该标注方案下的理想排序**有多接近，适合比较融合和 Rerank。若改变相关性等级、增益函数或候选集合，数值会变化；标注标准与公式必须固定，不能跨评测口径直接比较。
-
-### 【同一组数据从 Top-1 到 Top-5，指标如何变化】
-
-| 指标 | @1 | @2 | @3 | @5 |
-|---|---:|---:|---:|---:|
-| Hit@K | 0 | 1 | 1 | 1 |
-| Evidence Recall@K | 0% | 50% | 50% | 100% |
-| Precision@K | 0% | 50% | 33.3% | 40% |
-| RR@K（单条 Query） | 0 | 0.5 | 0.5 | 0.5 |
-| nDCG@K（上述分级标签） | 0 | 0.521 | 0.521 | 0.640 |
-
-这里 `nDCG@2≈(3/log2(3))/3.631≈0.521`，因为理想排序前两名本应分别为 C1、C2。**Recall 随 K 增大不下降**（固定结果和标签时），但 Precision 并不单调；因此不能只看其中一个指标判断某个 Top-K 配置更优。
-
-### 【工程实践：在什么阶段计算什么指标】
-
-~~~text
-Document → Chunking / Embedding → Point/Vector Index
-                                  ↓
-                    Vector / Keyword 候选召回
-                      └─ Evidence Recall@K：正确证据是否进入候选
-                                  ↓
-                    Fusion / Rerank：重排已有候选
-                      └─ nDCG@K / MRR：排序是否更合适
-                                  ↓
-                    Context Construction：筛选并组织 LLM 输入
-                      └─ 最终证据覆盖、Token/冗余与截断
-                                  ↓
-                    LLM Generation
-                      └─ Faithfulness / Answer Correctness
-
-独立对照：ANN 搜索 ↔ Exact kNN
-          └─ ANN Recall@K：近似索引的几何近邻误差
-~~~
-
-**对妙码 AI Flow 的适用位置**：
-
-- 已核对的 [`VectorRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 接收 Query，经 Embedding 和 `VectorStore.search()` 返回排序好的 Chunk；可以记录初始 Run，计算 Hit/Recall/Precision。
-- 已核对的 [`HybridRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 定义 `vector/fulltext/hybrid` 三模式。混合模式使用 `expandedTopK = ceil(topK*1.5)` 分别获取候选，再使用加权 RRF 融合（`k=60`，默认 `vectorWeight=0.7`），最终截取 `topK`。这提供了对照“向量结果 vs 融合后结果”的源码测试位置，**不表示实际环境已经完成 BM25、自动 Rerank 或质量评测**。
-- 当 `FulltextSearchProvider` 未提供时，混合检索走向量结果的降级路径；不能仅看到类型名称 `hybrid` 就假定两个通道始终都真实运行。
-- 当前 `QdrantVectorStore.search()` 的得分是向量相关性信号；RRF 融合后得分则是排序融合分数，两者不可直接相加或当作 Ground Truth。评测应使用稳定的身份、版本与证据标注，在同一个 Query 集上比较排序指标和响应延迟。
-
-**建议的最小验证**：同一固定语料与查询集执行 `vector` 和 `hybrid` 两种 Run（必须确认混合时全文 Provider 实际生效），使用 `ranx` 或等价工具比较 `Recall@K`、`MRR@K`、`nDCG@K`；参数、Embedding 版本、知识库权限范围、候选深度与最终 K 都随结果一起记录。未运行之前不声称哪个方案在项目中更好。
-
-### 【面试标准回答】
-
-Hit@K 表示前 K 条是否至少命中一条正确证据；Recall@K 表示所有正确证据中有多少进入了前 K 条；Precision@K 表示前 K 条中相关候选所占比例。RR 是单个 Query 的首条相关结果排名倒数，多 Query 取平均才得到 MRR；nDCG 则综合相关性等级与位置折损，衡量排序与理想排序之间的差距。
-
-选指标应先确定系统消费结果的方式：初始候选阶段优先保证 Evidence Recall，多事实问题还应检查必要事实覆盖；用户只看第一条时可关注 MRR/Hit@1；融合与 Rerank 关注 nDCG；最终上下文还需检验证据是否确实进入模型输入，而非只报告较高的初始 Recall。精确向量搜索对照 ANN 的 Recall 与人工标注的业务 Evidence Recall 是两种不同评测，不能混用。
-
-### 【资料依据与后续边界】
-
-- [Qdrant：Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/)：采用 Qrels/Run 和 ranx 评测 `Recall@K`、`MRR`、`nDCG@K`，并按系统消费场景选取 K。
-- [Qdrant：Before Tuning a Collection](https://qdrant.tech/documentation/search-tuning/before-tuning-a-qdrant-collection/)：不同指标可能选出不同的“最佳参数”；应先确定优化目标。
-- [妙码 AI Flow 向量检索器源码](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 与 [混合检索器源码](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)：现有检索链路的可观察节点和候选排序机制。
-
----
-
-## 【第二题追问：Context Construction 是否也属于 RAG 评测】
-
-### 【提问与结论】
-
-**是。Context（上下文）质量是完整 RAG 评测不可缺少的对象。**但需要先区分：
-
-- **Context Construction（上下文构建）**是系统实际执行的环节：它从检索候选中挑选、去重、补充、压缩、截断并组织 LLM 最终收到的证据文本。
-- **Context Evaluation（上下文评测）**是对检索所得材料或者最终模型输入的相关性、完整性和可用性进行评价。
-
-不同研究和评测框架对术语的归属不完全一致。Ragas 将 `Context Precision`、`Context Recall` 放在 RAG 相关评测指标中，通常用来衡量检索到的上下文是否有用；它们**不必然**意味着工程系统里有一个独立的名为 `ContextEvaluator` 的运行组件，也**不自动**覆盖最终 Prompt 组装导致的证据损失。必须先明确一个指标的输入数据来自哪个阶段。
-
-### 【知识概述：检索输出与最终 Context 是不同的数据对象】
-
-~~~text
-用户 Query
-  → 初始检索：返回一批候选 Chunk
-      │  评测：Evidence Recall@K（正确证据有没有进入候选）
-      ▼
-  → Fusion / Rerank：融合、重新排序
-      │  评测：MRR / nDCG（正确证据有没有排靠前）
-      ▼
-  → Context Construction：选择、去重、扩展、压缩、截断
-      │  评测：最终证据覆盖、引用可定位、Token 成本和冗余
-      ▼
-  → LLM Generation：依据最终 Context 生成回答
-         评测：Faithfulness（回答是否受 Context 支持）、
-               Answer Correctness（事实是否正确）
-~~~
-
-注意图中“初始检索返回候选”和“LLM 最终收到 Context”**不一定相同**。例如初始召回允许 50 条，而模型只接收重排后的 5 条；或者因 Token 预算只保留部分正文。Context 也可能添加来源标题、父章节说明或多个 Chunk 的合并文本，不能始终按原始 Chunk 个数衡量其内容。
-
-### 【同一问题：召回成功而上下文构建失败的完整过程】
-
-沿用前面的问题：“年假申请需要提前多久，由谁审批？”Ground Truth 仍是：
-
-~~~text
-C1：年假须提前三个工作日申请
-C2：年假由直属主管审批
-~~~
-
-假设：
-
-~~~text
-初始检索 Top-5：
-[C3, C1, C4, C2, C5]
-→ 包含 C1 与 C2；Evidence Recall@5 = 2/2 = 100%
-
-重排 Top-3：
-[C1, C2, C3]
-→ C1/C2 均在前两位；证据覆盖仍为 100%
-
-Context Construction：
-由于错误截断、错误去重或不当的 Token 预算策略，
-实际只组装了 C1 的正文
-→ 最终可用证据只支持“申请时限”
-→ 最终必要事实覆盖 = 1/2 = 50%
-
-LLM 收到的 Prompt：
-参考资料只有“年假须提前三个工作日申请”
-问题却同时询问“由谁审批”
-→ 无法从收到的资料确定审批人
-~~~
-
-这个例子只表示**人为构造的故障场景**。它证明检索器已经完成任务，不代表整个 RAG 链路能够完整回答。若此时仅调高 `hnsw_ef` 或增大初始 `topK`，并不会自动修正组装阶段丢弃 C2 的问题。
-
-| 阶段 | C1：时限 | C2：审批人 | 对两条必要事实的覆盖 |
-|---|---|---|---:|
-| 初始候选 Top-5 | 有 | 有 | 100% |
-| 重排后 Top-3 | 有 | 有 | 100% |
-| 最终送入 LLM 的 Context | 有 | 无 | 50% |
-
-需要把**能用于回答的证据是否保留**当成实际指标，而不是把 Query 相关主题的文本数量误当作覆盖度。
-
-### 【Context 的几种评价维度及边界】
-
-**第一类：相关性与排序质量。**最终组织的资料是否回答本次 Query？是否有大量“年假申请入口、病假证明”等与“时限+审批人”无关的片段？相关性通常可用二元或分级 Qrels 检验，检索排序可继续使用 Precision / nDCG 等指标。
-
-**第二类：必要证据覆盖。**最终 Context 能否支持问题中的每个必要事实？一种教学式的覆盖公式为：
-
-~~~text
-Final Context Fact Coverage
-  = （被最终 Context 支持的必要事实数）
-    / （该 Query 需要的必要事实总数）
-~~~
-
-例如两个事实只保留一个，则 `1/2=50%`。**这只是清晰定义后的工程自定义检查，不应冒充所有框架通用的 Context Recall 公式。**一条较大的父章节可能同时支持多个事实，不能直接用“保留了几个 Chunk”替代“支持几个事实”。
-
-**第三类：上下文预算与冗余。**片段即使都相关，重复段落、过长的父章节、无关 Metadata 也会占用 Token，导致重要证据被截断。应记录输入 Token 预算、实际上下文 Token 数、选择了哪些证据、因何丢弃哪些候选及是否发生截断。冗余与成本是工程观测项，不能仅凭某一条指标就推断模型答案质量。
-
-**第四类：引用与版本有效性。**最终 Context 中的每段事实能否回溯原 Document、版本、章节位置，以及调用者是否有权访问？版本失效和越权不能通过高相似度或相关性得分抵消。
-
-### 【Ragas 中 Context Precision 与 Context Recall 的含义】
-
-这里要区分**框架明确提供的指标**和**我们针对特定流水线自定义的验收指标**：
-
-| 评价名称 | 在 Ragas 中的典型含义 | 不能误解为 |
-|---|---|---|
-| Context Precision | 衡量检索结果中相关 Chunk 是否优先排在前面；其计算思想结合相关项出现位置的 `Precision@k` | 普通的 `相关条数 / 检索总条数` 就完全等同该指标 |
-| Context Recall | 参考答案中的必要断言是否能从所提供 Context 中找到支持；LLM-based 版本会分解参考答案的 Claims，再核对证据支持 | 任意场景下都只需对比 Chunk ID |
-| Final Context Coverage（本篇的检查） | 对齐固定的必要事实标注，检查最终实际输入 LLM 的材料是否覆盖这些事实 | 所有框架都有的统一标准化指标 |
-
-Ragas 官方 Context Recall 的基于断言计算思路是：
-
-~~~text
-Context Recall
- = 参考答案中被检索上下文支持的断言数 / 参考答案中的断言总数
-~~~
-
-如果用户问题需要两个事实，最终 Context 只支持时限、不支持审批人，则该口径下可能是 1/2；但 LLM 评判器的断言抽取与支持判定可能发生错误，需要标注抽检和明确使用的评测版本。Ragas Context Precision 更接近强调排名的相关性评测，而**不是简单记录系统是否超出 Token 上限**。
-
-参考：[Ragas Context Precision](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/)、[Ragas Context Recall](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/)、[Ragas 指标列表](https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/)。
-
-### 【与答案生成评测的区别】
-
-Context 评测判断“模型**看到了什么**”；Faithfulness（答案忠实度）判断“模型**说出的断言有没有证据支持**”；Answer Correctness（答案正确性）进一步检查“回答是否符合真实事实和问题需求”。
-
-例如最终 Context 正确包含 C1/C2，模型却说“审批将在两小时内完成”，这个两小时的信息没有证据支持，属于生成阶段的 Faithfulness 问题。另一种情况是旧版政策被错误选入 Context，模型忠实引用旧版但结论过时，此时答案可能忠于 Context，却仍然不符合现行规则。**这两个问题需要追溯不同的失效阶段。**
-
-### 【项目实践：应该在哪里采集哪些数据】
-
-从已核对的妙码 AI Flow 源码，可以确认 [`VectorRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 和 [`HybridRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 返回有序 `RetrievalResult[]`，其中包含 `chunkId`、`documentId`、`content`、`score`。这能作为**检索器输出候选集**的观察点；仅凭这些文件，尚不能确认最终 Prompt 如何组装，也不能确认系统已把“实际发送给 LLM 的 Context”完整记录。
-
-因此以下属于**建议的可观测性设计，不是已完成的项目现状**：
-
-~~~typescript
-type RagEvaluationTrace = {
-  queryId: string
-  corpusVersion: string
-  retrieverMode: "vector" | "fulltext" | "hybrid"
-  retrievedChunkIds: string[]   // 初始召回的顺序与身份
-  rerankedChunkIds?: string[]   // 实际有重排时才记录
-  contextEvidenceIds: string[]  // 实际进入 LLM Context 的来源
-  contextTokenCount: number
-  droppedEvidence: Array<{
-    id: string
-    reason: "low-relevance" | "duplicate" | "token-budget" | "permission"
-  }>
-  promptVersion: string
-}
-~~~
-
-一次质量故障可以按顺序定位：
-
-1. **Retrieved Run 是否覆盖正确证据？**未覆盖时查解析、切分、Embedding、检索/ANN 与过滤。
-2. **重排后是否保留正确证据？**候选存在但被截断时查融合、Rerank、`topK` 策略。
-3. **最终 Context 中是否仍包含完整事实？**丢失时查去重、父子扩展、Token 预算与 Prompt 模板组装。
-4. **生成是否正确引用这些事实？**证据完整但答案错误时查模型生成及来源引用逻辑。
-
-项目实现上述 Trace 时，还应对敏感内容采取权限约束、采样与脱敏；测试并不要求把真实的全部私密文档原文都记录到日志中。
-
-### 【面试标准回答】
-
-Context 属于 RAG 的评测对象，但 Context Construction 是运行阶段，Context Evaluation 则评估这个阶段交付给 LLM 的资料是否相关、完整、可靠。检索器输出和最终 LLM 输入通常不相同：候选在融合、重排、去重、父章节扩展或 Token 截断过程中可能丢失证据。因此初始 Evidence Recall@K 很高，不代表最终 Context 一定能支持全部答案事实。
-
-应区分检索相关性与排序、最终 Context 的必要事实覆盖、Token 成本与冗余、来源版本和权限有效性。Ragas 的 Context Precision 通常衡量相关 Chunk 在检索列表中的排序质量，Context Recall 关注参考答案断言能否从提供的上下文找到支持；工程侧还可以单独记录最终 Context Fact Coverage、被丢弃证据及原因。
-
-最后，Context 完整也不保证生成正确，应继续区分 Faithfulness（生成是否受证据支持）与 Answer Correctness（事实与问题是否正确）。这样才能根据质量损失位置决定该优化检索、重排、上下文构建还是生成环节。
-
-### 【资料依据】
-
-1. Ragas：[Context Precision](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/)。
-2. Ragas：[Context Recall](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/)。
-3. Ragas：[Available Metrics](https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/)。
-4. Qdrant：[Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/) 与 [Evaluating Pipeline Output Quality](https://qdrant.tech/documentation/search-evaluation/pipeline-output-quality/)。
-5. 项目源码：[VectorRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts)、[HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)。
-
----
-
-## 【第三题：如何构建可靠的 RAG Ground Truth 评测数据集】
-
-### 【提问与知识目标】
+#### 【提问与知识目标】
 
 前两题建立了评价对象（Query、Ground Truth/Qrels、Run）和 Hit@K、Evidence Recall@K、Precision@K、MRR、nDCG 等指标。**指标计算依赖一个前提：我们能够可靠地区分哪条知识是正确证据，且测试问题足以代表系统应处理的实际需求。**
 
 本题讨论如何从真实查询、人工标注与 LLM 合成数据构造可复用的检索评测集，重点研究证据标注完整性、测试场景覆盖、语料版本、偏差与可复现性。评测数据集不是代码里的几条 `query→expectedChunkId` 测试常量，而是能长期衡量检索方案是否变好的**标准化实验资产**。
 
-### 【知识概述：Query 的来源不等于 Ground Truth 的正确性】
+#### 【知识概述：Query 的来源不等于 Ground Truth 的正确性】
 
 Ground Truth（参考真值）由两类信息构成：
 
@@ -666,7 +315,7 @@ C3：员工申请病假需要提供医疗证明。
 
 Qdrant 官方指出，LLM 生成的查询通常比真实用户查询更容易被检索，可能抬高离线指标；点击日志也存在位置偏差，不能把点击直接等同人工验证的相关性。见 [1]。**因此应将“样本生成”和“标签验证”分为两个不同环节。**
 
-### 【真实查询、人工标注与 LLM 合成各自负责什么】
+#### 【真实查询、人工标注与 LLM 合成各自负责什么】
 
 | 来源 | 获得方式 | 主要贡献 | 需要控制的风险 |
 |---|---|---|---|
@@ -680,7 +329,7 @@ Qdrant 官方指出，LLM 生成的查询通常比真实用户查询更容易被
 - **人工审核决定参考标准**：至少对进入正式回归集的关键事实与证据对应关系进行核验；有争议的标签应由规则和复核解决。
 - **LLM 负责扩展**：生成同义表达、复杂限定条件、多证据问题、无答案和难例，但正式入库前进行事实校验。合成数据和真实数据分别报告评测结果，避免总体分数被“容易的合成问题”主导。
 
-### 【Ground Truth 的实际构建流程】
+#### 【Ground Truth 的实际构建流程】
 
 ~~~text
 确定评测范围（知识领域、版本、权限、业务目标）
@@ -710,7 +359,7 @@ Qdrant 官方指出，LLM 生成的查询通常比真实用户查询更容易被
 
 **Pooling 不是穷尽所有正确证据的数学保证。**应保留“未审核/未知”状态，必要时追加新检索方法和人工调查扩大候选池；对新系统反复发现的“未知但有用”结果做盲审和补标。不能把“不在标签表里”直接当成“人工确认无关”。
 
-### 【人工标注的粒度：从 Chunk ID 扩展到必要事实】
+#### 【人工标注的粒度：从 Chunk ID 扩展到必要事实】
 
 仍用问题：“年假需要提前多久申请、由谁审批？”
 
@@ -760,7 +409,7 @@ Qdrant 官方指出，LLM 生成的查询通常比真实用户查询更容易被
 
 **Qrels 与必要事实覆盖应分别实现：**普通 Chunk-level 指标可以使用 Qrels；多事实任务可以单独计算“最终候选或 Context 支持了多少 requiredFacts”。只有全部必要事实被证据支持，才可能判断信息覆盖完整；仍不代表最终 LLM 答案必然正确。
 
-### 【怎样设计具有代表性的 Query 覆盖】
+#### 【怎样设计具有代表性的 Query 覆盖】
 
 **数量多不代表覆盖好。**如果一千条 Query 大多是“某某制度是什么”，评测分数很高也无法证明系统理解编号、例外条款或多文档问题。
 
@@ -786,7 +435,7 @@ Ragas 官方提供通过知识结构/关系生成单跳（Single-hop）与多跳
 
 三者可以相互有重合，但报告时注明来源、分组和统计口径；不能随意把挑战集占比变化解释为线上质量变化。
 
-### 【LLM 在数据集构建中的合理工作边界】
+#### 【LLM 在数据集构建中的合理工作边界】
 
 LLM 适合做的工作是：从已核实文档中抽取待核实的原子事实、生成不同口语和专业表达、组合多证据场景、建议可能的引用片段、去除明显重复问题。完成后仍需校验：
 
@@ -808,7 +457,7 @@ released（固定版本的正式基准）
 
 对低风险大样本可以使用自动检查与人工抽样核验，但**正式参考真值的可信度与人工投入之间的取舍，应在评测报告中如实说明**。不能把 LLM 自行生成且自行判分称作无偏的真实人工 Ground Truth。
 
-### 【如何在妙码 AI Flow 当前检索架构上落地】
+#### 【如何在妙码 AI Flow 当前检索架构上落地】
 
 首先解释项目上下文。已核对的 [`VectorRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 负责把 Query 编码为向量、调用存储层 `search()` 并映射为带 `chunkId`/`documentId`/`content`/`score` 的结果；[`HybridRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 在 `vector/fulltext/hybrid` 模式间调度，双路结果经过加权 RRF 融合。[`QdrantVectorStore`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 支持按 `knowledgeBaseIds` 过滤和 `topK` 返回 Chunk 身份。
 
@@ -853,7 +502,7 @@ type EvaluationCase = {
 
 在没有验证之前，这是**设计建议**而非项目已经上线的数据结构。实验时固定相同语料/权限/Embedding/检索深度，对比 `vector` 和真实启用全文 Provider 的 `hybrid` Run；不能因源码存在 Hybrid 模式，就假定运行时始终成功调用了两条检索通道。
 
-### 【评测数据集与检索系统的版本应如何关联】
+#### 【评测数据集与检索系统的版本应如何关联】
 
 最低限度记录：
 
@@ -868,7 +517,7 @@ type EvaluationCase = {
 
 当底层 Chunking 改变时，应保留一份可对齐到源文档和事实的评测定义，必要时映射新 Chunk 并复审；不应强行沿用已经失效的 Chunk ID。测试集标签升级时，应说明历史指标是否需要按新版本重算。
 
-### 【实践边界与质量检查】
+#### 【实践边界与质量检查】
 
 - **标签完整性**：未被 Pool 覆盖的结果状态是未知，不能默认为“不相关”；对新检索器发现的合理结果追加审核。
 - **用户反馈偏差**：点击受名次、展示方式影响；点击率不是天然 Qrels。
@@ -877,7 +526,7 @@ type EvaluationCase = {
 - **统计可靠性**：除整体平均，至少按 Query 类型和来源分组；对于微小差异，在样本不足、标签不全时不应轻率宣布新方案优越。
 - **避免只考自己擅长的题**：生成测试问题与被评估的模型/检索器高度同源时，需保留独立验证集和真实查询集，避免评测偏乐观。
 
-### 【面试标准回答】
+#### 【面试标准回答】
 
 RAG 检索评测的 Ground Truth 是经过验证的 Query—Evidence 相关性标注，而不是模型自动生成的参考答案或初始检索器的 Top-K。数据集应结合真实用户查询、人工设计/审核和 LLM 合成数据：真实查询提供实际分布，人工审核保证事实与证据关系可信，LLM 用于扩充同义表达、复杂问题和边界场景。
 
@@ -885,7 +534,7 @@ RAG 检索评测的 Ground Truth 是经过验证的 Query—Evidence 相关性�
 
 评测集按语料/标注/检索配置版本管理，使用同一套已审核样本比较不同检索方案，分别统计真实查询与合成查询、普通与挑战用例。对于未标注但可能正确的结果要复核补标，而不能默认错误。这样构建的 Ground Truth 才能作为后续 Chunking、Embedding、Hybrid Search、Rerank 等技术改进的稳定对照基线。
 
-### 【权威资料与源码】
+#### 【权威资料与源码】
 
 1. [Qdrant：Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/)：真实用户日志、人工标注、LLM 合成及评测数据质量风险。
 2. [NIST TREC：Relevance Judgments](https://trec.nist.gov/data/reljudge_eng.html)：Pooling、语料与 Qrels 匹配。
@@ -895,327 +544,219 @@ RAG 检索评测的 Ground Truth 是经过验证的 Query—Evidence 相关性�
 
 ---
 
-## 【第四题：如何根据评测结果定位 RAG 检索质量的真正瓶颈】
+### 【1.3 检索质量指标与完整计算】
 
-### 【提问与知识目标】
+*原讨论问题：Recall@K、Precision@K、Hit@K、MRR 与 nDCG 分别衡量什么*
 
-前三题已经解决三件事：建立 Query—Evidence Ground Truth，使用 Hit@K、Recall@K、MRR、nDCG 等指标识别质量差异，设计可靠、可复现的测试样本。新的问题是：**某个 RAG 知识库在固定评测集上的 Evidence Recall@10 只有 72%，是否应该增大 Top-K、改 Chunk Size、换 Embedding，还是调整 HNSW？**
 
-答案是：**单一结果指标不能直接确定故障原因。应先找到质量损失发生的链路，再针对那个层次设计单变量对照实验**。本题把之前的知识构建、索引与评测连成一条“观察 → 归因 → 实验 → 复核”链路，避免把参数调优误当作质量优化本身。
+#### 【提问与知识目标】
 
-在开始诊断之前，需确保标注、实际语料、权限范围、Embedding 版本、过滤条件、索引状态与测试 Query 对齐。若评测基础自身失真，优化判断也会失真。[Qdrant《What to Check Before Tuning a Qdrant Collection》](https://qdrant.tech/documentation/search-tuning/before-tuning-a-qdrant-collection/) 明确建议先确定质量目标、检查索引/过滤配置、使用标注数据评估症状，而非直接从参数表选值。
+上一题已经建立：给定查询 Query、人工标注的正确证据集合 Ground Truth/Qrels，以及按得分排序的检索结果 Run，可以判断系统是否检索到了有效证据。本题进一步讨论：为什么不能只用一个分数衡量所有检索能力，**候选覆盖、无关噪声与排序先后**应分别用什么指标观察？
 
-### 【知识概述：按数据流区分六类可能的质量损失】
+统一教学场景：员工提问“年假需要提前多久申请、由谁审批？”；假设资料已经审核，正确证据分别为 C1（提前三个工作日申请）和 C2（由直属主管审批）。某检索器的有序结果为：
 
-诊断时先区分**离线知识构建**与**在线检索生成**：
+| 名次 | Chunk ID | 内容（简写） | 二元相关性 |
+|---:|---|---|---:|
+| 1 | C3 | 年假申请入口 | 0 |
+| 2 | C1 | 年假申请时限 | 1 |
+| 3 | C4 | 病假医疗证明 | 0 |
+| 4 | C2 | 年假审批人 | 1 |
+| 5 | C5 | 考勤打卡规则 | 0 |
 
 ~~~text
-离线：原始文档 → 解析与版本 → Chunking → Embedding → Point/索引
-                 │             │             │        │
-                 │             │             │        └─ 是否真正完成索引及过滤配置？
-                 │             │             └─ 当前向量是否能表达正确语义？
-                 │             └─ 必要事实/限制条件是否仍完整？
-                 └─ 正确来源是否存在、有效、已入库？
-                                ↓
-在线：Query + 身份/权限/版本 → 向量 / 词项检索 → 候选集合
-                                              │
-                    独立对照：Exact kNN vs ANN（几何近邻误差）
-                                              │
-                                              ▼
-                              融合 / 重排 / 最终 Top-K 截断
-                                              │
-                                              ▼
-                            Context Construction（最终模型输入）
-                                              │
-                                              ▼
-                                        LLM 答案输出
+Ground Truth（正确证据）：{C1, C2}
+Run（实际排序）：[C3, C1, C4, C2, C5]
 ~~~
 
-这是一条**因果诊断结构**，不是强制要求每个 RAG 系统都独立部署六个服务。有的系统仅使用向量检索，没有融合；有的系统将 Rerank 和 Context 选择放在一个调用中。无论实现如何，都可以通过阶段性输入输出定位证据在哪里消失。
+以下计算全部基于这组**教学数据**，不是项目运行结果；在没有其他相关证据且标注完备的假设下，Ground Truth 的正确证据数是 2。现实中还应考虑未标注但同样正确的替代证据。
 
-| 观察症状 | 可能的瓶颈 | 优先检查 | 不应立即做的事 |
+#### 【知识概述：五种指标在回答不同问题】
+
+| 指标 | 实际判断 | 适用重点 | 无法单独证明什么 |
 |---|---|---|---|
-| 原始事实没有可检索记录 | 文档解析、同步/入库、版本 | 原文、文档状态、Point/Chunk 实际存储 | 直接调高 K |
-| 原始事实存在但被截成不能独立理解的片段 | Chunking/Metadata | 原文位置、标题、条件、Chunk 正文 | 首先重建 HNSW |
-| 正确 Chunk 已入库，Exact kNN 也排得很靠后 | 表示/检索策略与过滤条件 | 查询改写、Embedding、阈值、权限、词项检索 | 认定 ANN 图搜索是唯一问题 |
-| Exact kNN 找到近邻，ANN 丢失对应近邻 | 近似检索或执行配置 | `hnsw_ef`、索引状态、过滤与搜索路径 | 更换所有原始文档 |
-| 初始候选有正确证据，融合/截断后没有 | 排序、候选深度或融合 | 每路 Run、融合 Run、Rerank 结果、最终 K | 盲目增大 Chunk Size |
-| 最终排序正确，LLM 输入缺少事实 | Context 组装、去重、截断 | 最终 Prompt 的证据 ID、Token 预算 | 只改 Embedding/HNSW |
+| Hit@K | 前 K 条有没有至少一条正确结果 | FAQ、单答案/至少一次命中 | 多证据问题是否找齐 |
+| Recall@K | 全部正确证据中找到了多少 | 候选召回阶段，避免漏证据 | 排序是否靠前、噪声多少 |
+| Precision@K | 返回的前 K 条有多少是相关的 | 候选噪声/有限上下文利用 | 有没有找齐语料中的所有证据 |
+| RR / MRR | 第一条正确证据的位置是否靠前 | 单答案、用户优先使用首条 | 第二、第三条必要证据在哪里 |
+| nDCG@K | 重要证据是否排在前面、整体排序是否接近理想 | 重排、融合、分级相关性 | 数据未入库或事实是否正确 |
 
-**重要边界**：一个问题可能同时存在多个瓶颈；上表用于定位**有证据支持的优先排查方向**，不是“看到症状就能唯一判定故障”的规则。
+**K 是同一运行结果的前缀截断深度，不是 HNSW 的 `hnsw_ef` 或 Embedding 维度**。初始检索可能返回 50 条候选，而最终送入 LLM 的只有 5 条，因此两阶段应分别评价 `Recall@50` 和 `Context 证据覆盖@5`，不能用前者代替后者。
 
-### 【一次完整的故障：入职不满一年能否申请年假】
+#### 【Hit@K：前 K 条有没有任何一条正确证据】
 
-以下是用于展示因果关系的**教学情境，不是妙码 AI Flow 的实际线上故障**：
-
-用户 Query：“入职不满一年的员工可以申请年假吗？”
-
-现行制度中的参考证据为：
+对单个 Query：
 
 ~~~text
-C8：入职不满一年的员工不适用本年假制度。
+Hit@K(q) = 1，前 K 条至少出现一条相关证据
+Hit@K(q) = 0，否则
 ~~~
 
-当前 Top-5 未召回 C8，表现为 Evidence Recall@5=0。接下来需要逐层排除，而不是立刻尝试五种参数。
+示例：Top-1 只有无关的 C3，故 `Hit@1=0`；Top-2 有 C1，`Hit@2=1`；Top-3 与 Top-5 依然为 1。
 
-### 【第一层：原始数据是否存在且已正确入库】
+如果存在 100 个 Query，其中 80 个 Query 的 Top-5 至少包含一条相关证据，则 `Hit Rate@5=80/100=80%`。它直观但不能表示多证据问题找得够不够完整：对当前场景 `Hit@2=1`，尽管 C2 完全没出现。
 
-先检查：
+#### 【Recall@K：标注的全部正确证据被覆盖多少】
 
-1. 当前知识库是否包含**现行版本**的休假制度？问题是否处于该调用者有权检索的知识范围？
-2. 原始文档能否定位到“入职不满一年不适用”的条款？
-3. 解析产物和实际入库的 Chunk 中是否存在这句话及其否定关系？
-4. 文档处理是否成功、所选 Collection 是否正确、更新/删除是否遗留旧 Point？
-
-反例：
+对单个 Query，在二元标注、按唯一证据 ID 计算的条件下：
 
 ~~~text
-原始 PDF：包含 C8 的完整规定
-    ↓ 解析遗漏了尾部条款
-Chunk 集合：没有该条
-    ↓
-Embedding、HNSW、Top-K 再好也无法找回从未入库的事实
+Evidence Recall@K(q)
+ = |TopK(q) ∩ Relevant(q)| / |Relevant(q)|
 ~~~
 
-此时优先修复文档解析、增量处理或数据完整性。仅仅增大 `topK` 不能检索不存在的 C8。
+示例结果：
 
-**不要把“向量查询没有结果”直接视为未入库**：先通过可信的原文/文档索引/存储检查确认事实是否存在，避免把过滤范围或阈值造成的不可见误判为缺失。
+| K | 前 K 条的相关证据数 | Ground Truth 总数 | Recall@K |
+|---:|---:|---:|---:|
+| 1 | 0 | 2 | 0% |
+| 2 | 1 | 2 | 50% |
+| 3 | 1 | 2 | 50% |
+| 4 | 2 | 2 | 100% |
+| 5 | 2 | 2 | 100% |
 
-### 【第二层：Chunking 是否保留了事实的完整语义】
+这说明检索深度为 3 时，只覆盖了“申请时限”，未覆盖“审批人”，不能完整回答问题。
 
-假设原文完整，但切分后的内容是：
+**为何第一阶段应重视 Recall？**检索器没有返回的证据，后续仅作用于已有候选的 Reranker 无法恢复。提高 Top-K 可能改善覆盖，但也会增加候选噪声与计算成本，不能只凭更高 K 声称质量更好。
+
+**边界**：若查询没有任何相关证据，分母为零，普通 Recall 公式不适用，应把无答案识别、拒答和误召回作为独立评测目标；若存在很多等价证据，必须先规定文档/Chunk/事实的去重与标签口径。
+
+#### 【Precision@K：前 K 条中有多少条真正相关】
 
 ~~~text
-Chunk A：入职不满一年的员工
-Chunk B：不适用本年假制度
+Precision@K(q)
+ = |TopK(q) ∩ Relevant(q)| / K
 ~~~
 
-这两个片段单独看时都不包含完整的“适用人群—限制结论”关系。系统可能检索到 A，却无法判断到底是否适用，或只检索到 B 而不知道主体。
+示例：
 
-排查的重点不是“Chunk 字符数够不够大”，而是：
+- `Precision@2 = 1/2 = 50%`。
+- `Precision@3 = 1/3 ≈ 33.3%`。
+- `Precision@5 = 2/5 = 40%`。
 
-- 限制条件（入职不满一年）是否和结论（不适用）建立了可检索的联系？
-- 章节标题、文档级背景及对应 Offset 是否保留，后续能否取回父段落？
-- 相邻或父子片段能否组合恢复完整事实？
-- 更换 Chunk Size/Overlap 后，是否真的提升了多条件、例外规则的 Evidence Recall，并且没有牺牲其他查询类型？
+Top-3 比 Top-2 额外加入了无关的病假内容，召回仍为 50%，但 Precision 反而下降。这表示候选噪声增加，而不是检索进步。
 
-可进行结构化切分、按标题补充背景、父子检索或合理调整边界的单项实验。**Chunk 越大越好是错误命题**：过大的片段可能包含更多噪声、提高存储/上下文成本，并影响相似度区分能力。
+如果实际返回少于 K 条，某些评测实现仍按固定 K 作分母，另一些报告实际结果条数；必须**写清评测工具的计算口径**，否则相同 Run 也可能得出不同 Precision。
 
-### 【第三层：为什么需要先做 Exact kNN 对照】
+Precision 可以间接反映“塞给模型多少不相干文本”，但不直接等于最终 Prompt 的利用效率：去重、父子扩展、压缩或上下文裁剪会改变真正进入 LLM 的材料。
 
-当我们确认 C8 已正确表示、当前查询范围内可见后，应区分：
+#### 【MRR：第一条正确结果排在第几名】
 
-1. **当前向量空间本身不善于把 C8 排在前面**；
-2. **向量空间认为 C8 很近，但 ANN 近似索引没有找到它**。
-
-为区分二者，保持**相同 Query Vector、Embedding 版本、距离度量、语料快照、过滤条件、阈值口径与 K**，运行 Exact kNN 和 ANN 两次查询。
-
-Qdrant 的 `SearchParams(exact=true)` 会强制精确搜索，对照 ANN Top-K 的近邻集合；文档见 [Measuring ANN Recall](https://qdrant.tech/documentation/tutorials-search-engineering/ann-recall/) 和 [Search](https://qdrant.tech/documentation/concepts/search/)。
-
-**情况 A：Exact 也找不到 C8（业务参考证据）**：
+单个 Query 使用 **RR（Reciprocal Rank，倒数排名）**：
 
 ~~~text
-Ground Truth：C8
+RR(q) = 1 / rank_firstRelevant(q)
 
-Exact Top-5 = [C3, C5, C1, C4, C9]
-ANN   Top-5 = [C3, C5, C1, C4, C9]
+没有任何正确结果进入本次评测范围时，该查询的 RR 记为 0。
+MRR = (所有 Query 的 RR 之和) / Query 总数
 ~~~
 
-若 Exact 和 ANN 一致，`ANN Recall@5=100%`，但 `Evidence Recall@5=0`。这是**向量相似度排序与业务相关性目标不一致**的示例，而不是图搜索近似误差。应检查文本与 Query 的语义匹配、向量模型、搜索阈值与授权范围；随后测试查询改写、精确词项匹配或 Hybrid Search 等能力。
+示例的首条正确证据 C1 在第 2 名，因此 `RR(q)=1/2=0.5`。如果另一条 Query 首条正确证据排第 1，`RR=1`；两条 Query 的 `MRR=(0.5+1)/2=0.75`。
 
-**情况 B：Exact 找到了 C8，ANN 没有**：
+若采用截断 `MRR@K`，只有 Top-K 内出现的首条正确结果才贡献分数；当前示例 `RR@1=0`、`RR@2=0.5`。单个 Query 的结果应称 RR，不要把一个查询的 0.5 错称“MRR=0.5”。
+
+**适用边界**：MRR 适合用户只需要一条答案或只看第一条搜索结果的场景；但对于“申请时限+审批人”这样必须找齐两条事实的问题，MRR 在找到 C1 后不再关注 C2，所以不应单独作为能力目标。
+
+#### 【nDCG@K：同时考虑相关性等级与结果位置】
+
+nDCG（Normalized Discounted Cumulative Gain）先给每条候选标注相关性等级，再对后面名次施加折损。常见、但非唯一的增益定义：
 
 ~~~text
-Ground Truth：C8
-
-Exact Top-5 = [C3, C8, C1, C4, C9]
-ANN   Top-5 = [C3, C5, C1, C4, C9]
+DCG@K = Σ[ (2^rel_i - 1) / log2(i+1) ]，i 从 1 到 K
+IDCG@K = 相同相关性标签在理想排序下的 DCG@K
+nDCG@K = DCG@K / IDCG@K
 ~~~
 
-两组向量 Top-5 的交集是 {C3,C1,C4,C9}，因此本例 `ANN Recall@5=4/5=80%`；Exact 的 `Evidence Recall@5=1`，ANN 的 `Evidence Recall@5=0`。此时有证据进一步检查近似索引的搜索参数、索引构建情况及过滤方式。需要注意：**总体 ANN Recall 和 Evidence Recall 不是同一个分数，单个查询上的业务命中也不总是随 ANN Recall 单调变化**。
+假设人工把 C1 标为“高度相关”（`rel=2`）、C2 标为“相关”（`rel=1`），其余为无关（`rel=0`）。当前排序 `[C3, C1, C4, C2, C5]` 的实际增益为：
 
-**索引状态是前提**：Qdrant 可能对没有建立 HNSW 或满足扫描策略的 Segment 使用精确扫描，这时修改 `hnsw_ef` 并不影响该部分搜索；必须核对 Collection/Segment 的索引状态、过滤 Payload Index 和实际搜索路径，不能认为调用“向量搜索 API”就必然走 HNSW。
-
-### 【第四层：初始召回是否需要改变检索方式】
-
-如果 C8 在精确向量检索中仍排名靠后，可以先依据 Query 类型提出假设。
-
-示例：对于“入职不满一年”“不适用”这样的条件/否定表达，当前向量模型可能不能稳定区分主体和规则；对于 `E-1042`、SKU、代码标识符等，精确词项匹配可能更有价值。
-
-可比较的实验条件包括：
+| 排名 | Chunk | rel | 增益/折损贡献 |
+|---:|---|---:|---:|
+| 1 | C3 | 0 | 0 |
+| 2 | C1 | 2 | `3/log2(3) ≈ 1.893` |
+| 3 | C4 | 0 | 0 |
+| 4 | C2 | 1 | `1/log2(5) ≈ 0.431` |
+| 5 | C5 | 0 | 0 |
 
 ~~~text
-固定 Ground Truth / 语料 / 版本 / 权限
-               ↓
-             同一 Query
-               ↓
-      ┌────────┼─────────┐
-      ▼        ▼         ▼
-  Dense ANN  Text/BM25   Hybrid
-      │        │         │
-      └────────┼─────────┘
-               ▼
-          对比相同 K 的：
-          Evidence Recall、MRR、nDCG、P95、成本
-               ↓
-     按 Query 类型检查改善与退化
+DCG@5 ≈ 1.893 + 0.431 = 2.323
+理想排序：C1（第一名）、C2（第二名）
+IDCG@5 = 3 + 1/log2(3) ≈ 3.631
+nDCG@5 ≈ 2.323 / 3.631 ≈ 0.640
 ~~~
 
-**术语边界**：简单的子串匹配不等于 BM25，定义了 `hybrid` 模式也不等于实际已经执行了稠密+稀疏双路检索。是否采用 BM25、Query Rewrite 或混合检索，必须看真实失效的查询类型与对照结果。
+这个数衡量当前排序与**该标注方案下的理想排序**有多接近，适合比较融合和 Rerank。若改变相关性等级、增益函数或候选集合，数值会变化；标注标准与公式必须固定，不能跨评测口径直接比较。
 
-### 【第五层：融合、重排与 Top-K 截断是否丢失正确证据】
+#### 【同一组数据从 Top-1 到 Top-5，指标如何变化】
 
-假设初始召回：
+| 指标 | @1 | @2 | @3 | @5 |
+|---|---:|---:|---:|---:|
+| Hit@K | 0 | 1 | 1 | 1 |
+| Evidence Recall@K | 0% | 50% | 50% | 100% |
+| Precision@K | 0% | 50% | 33.3% | 40% |
+| RR@K（单条 Query） | 0 | 0.5 | 0.5 | 0.5 |
+| nDCG@K（上述分级标签） | 0 | 0.521 | 0.521 | 0.640 |
+
+这里 `nDCG@2≈(3/log2(3))/3.631≈0.521`，因为理想排序前两名本应分别为 C1、C2。**Recall 随 K 增大不下降**（固定结果和标签时），但 Precision 并不单调；因此不能只看其中一个指标判断某个 Top-K 配置更优。
+
+#### 【工程实践：在什么阶段计算什么指标】
 
 ~~~text
-Dense Top-20 包含 C8
-Text  Top-20 也可能包含 C8
-                ↓
-融合（Fusion）
-                ↓
-Final Top-5 不包含 C8
-                ↓
-LLM 无从使用这条证据
+Document → Chunking / Embedding → Point/Vector Index
+                                  ↓
+                    Vector / Keyword 候选召回
+                      └─ Evidence Recall@K：正确证据是否进入候选
+                                  ↓
+                    Fusion / Rerank：重排已有候选
+                      └─ nDCG@K / MRR：排序是否更合适
+                                  ↓
+                    Context Construction：筛选并组织 LLM 输入
+                      └─ 最终证据覆盖、Token/冗余与截断
+                                  ↓
+                    LLM Generation
+                      └─ Faithfulness / Answer Correctness
+
+独立对照：ANN 搜索 ↔ Exact kNN
+          └─ ANN Recall@K：近似索引的几何近邻误差
 ~~~
 
-这里初始检索可能已经找到正确资料，但融合得分、Rerank 排序或者最终 Top-K 截断将其排除。应该检查**每条检索通道的候选 ID/排名、融合后排序、最终截断前后 ID 集合**。
+**对妙码 AI Flow 的适用位置**：
 
-特别注意三点：
+- 已核对的 [`VectorRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 接收 Query，经 Embedding 和 `VectorStore.search()` 返回排序好的 Chunk；可以记录初始 Run，计算 Hit/Recall/Precision。
+- 已核对的 [`HybridRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 定义 `vector/fulltext/hybrid` 三模式。混合模式使用 `expandedTopK = ceil(topK*1.5)` 分别获取候选，再使用加权 RRF 融合（`k=60`，默认 `vectorWeight=0.7`），最终截取 `topK`。这提供了对照“向量结果 vs 融合后结果”的源码测试位置，**不表示实际环境已经完成 BM25、自动 Rerank 或质量评测**。
+- 当 `FulltextSearchProvider` 未提供时，混合检索走向量结果的降级路径；不能仅看到类型名称 `hybrid` 就假定两个通道始终都真实运行。
+- 当前 `QdrantVectorStore.search()` 的得分是向量相关性信号；RRF 融合后得分则是排序融合分数，两者不可直接相加或当作 Ground Truth。评测应使用稳定的身份、版本与证据标注，在同一个 Query 集上比较排序指标和响应延迟。
 
-- **候选集合与排序不是同一个目标。**如果正确证据在初始候选里却不在最终 Top-5，应该研究 Fusion/Rerank/最终 K，而不是直接归责 Embedding 或 HNSW。
-- **“增加初始 Top-K”不保证最终 Context 更完整。**更多候选可能只增加延迟和噪声；必须检验融合/重排是否能利用这些新候选。
-- **同一 K 下的一次 Recall 差异不能唯一证明是哪一行代码导致**，还应检查相同语料、合法权限、去重、阈值及是否存在动态候选扩展。
+**建议的最小验证**：同一固定语料与查询集执行 `vector` 和 `hybrid` 两种 Run（必须确认混合时全文 Provider 实际生效），使用 `ranx` 或等价工具比较 `Recall@K`、`MRR@K`、`nDCG@K`；参数、Embedding 版本、知识库权限范围、候选深度与最终 K 都随结果一起记录。未运行之前不声称哪个方案在项目中更好。
 
-### 【第六层：最终 Context 是否仍然保留必要证据】
+#### 【面试标准回答】
 
-假设：
+Hit@K 表示前 K 条是否至少命中一条正确证据；Recall@K 表示所有正确证据中有多少进入了前 K 条；Precision@K 表示前 K 条中相关候选所占比例。RR 是单个 Query 的首条相关结果排名倒数，多 Query 取平均才得到 MRR；nDCG 则综合相关性等级与位置折损，衡量排序与理想排序之间的差距。
 
-~~~text
-候选 Top-20：含 C8
-Rerank Top-5：含 C8
-Prompt 实际 Context：不含 C8
-最终答案：缺少适用人群的限制条件
-~~~
+选指标应先确定系统消费结果的方式：初始候选阶段优先保证 Evidence Recall，多事实问题还应检查必要事实覆盖；用户只看第一条时可关注 MRR/Hit@1；融合与 Rerank 关注 nDCG；最终上下文还需检验证据是否确实进入模型输入，而非只报告较高的初始 Recall。精确向量搜索对照 ANN 的 Recall 与人工标注的业务 Evidence Recall 是两种不同评测，不能混用。
 
-此时要检查 Context Construction：是否因 Token 预算、合并去重、父章节提取、格式化错误或来源过滤导致证据丢失。
+#### 【资料依据与后续边界】
 
-应分别保存或记录**候选排序**和**最终确实传入模型的证据 ID/事实支持关系**。最关键的结论：
-
-> 初始 Evidence Recall 高，不证明最终 Context 完整；最终 Context 完整，也不证明 LLM 一定会生成正确答案。
-
-若 C8 已进入最终 Context，模型仍回答“入职半年适用年假”，则故障可能在模型生成、证据理解或旧版本引用，应进入 Faithfulness 与 Answer Correctness 的评测。
-
-### 【分阶段指标如何用于归因：哪些差值能比较、哪些不能】
-
-教学示例：假设固定 Ground Truth 和一批 Query，做不同方式的实验，获得如下结果：
-
-| 阶段或方案 | 评价对象 | 示例结果 |
-|---|---|---:|
-| Exact kNN，Top-20 | 业务 Evidence Recall@20 | 90% |
-| HNSW，Top-20 | 业务 Evidence Recall@20 | 88% |
-| 稠密 + 词项候选合并，Top-20 | 业务 Evidence Recall@20 | 94% |
-| 融合后 Top-5 | 业务 Evidence Recall@5 | 83% |
-| 最终 Context | 必要事实覆盖比例 | 76% |
-
-**全部为假设数字，并非项目实际评测**。还需注意：
-
-1. `Exact kNN` 与 `ANN` 的候选集合不同，可用同一 Query、K、语料和过滤计算它们的 **ANN Recall@K**，另分别计算两套结果的业务 Evidence Recall。这两个指标不能混称。
-2. `Dense` 与 `Hybrid` 是**可比较的策略分支**，并非简单的流水线“下一步”；Hybrid Recall 比 Dense 高只能说明本示例多路方案覆盖更多证据，不代表它必然更优。
-3. Top-20 与 Top-5 的 Recall 本来受**截断深度**影响：如果前 20 中包含正确证据，后 5 没有，这可能只说明 K 缩小，并不自动证明 RRF 算错。需要对照排序和截断前后的结果。
-4. “必要事实覆盖率”与 Chunk-ID Evidence Recall 的评价粒度不同，不能把 83%→76% 的百分点差值直接解释为“Context 额外丢失 7% 个 Chunk”。应在逐 Query 的事实标注下另算上下文阶段损失。
-5. 总体平均值可能掩盖低频但高风险的失败，应按精确编号、条件/否定、多证据、过期/版本及无答案查询分类诊断。
-
-只有在明确相同的评价对象、分母、K、语料和权限时，阶段差值才有更直接的可比意义。否则需要使用**同一查询的证据传递轨迹**解释丢失位置。
-
-### 【将诊断转化为可验证的优化实验】
-
-推荐按以下顺序组织一次实验：
-
-1. **固定 Baseline**：冻结当前 `corpusVersion`、`datasetVersion`、Query 列表、Ground Truth、Embedding 模型、过滤权限、`topK`/`threshold`、索引状态；记录候选 ID/排名、Recall、nDCG、P95 延迟与资源成本。
-2. **找到失效模式**：例如多条精确编号类 Query 在 Dense Top-10 缺证据，但词项搜索能命中。
-3. **提出明确假设**：例如“关键词匹配将改善编号类 Query 的候选覆盖，而不是改善普通语义问题”。
-4. **只改变关键方案**：增加或切换一种实际可用的词项检索策略，其他条件固定；不要同时换 Chunking、Embedding、Top-K、权重和索引参数。
-5. **观察质量与代价**：除了总体 Recall、MRR、nDCG，按 Query 类型比较改善、退化；记录 P50/P95、检索服务成本、异常及无结果率。
-6. **验证稳健性**：在未用于选择参数的验证/测试查询上复核，必要时通过重复运行、置信区间或统计检验判断增益是否可能只是样本噪声。
-
-对改变索引构建、Embedding 或 Chunking 的实验，无法严格做到其他所有条件不变（例如 Chunk ID 会变化）；此时要**固定业务事实和 Query**，对不同版本建立可审核的证据映射，清楚披露语料重建带来的混杂因素。
-
-### 【与妙码 AI Flow 的现有源码如何对应】
-
-项目业务链路包含文档处理 → 切分 → Embedding → Qdrant Collection 存储 → 在线 Retriever。需要知道每个模块在干什么，才能选择采集位置：
-
-- [`document-processor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts) 是文档入库服务，负责生成 Chunk、Embedding 后写入 Qdrant。诊断“是否有知识、是否切分完整”应先回溯该入口和对应原文/数据状态。
-- [`QdrantVectorStore.search()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 用 `limit: topK`、`score_threshold: threshold` 和 `knowledgeBaseId` 过滤调用 Qdrant，返回 `chunkId`、`documentId`、`content`、`score`。该结果可作**向量搜索 Run**。源码当前未在此调用中设置 `exact:true`，因此要做 Exact kNN 对照需要额外提供独立的测试调用或显式的搜索参数，而不能声称当前 API 已有一键 Exact 对照。
-- [`VectorRetriever.retrieve()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 把 Query 交给 Embedding 服务得到 Query Vector，再调用 `vectorStore.search`；此处可以记录**初始向量候选排序**。
-- [`HybridRetriever.retrieve()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 支持 `vector/fulltext/hybrid`；在 `hybrid` 模式下，`expandedTopK = ceil(topK*1.5)`，再按加权 RRF 进行融合（常数 `k=60`，默认向量权重 `vectorWeight=0.7`），最后截取 `topK`。若 `FulltextSearchProvider` 不存在或未返回结果，则降级为向量结果，不保证真正实现双通道召回。这里可作为**融合前后对照**的测试位置。
-- 同一源码中的 `textSearch()` 是从 Qdrant `scroll(limit:1000)` 获取一批片段后，在应用层进行字符串出现频次评分。它**不是 BM25**，也没有在该调用中遍历全部分页；因此不能仅因类名叫“文本搜索”就把它当成完整关键词索引能力的基线，更不能把它等同于 BM25 的倒排索引。
-
-上述均为对**已核对源码行为**的说明；它们不意味着项目已经接入 Ground Truth、记录全部阶段 Trace、部署真正的 BM25 检索服务或实现 Reranker。是否值得新增这些能力，应由真实实验决定。
-
-### 【最小可观测性：怎样知道证据究竟在哪一步消失】
-
-可以参考以下**设计草案**（非项目既有实现）：
-
-~~~typescript
-type RetrievalDiagnosticTrace = {
-  queryId: string
-  corpusVersion: string
-  datasetVersion: string
-  sourceEvidenceIds: string[]       // Ground Truth，在受限评测系统内保存
-  denseCandidateIds: string[]       // Dense 初始 Run
-  exactCandidateIds?: string[]      // 仅在执行了 Exact 对照时存在
-  textCandidateIds?: string[]       // 实际启用第二路检索时才有
-  fusedCandidateIds?: string[]      // 实际发生融合时才有
-  rerankedCandidateIds?: string[]   // 实际经过 Rerank 时才有
-  finalContextEvidenceIds?: string[]// 实际送给 LLM 的来源
-  retrievalMs: number
-  contextTokenCount?: number
-  searchConfig: {
-    mode: "vector" | "fulltext" | "hybrid"
-    topK: number
-    threshold?: number
-  }
-}
-~~~
-
-逐 Query 将 Ground Truth ID 映射到各阶段 ID，记录首次不再出现的位置；如果 Chunk 边界变化、父子扩展或同义证据替换，应按原子事实和源文档映射判断，不能简单用原 ID 做全部归因。生产环境还需为这些 Trace 配置权限、必要字段脱敏、采样和存储保留策略，避免记录不必要的敏感文本。
-
-### 【边界与进一步验证】
-
-- **权限过滤是先决条件**：即使 Ground Truth 引用某份文档，也必须核实当前 Query 对该文档是否有合法访问权；否则不应将“不返回未授权证据”视为检索失败。
-- **阈值导致的空结果**：`score_threshold` 过高可能提前过滤正确片段，此时要检查阈值与 Embedding 分数分布，不能归因于 HNSW。
-- **索引构建状态**：Qdrant 未建 HNSW 或选择精确扫描时，`hnsw_ef` 的变化不一定影响查询；优化前检查真正生效的执行策略。
-- **样本与查询类型**：单条 Exact/ANN 的比较是诊断证据，不足以证明总体的 ANN Recall 达标；需要代表性的 Query 集、重复性与按类型统计。
-- **生成层不混淆**：如果正确证据已经进入最终 Context，但模型依然回答错误，应继续看 Faithfulness/Answer Correctness，不再把所有问题笼统记在 Retriever 名下。
-- **成本约束**：在 Recall 提升很小的情况下显著增加 P95/内存/Token 成本，不一定是适合业务的改进。
-
-### 【面试标准回答】
-
-RAG 检索优化应先建立以 Ground Truth 为标准的固定评测基线，再根据**质量第一次损失的位置**选择要研究的环节，而不是盲目增大 Top-K、修改 Chunk Size 或 HNSW 参数。
-
-先检查源文档、版本、授权、解析与入库是否正确，确认参考事实确实存在且被 Chunk 完整表达；然后对同一 Query Vector、语料、距离度量与过滤范围比较 Exact kNN 和 ANN。如果 Exact 自身也找不到业务正确证据，重点研究 Embedding 表示、查询表达、阈值以及词项/混合检索；如果 Exact 能找到但 ANN 遗漏，才有依据研究 `hnsw_ef`、索引状态及过滤策略。
-
-如果正确证据已在初始候选中，则检查融合、Rerank 和最终 Top-K 是否改变排序并丢失证据；若排序后仍保留但最终 Prompt 没有，问题发生在 Context Construction。每次针对清楚的假设做受控实验，在同一 Ground Truth 下比较 Evidence Recall、MRR、nDCG、P95 和成本，并用独立查询验证收益。**优化的是业务证据质量，不只是几何最近邻的搜索速度。**
-
-### 【权威资料与项目源码】
-
-1. [Qdrant：What to Check Before Tuning a Qdrant Collection](https://qdrant.tech/documentation/search-tuning/before-tuning-a-qdrant-collection/)：按查询失效症状选择检查与调优方向，注意未建索引、过滤与评测设置。
-2. [Qdrant：Measuring ANN Recall](https://qdrant.tech/documentation/tutorials-search-engineering/ann-recall/)：Exact kNN 与 ANN 对照、`hnsw_ef` 的召回/延迟取舍。
-3. [Qdrant：Search](https://qdrant.tech/documentation/concepts/search/)：搜索参数中的 `exact`、`hnsw_ef`、`limit`。
-4. [Qdrant：Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/)：有标注的业务检索相关性评测。
-5. 项目源码：[文档处理](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)、[VectorRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts)、[HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)、[QdrantVectorStore](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)。
+- [Qdrant：Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/)：采用 Qrels/Run 和 ranx 评测 `Recall@K`、`MRR`、`nDCG@K`，并按系统消费场景选取 K。
+- [Qdrant：Before Tuning a Collection](https://qdrant.tech/documentation/search-tuning/before-tuning-a-qdrant-collection/)：不同指标可能选出不同的“最佳参数”；应先确定优化目标。
+- [妙码 AI Flow 向量检索器源码](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 与 [混合检索器源码](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)：现有检索链路的可观察节点和候选排序机制。
 
 ---
 
-## 【第五题：为什么 Dense Vector Search 与 BM25 具有互补性，什么时候应该引入 Hybrid Search】
+## 【二、离线知识表示与检索索引】
 
-### 【提问与知识目标】
+从 Dense 向量表示与词项检索的差异入手，理解 BM25 的倒排索引、词项权重、Qdrant Sparse Vector 以及离线与在线数据结构的配合。文档切分和基础 Embedding 的完整工程解释沿用相邻专题，不在本篇以摘要替代原有原理和源码。
+
+### 【2.1 Dense 与 BM25 的匹配机制和互补性】
+
+*原讨论问题：为什么 Dense Vector Search 与 BM25 具有互补性，什么时候应该引入 Hybrid Search*
+
+
+#### 【提问与知识目标】
 
 此前已掌握文档切片、Embedding、Qdrant Dense Vector、HNSW 与 Evidence Recall 等基本链路。接下来讨论一个架构决策：**已经有了语义向量检索，为何还要建立词项检索？** 关键不是“检索算法越多越好”，而是确认不同查询对语义泛化和精确词项的依赖不同，进而用 Ground Truth 检验是否存在可弥补的召回缺口。
 
 仍从企业知识检索的通用问题出发；妙码 AI Flow 的实现作为后续源码实例。所有排序和分数均为教学假设，而非实际项目评测数据。
 
-### 【相同主题下，为什么语义接近不等于证据正确】
+#### 【相同主题下，为什么语义接近不等于证据正确】
 
 假设企业知识库保存：
 
@@ -1236,7 +777,7 @@ Query：“E-1042 故障应该如何处理？”
 
 **互补的根本原因**：稠密检索以向量空间距离衡量语义相关性；BM25 以显式词项匹配及统计权重衡量文本相关性。两种机制会产生不同的正确候选和不同的错误。
 
-### 【Dense Search 与 BM25 的输入、索引和匹配机制】
+#### 【Dense Search 与 BM25 的输入、索引和匹配机制】
 
 **Dense Search**：
 
@@ -1301,7 +842,7 @@ BM25(Q,D) = Σ IDF(t) × [ TF(t,D) × (k1+1)
 
 **误区**：BM25 匹配“入职不满一年”“不适用”等词，不意味着算法理解条件推理；Dense 与 BM25 都不能替代权限、版本有效性和复杂规则验证。
 
-### 【Hybrid Search 怎样结合互补能力】
+#### 【Hybrid Search 怎样结合互补能力】
 
 典型实现不是把语义向量与 BM25 原始分数硬相加，而是并行进行两路候选检索，再做融合：
 
@@ -1332,7 +873,7 @@ BM25 排序： D1、D2、D4、D5
 
 两种评分尺度不能直接无条件相加。例如 Cosine Score 可能在 0～1 附近，而某个 BM25 分数可能为 14.5；原始相加会产生不可解释的偏置。可使用 RRF（基于排序位置）、经过校准的分数融合或额外 Rerank，下一题再详解 RRF 的计算与适用边界。
 
-### 【妙码 AI Flow：现有检索链路究竟是什么】
+#### 【妙码 AI Flow：现有检索链路究竟是什么】
 
 源码需要先按业务入口理解，而不是仅看到 `hybrid` 名称就推断已具备“标准 BM25”：
 
@@ -1344,7 +885,7 @@ BM25 排序： D1、D2、D4、D5
 
 **对当前项目准确的描述**：`Dense Vector + 应用层自定义文本匹配 + 加权 RRF`，而不是“Dense + 标准 BM25 倒排索引 + RRF”。如果全文搜索未返回结果，混合检索会返回向量结果的前 K 条。
 
-### 【通过评测决定是否引入标准 BM25】
+#### 【通过评测决定是否引入标准 BM25】
 
 固定 Query/Qrels、语料版本、授权范围、Embedding 模型和候选 K，对照：
 
@@ -1356,13 +897,13 @@ C：Dense + BM25 + Fusion
 
 至少分组检验：精确编号/产品型号、口语同义表达、跨文档多事实、否定与条件问题。计算 Evidence Recall@K、nDCG@K、MRR、P95 延迟和索引维护成本；如果混合方案相对最强单路没有显著收益，未必值得额外增加基础设施复杂度。
 
-### 【面试标准回答】
+#### 【面试标准回答】
 
 Dense Vector Search 利用 Embedding 将 Query 与知识表示为稠密向量，通过向量距离衡量语义相似，适合措辞不同但语义相近的问题；BM25 基于分词及词项的 TF、IDF 和长度归一化计算相关性，常通过倒排索引高效查询，能够突出精确编号和稀有术语等显式匹配信号。两者保留的相关性信息不同，因此可能互相弥补召回缺陷。
 
 Hybrid Search 分别执行两路候选检索，再去重并通过 RRF、分数融合或 Rerank 得到统一排序。引入双路检索前应通过统一 Ground Truth 检查各类 Query 的真实召回互补性及增益成本，不能仅因存在 Hybrid 类型就认定拥有标准 BM25。妙码 AI Flow 当前实现的是 Dense + 应用层自定义文本匹配 + 加权 RRF，需要另行建设 BM25 词项索引才能与标准方案等同。
 
-### 【资料与源码】
+#### 【资料与源码】
 
 1. [Qdrant：The Two Families of Search](https://qdrant.tech/course/beginners/module-3/the-two-families-of-search/)：Dense/稀疏两类检索的机制与互补性。
 2. [Qdrant：Hybrid Search](https://qdrant.tech/documentation/search-tuning/hybrid-search/)：候选预取、BM25 稀疏通道与 RRF。
@@ -1372,9 +913,12 @@ Hybrid Search 分别执行两路候选检索，再去重并通过 RRF、分数�
 
 ---
 
-## 【第五题追问：BM25 的词项、倒排索引和稀疏向量怎样在离线与在线阶段协作】
+### 【2.2 BM25 倒排索引、Sparse 表示与运行过程】
 
-### 【提问与知识目标】
+*原讨论问题：BM25 的词项、倒排索引和稀疏向量怎样在离线与在线阶段协作*
+
+
+#### 【提问与知识目标】
 
 问题集中在五个连续判断：
 
@@ -1386,7 +930,7 @@ Hybrid Search 分别执行两路候选检索，再去重并通过 RRF、分数�
 
 **先统一术语**：Chunking 按段落/章节形成可检索片段；Tokenization 将片段拆成词项；Sparse Vectorization 将词项映射到稀疏向量的非零维度及权重；Dense Embedding 则是另外一条语义表示链路。BM25 不要求为每个词训练 Dense Embedding。
 
-### 【离线处理：从 Chunk 到词项倒排索引】
+#### 【离线处理：从 Chunk 到词项倒排索引】
 
 假设同一知识库有：
 
@@ -1434,7 +978,7 @@ C3：用户、登录、失败、检查、密码
 - HNSW 的主要近邻关系：**向量点 ↔ 向量点**，通过图连接近邻。
 - 两者都不是将词项顺序连接成“词与词”的邻接图。
 
-### 【在线查询：Tokenization、Posting 合并、BM25 评分、Top-K】
+#### 【在线查询：Tokenization、Posting 合并、BM25 评分、Top-K】
 
 用户提问：“数据库连接池为什么会耗尽？”
 
@@ -1476,7 +1020,7 @@ BM25(Q,D) = Σ[ IDF(t) ×
 
 示例中 C1 同时匹配更多词项，且包含罕见的“连接池”“耗尽”，因此**通常有理由预期** C1 比 C2 排名更靠前；这不是不经实际统计就可保证的任何文本下的严格次序。
 
-### 【词项索引保存在哪里：传统检索引擎与数据库的职责】
+#### 【词项索引保存在哪里：传统检索引擎与数据库的职责】
 
 倒排索引一般由搜索引擎/数据库持久化维护，业务代码不必自己建立如下 SQL 表：
 
@@ -1488,7 +1032,7 @@ term | chunk_id | tf
 
 **索引不一定离线一次完成后永久不变**：新文档增删、分词策略和语料统计变化都可能触发增量索引更新或段优化。这里说“离线构建”是从用户 Query 的实时路径中分离文档入库，而不意味着只能批量停机重建。
 
-### 【Qdrant 是否提供 BM25：Sparse Vector 索引与原生文本推理】
+#### 【Qdrant 是否提供 BM25：Sparse Vector 索引与原生文本推理】
 
 **提供。**但需分清三个能力：
 
@@ -1553,7 +1097,7 @@ Qdrant 官方 [Server-side Inference: BM25](https://qdrant.tech/documentation/in
 
 **中文与特殊标识符**：BM25 要对文档与 Query 使用相兼容的词项分析与 ID 映射；若针对中文，只按英文空格切分会遗漏真正的词边界，需检查 Qdrant 模型/Tokenizer 对语言的支持，并根据精确编号与语义评测结果选择合适配置。对于代码、版本号和故障编号，精确过滤字段通常比仅依赖 BM25 排名更安全。
 
-### 【妙码 AI Flow 的当前实现与推荐改造位置】
+#### 【妙码 AI Flow 的当前实现与推荐改造位置】
 
 **项目现状（已核对）**：
 
@@ -1580,7 +1124,7 @@ Query → Dense Query Embedding → Dense 候选
 
 需要核实项目当前部署的 Qdrant 版本/推理功能与客户端 API，再确定使用服务端 BM25 推理或客户端 FastEmbed；对已有 Point 执行稀疏表示补录/重建，确保原 Payload、知识库过滤、授权边界不丢失。对于新增 BM25 通道，应对照此前构建的 Ground Truth，在相同 Query 集上比较现有文本匹配、独立 BM25 和 Dense+BM25 的 Evidence Recall@K、nDCG、MRR、P95 及索引开销。
 
-### 【本题标准回答】
+#### 【本题标准回答】
 
 BM25 的离线阶段不是将词项变成 Dense Embedding，也不是按 TF 给词建立一个全局排行榜，而是将 Document 或 Chunk 分词、统计词项在每个文档中的频率以及语料统计，建立**词项到文档/Chunk 的倒排索引**，并持久化在搜索引擎或数据库中。在线 Query 使用兼容的分词规则，查询词项关联的 Posting，汇总候选后结合 TF、IDF 和文档长度计算与当前 Query 的相关性，排序获得 Top-K。倒排索引的核心是词与文档的关联，而不是 HNSW 那样的向量近邻图。
 
@@ -1588,7 +1132,7 @@ Qdrant 可以通过 BM25 Sparse Vector 索引实现这套能力，并允许同�
 
 妙码 AI Flow 当前只写入 Dense 向量，文本检索依靠从 Qdrant 获取一批 Payload 后在 Node.js 层字符串匹配，尚未接入 Qdrant BM25 Sparse 通道。升级时应在已有 Chunk 入库和检索 Provider 处补齐 Sparse 表示、索引及在线 Query 编码，再结合 Ground Truth 验证质量和成本，而不是仅更改 `retrievalMode` 的名称。
 
-### 【资料与实现边界】
+#### 【资料与实现边界】
 
 1. [Qdrant：Sparse Vectors and Inverted Indexes](https://qdrant.tech/course/essentials/day-3/sparse-vectors/)：`indices/values` 与真实倒排索引的区别、稀疏检索。
 2. [Qdrant：The Two Families of Search](https://qdrant.tech/course/beginners/module-3/the-two-families-of-search/)：词项到 Point 的倒排链路。
@@ -1600,9 +1144,339 @@ Qdrant 可以通过 BM25 Sparse Vector 索引实现这套能力，并允许同�
 
 ---
 
-## 【第五题追问二：妙码 AI Flow 当前文本检索的实现、与 BM25 的区别以及改造方案】
+## 【三、在线检索、授权过滤与 Hybrid 候选召回】
 
-### 【问题背景与结论】
+在理解索引结构后，先明确当前用户允许检索哪些数据、Qdrant 如何执行带约束的近邻搜索，再进入项目真实全文检索链路和 Dense + Sparse 的工程改造。
+
+### 【3.1 Payload Index、过滤时机与权限边界】
+
+*原讨论问题：RAG 的权限与有效性过滤应在离线建索引、检索中还是检索后执行*
+
+
+#### 【提问】
+
+在 RAG 检索中，如果需要按照知识库/租户权限、文档状态、有效版本、生效时间等条件限制检索范围，这些条件通常在**离线入库时**处理，还是在**执行向量检索前/过程中**过滤，或应当先检索再由应用程序做**检索后过滤**？Qdrant 的 Payload Keyword Index 是如何发挥作用的？已有项目采取了什么机制？
+
+#### 【结论与知识概述：离线建索引、在线定范围、检索时过滤、必要时检索后复核】
+
+这并非三个互斥方案，而是不同职责分层：
+
+| 阶段 | 目标 | 核心输入与操作 | 对最终证据的影响 |
+|---|---|---|---|
+| 离线文档入库/索引准备 | 提供可过滤的数据结构 | 将 `knowledgeBaseId`、`documentId`、`tenantId`、`status`、`effectiveFrom/To` 等适用字段写入 Payload，建立相应类型的 Payload Index | 为之后的高效过滤提供数据与索引，但不能替当前用户做授权决策 |
+| 在线查询发起前 | 计算本次合法访问范围 | 验证身份；读取后端的知识库/文档授权关系、当前有效版本与时间约束，构造查询 Filter | 得到当前调用者真正被允许访问的数据集合 |
+| Qdrant 检索执行期间 | 在 Filter 约束下求相关 Top-K | Query Vector 或 Sparse Query + Payload Filter，由 Qdrant 查询规划器选择执行策略 | 避免不合法候选先占据无过滤 Top-K，再被应用层删掉 |
+| 检索后、Rerank/Context 前 | 必要的二次校验 | 检查版本、文档是否失效、权限是否撤销、来源信息是否仍有效 | 增加一致性与安全保护，但不能取代检索期的范围约束 |
+
+**硬性授权和已知业务约束应尽量下推到检索请求中，而不是依赖“全库 Top-K → 后置删除”**。同时后置复核仍有意义，尤其用于处理动态授权与文档状态变更；如果复核失败，不能继续向 Reranker、LLM、前端或日志释放该证据。
+
+注意这里的“在线检索前”是指**先由业务层计算授权与过滤条件**；向量数据库内部并不一定按“先物化所有过滤后的 Point，再对它们启动 HNSW”的固定顺序执行。应从**逻辑约束**和**物理执行计划**两个层次理解。
+
+#### 【概念边界：Payload、Payload Index、Filter 与向量索引分别做什么】
+
+假设 Point：
+
+~~~json
+{
+  "id": "point-001",
+  "vector": [0.12, 0.84, 0.23],
+  "payload": {
+    "chunkId": "doc-001_0",
+    "content": "员工应提前三个工作日申请年假。",
+    "knowledgeBaseId": "kb-A",
+    "documentId": "doc-001",
+    "tenantId": "tenant-01",
+    "status": "ACTIVE"
+  }
+}
+~~~
+
+上面的向量只是教学示例，实际维度与项目 Embedding 模型一致。
+
+- **Payload**：附在 Point 上的正文和业务属性，作为过滤表达式可访问的数据；存在 Payload **不自动等于**已为字段建立索引。
+- **Payload Index**：按字段类型为 Qdrant 的过滤和查询规划提供加速、基数估计及过滤式 HNSW 关联能力；例如 `keyword` 适合精确匹配的知识库 ID，不是对 `content` 做 BM25 倒排索引。
+- **Filter**：某次请求真正要执行的业务范围约束，例如当前用户仅可访问 `kb-A`；必须在在线 Query 中传入，**建立索引本身不代表自动启用该条件**。
+- **Dense HNSW / Sparse Index**：决定相似度/词项候选如何发现并排序；Payload Index 是与之协作的过滤机制，不是把过滤字段本身变成语义向量。
+
+重要澄清：将 `tenantId` 建立为 Payload Keyword Index，并不意味着给每位用户创建一个物理隔离的 Collection 或独立向量空间。共享 Collection 上的 Filter 首先提供**逻辑隔离**；是否采用 per-tenant 布局、`is_tenant` 优化、独立 Shard 或独立 Collection，是另一层有关隔离、性能与租户规模的架构决策。高隔离要求还应考虑服务端权限、密钥与数据部署边界。
+
+#### 【Qdrant 如何把 Filter 与 HNSW 搜索结合起来】
+
+Qdrant 官方[Filtering in Vector Search](https://qdrant.tech/documentation/search-patterns/vector-search-filtering/)明确区分：
+
+- **纯后置过滤**：先执行无约束近邻搜索，截断 Top-K，再删除不满足条件的候选。它可能导致返回数量不足，且正确的合法候选根本未进入无约束 Top-K。
+- **朴素完全前置过滤**：先找到所有符合条件的 Point，再逐一精确计算向量距离。对匹配很少的情况可行，但过滤后集合较大时穷举开销可能很高。
+- **Qdrant 的检索中融合过滤**：结合 Payload Index、过滤条件及分段查询规划，可能直接评分少量过滤后的候选，也可能在 Filterable HNSW 上进行带约束的近邻搜索；具体执行路径与过滤基数、索引构建状态和配置有关。
+
+逻辑链路：
+
+~~~text
+查询者身份
+     ↓
+后端鉴权与权限计算
+     ↓
+授权的 KnowledgeBase/Document IDs、有效版本等
+     ↓
+[Query Embedding + Qdrant Payload Filter + topK]
+     ↓
+Qdrant Query Planner
+     ├─ 少量匹配候选：直接评分
+     └─ 大范围匹配：利用支持过滤的向量索引
+     ↓
+在过滤约束下返回相似候选 Top-K
+     ↓
+必要时进行失效/授权复核
+     ↓
+Fusion → Rerank → Context Construction → Generation
+~~~
+
+因此不能在面试中笼统回答“Qdrant 总是先过滤完所有文档，再去运行一次 HNSW”。正确表达是**在向量检索执行中施加 Filter 约束，并由 Qdrant 选择合适的搜索策略**。
+
+**过滤不意味着 ANN 一定变为精确搜索**：当采用近似 HNSW 时，严格 Filter、多个过滤条件的交集以及索引状态都可能影响 Recall 和延迟。可使用精确过滤向量搜索作为小样本基线，对比正常过滤式 HNSW 的 Recall@K 和 P95；部分 Qdrant 版本/部署支持 ACORN 等提高严格过滤场景召回的策略，应基于实际 Server 版本测试。
+
+#### 【为什么不能先取全库 Top-K 再在应用端过滤：正确性与安全性】
+
+假设用户只允许访问知识库 A，查询返回上限为 `topK=3`，知识库 B 不可访问。全库原始相似度排序：
+
+| 全库名次 | Chunk | 知识库 | 当前用户是否有权 |
+|---:|---|---|---|
+| 1 | B1 | B | 否 |
+| 2 | B2 | B | 否 |
+| 3 | A1 | A | 是 |
+| 4 | B3 | B | 否 |
+| 5 | A2 | A | 是 |
+| 6 | A3 | A | 是 |
+
+错误方案：
+
+~~~text
+无过滤 Query → 全库 Top-3 = [B1, B2, A1]
+                         ↓
+                    应用层删除 B1/B2
+                         ↓
+                     最终仅 [A1]
+~~~
+
+虽然 A2/A3 合法且相关，但已在无过滤 Top-3 之外，被提前截断；返回仅一条而非请求的三条，损害**授权语料内的 Candidate Recall**。
+
+正确的查询约束：
+
+~~~text
+filter = { knowledgeBaseId in ["A"] }
+              ↓
+     在 A 范围内执行 Top-3
+              ↓
+          [A1, A2, A3]
+~~~
+
+这个例子是假设 A 中确实有三条候选的教学情况，实际 ANN Top-K 还受阈值和近似搜索影响。
+
+还有权限与信息流问题：无约束检索可能把 B 的 Payload 带回应用服务，并在调试日志、Reranker 或模型输入中产生不必要的越权处理风险。**所以应在服务端使用经过授权的 Filter 限制候选发现，不能仅在最后输出 HTML/JSON 前过滤**。
+
+后置验证仍然可以作为额外检查，例如检索执行期间某文档刚好被撤销或者文档发布状态变更；此时可丢弃失效候选并在合法范围内适度补检，但不能只依赖这种后续修复。
+
+#### 【妙码 AI Flow 的源码现状：已建立两种 Keyword Index，在线只按知识库 ID 过滤】
+
+##### 【一、离线创建 Collection 与 Payload Index】
+
+[`packages/ai-engine/src/knowledge/store/qdrant-store.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 的 `ensureCollection()` 会在**新建 Collection** 后执行：
+
+~~~typescript
+await this.client.createPayloadIndex(
+  this.collectionName,
+  {
+    field_name: "knowledgeBaseId",
+    field_schema: "keyword",
+  },
+);
+
+await this.client.createPayloadIndex(
+  this.collectionName,
+  {
+    field_name: "documentId",
+    field_schema: "keyword",
+  },
+);
+~~~
+
+作用：
+
+- `knowledgeBaseId`：在 Dense Search 与 `textSearch()` 的 `scroll` 过滤中使用，限制检索范围；
+- `documentId`：在 `deleteByDocumentId()` 删除点数据的过滤等操作中使用，也方便后续文档级查询。**不能因为建立了该字段索引就声称当前 Dense Search 已经自动增加 `documentId` 查询过滤**。
+
+`upsertVectors()` 将 `chunkId/content/chunkIndex/documentId/knowledgeBaseId` 等作为 Point Payload 写入 Qdrant。这样离线将业务字段编码成可过滤的数据。
+
+**源码细节**：`ensureCollection()` 检查到 Collection 已存在时会提前返回。因此若对老 Collection 新增过滤字段索引或发现旧索引缺失，不能只调用此方法就假设索引已被自动补齐；应单独检查索引 Schema 并执行可重复的索引迁移/修复逻辑。
+
+Qdrant 官方建议在已知过滤字段时**优先在写入 Point 前建立 Payload Index**，让 Filterable HNSW 的过滤关联随着索引结构创建得更充分；如果先积累大规模数据、后来再补索引，可能需要重建 HNSW 相关结构才能得到相同的过滤性能。参见 [Production: Bulk Data Import](https://qdrant.tech/documentation/production-operations/bulk-data-import/)。
+
+##### 【二、业务 API 在线先判断知识库归属】
+
+[`apps/workflow/app/api/knowledge/[id]/search/route.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts) 首先：
+
+~~~typescript
+const userId = await getCurrentUserId();
+if (!userId) {
+  return apiError(ErrorCode.UNAUTHORIZED);
+}
+
+const knowledgeBase = await prisma.knowledgeBase.findFirst({
+  where: { id: knowledgeBaseId },
+});
+if (!knowledgeBase || knowledgeBase.userId !== userId) {
+  return apiError(ErrorCode.KNOWLEDGE_BASE_NOT_FOUND);
+}
+~~~
+
+即这条 API 在调用检索器之前，先核对用户身份及其对指定 Knowledge Base 的所有权，然后传入：
+
+~~~typescript
+const results = await retriever.retrieve({
+  query,
+  knowledgeBaseIds: [knowledgeBaseId],
+  mode,
+  topK,
+  threshold,
+  vectorWeight: knowledgeBase.vectorWeight,
+});
+~~~
+
+这说明 API 的权限边界并非依靠 Qdrant 自动识别当前用户，而是由**业务层核验之后，将合法的知识库 ID 作为检索过滤范围传入**。
+
+##### 【三、Qdrant 向量检索在 Query 内执行 Filter】
+
+同一个 `QdrantVectorStore.search()` 通过：
+
+~~~typescript
+const response = await this.client.search(
+  this.collectionName,
+  {
+    vector,
+    limit: topK,
+    score_threshold: threshold,
+    filter: {
+      must: [
+        {
+          key: "knowledgeBaseId",
+          match: { any: knowledgeBaseIds },
+        },
+      ],
+    },
+    with_payload: true,
+    with_vector: false,
+  },
+);
+~~~
+
+对结果施加 `knowledgeBaseId` 限制。当前的文本分支 `textSearch()` 虽然仍是 `scroll(limit:1000)` 后在 Node.js 进行字符串匹配，但 `scroll` 同样带有 `knowledgeBaseId` Filter；这不能被误写成真正 BM25 Sparse Search，也不能消除该分支只读第一页 1000 个 Point 的限制。
+
+**结论：此 API 的“业务侧所有权校验 + 向量库检索时字段过滤”是明确的现有机制**。但项目尚未实现 `tenantId`、文档有效时段、状态或复杂 ACL 字段的统一检索过滤体系，不能将建议架构描述为已交付。
+
+##### 【四、工作流知识节点的授权边界需要单独说明】
+
+[`packages/ai-engine/src/nodes/executors/knowledge-executor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts) 使用工作流节点配置里的 `knowledgeBaseIds` 调用 Retriever，在该执行器自身的代码中检查了 ID 列表非空、Query 非空等，但**没有在该执行器内做与知识库搜索 API 相同的 `userId → knowledgeBase.userId` 所有权查询**。
+
+因此不能由“知识库搜索 API 安全”推断“所有工作流执行入口都已做同样授权”。应在所有运行入口/服务层统一保证传入执行器的是**按当前调用者授权确定的合法知识库集合**；更强的方案可把已验证的授权 Scope 当作不可由用户任意覆盖的运行时上下文，以避免节点配置绕过权限边界。
+
+#### 【如果进一步增加生效时间、版本和细粒度 ACL，应怎样建模】
+
+可以将已知且稳定、需要用于高频查询过滤的字段放入 Payload；示例为未来改造结构：
+
+~~~typescript
+type KnowledgeChunkPayload = {
+  chunkId: string;
+  documentId: string;
+  knowledgeBaseId: string;
+  tenantId: string;
+  content: string;
+  status: "ACTIVE" | "ARCHIVED";
+  effectiveFrom?: string;
+  effectiveTo?: string;
+  version?: string;
+};
+~~~
+
+入库/维护阶段：
+
+- `keyword` 适于精确 ID、状态和版本匹配；
+- 日期或数值范围应使用适当的 `datetime`、`integer` 等字段索引及 `range` 条件；
+- 选择真正高频过滤字段建立索引，索引会增加存储/维护成本，且需匹配字段的值类型；
+- 文档发布、版本变动、权限撤销后应确保 Qdrant Payload 与业务权威数据源间的一致性，不应让旧 `ACTIVE` 状态无限期滞留。
+
+在线语义示意，**以下为新功能设计草案，不是当前代码**：
+
+~~~typescript
+const allowedKnowledgeBaseIds =
+  await authorizationService.getAllowedKnowledgeBaseIds(currentUser);
+
+const response = await client.query("knowledge_chunks", {
+  query: queryVector,
+  filter: {
+    must: [
+      {
+        key: "knowledgeBaseId",
+        match: { any: allowedKnowledgeBaseIds },
+      },
+      {
+        key: "status",
+        match: { value: "ACTIVE" },
+      },
+    ],
+  },
+  limit: topK,
+  with_payload: true,
+});
+~~~
+
+其中 `authorizationService` 是拟新增或复用的可信业务授权服务，而不是已有实现；若授权列表为空应直接拒绝/返回空，不可删除 Filter 退化为全库查询。
+
+对于生效日期，既要支持开始时间约束，也要考虑 `effectiveTo` 为空（长期有效）的语义；复杂范围条件必须根据具体的 Qdrant Filter Schema 显式表达，不要把日期字符串简单当成 Keyword 做字典序比较。
+
+**动态用户权限不宜全部当成静态 Payload**：例如用户加入/退出团队、权限变更、文档共享名单变动，真正的权限关系通常在业务数据库或授权服务中，以该权威数据源计算当前可见集合，再生成 Qdrant Filter。若 ACL 很复杂，可以考虑文档可见性物化或不同粒度的索引隔离设计，但必须平衡更新成本、查询选择性和安全性。
+
+#### 【过滤与索引的工程验收】
+
+应同时衡量**访问控制正确性、授权语料中的检索质量以及性能**，而不只是响应是否有结果：
+
+| 检查 | 用例与方法 | 预期 |
+|---|---|---|
+| 用户隔离 | A/B 两个用户拥有不同 Knowledge Base，相同 Query | A 无法获取 B 的 Chunk 内容或来源 Metadata |
+| 文档状态 | ACTIVE/ARCHIVED 两个版本同时留在存储 | 本次请求只检索当前许可且生效的版本 |
+| 精确范围与后置过滤对照 | 教学情形：全库前 K 被大量越权数据占据 | 检索期 Filter 不会先让越权候选占据 Top-K |
+| ANN 近似误差 | 选取严格过滤 Query，对比精确评分与普通 Qdrant 搜索 | 检查过滤范围内的 Recall@K 与 P95，必要时调整索引/参数 |
+| 撤权/版本变更 | 查询期间修改权限或文档状态 | 不释放过期越权证据，必要时失败关闭、复核与补检 |
+| 多入口一致性 | 管理 API、工作流知识节点、批处理调用 | 相同调用者授权 Scope 可解释、一致且不会被任意扩大 |
+| 索引维护 | 新 Collection 创建、已有 Collection 迁移 | 检查字段索引存在、类型正确、索引构建状态可追踪 |
+
+注意：`Payload Index` 能改善过滤检索性能，但本身**不等于访问控制系统**；访问控制由受信任的服务端鉴权与 Filter 构造实现，并应避免将 Qdrant 无约束查询能力直接暴露给不可信调用者。
+
+#### 【面试标准回答】
+
+在 RAG 系统中，权限与文档有效性过滤通常采用**离线建索引、在线检索时约束和检索后必要复核**的分层模式。离线入库时将知识库/租户 ID、文档状态、生效范围、版本等字段写入 Payload，并针对高频过滤字段创建 Payload Index；在线由服务端验证用户身份与授权，生成 Filter，与 Query Vector 一起提交给 Qdrant。
+
+Qdrant 可以结合 Payload Index 和 Filterable HNSW，把过滤约束纳入近邻搜索执行；查询规划器依据匹配量选择对少量候选直接评分或在过滤式 HNSW 上搜索，并非固定“先把所有文档过滤完，再启动一次 HNSW”。相比“全库 Top-K 后应用层删除”，检索时 Filter 可以避免不合法候选先挤占 Top-K，减少无效数据处理，也有利于保障授权语料下的召回质量。
+
+妙码 AI Flow 现已对 `knowledgeBaseId` 和 `documentId` 建立 Keyword Payload Index；知识库搜索 API 先核对知识库归属，再把合法 `knowledgeBaseId` 下推给向量检索及文本 `scroll` 分支。工作流 KnowledgeExecutor 本身未重复执行用户所有权校验，需要依赖受信任的运行入口统一保证其知识库 ID 范围。未来扩展有效版本和动态 ACL 时，应在可靠授权数据源上计算过滤约束，检索后对撤权、失效和来源进行必要复核，但不应把后置检查作为唯一控制。
+
+**一句话：离线准备索引，在线计算授权范围，向量检索中执行 Filter，使用证据前必要时复核；Payload Index 是加速与查询规划工具，不是自动授权或独立向量空间。**
+
+#### 【参考资料与源码】
+
+1. [Qdrant：Filtering in Vector Search—Filter During the Search, Not Before or After](https://qdrant.tech/documentation/search-patterns/vector-search-filtering/)：过滤时机、Filterable HNSW 与基数感知策略。
+2. [Qdrant：Bulk Data Import—Create Payload Indexes Before Uploading](https://qdrant.tech/documentation/production-operations/bulk-data-import/)：先建索引和过滤式 HNSW 关联的性能影响。
+3. [Qdrant：Filtering and Exact String Matching](https://qdrant.tech/documentation/search/text-search/text-filtering/)：Keyword Index 的准确职责。
+4. [Qdrant：Production Checklist](https://qdrant.tech/documentation/production-checklist/)：过滤索引与查询优化建议。
+5. [Qdrant：FAQ（Logical Separation、Per-tenant Index、Sharding）](https://qdrant.tech/documentation/faq/)：共享 Collection 中的逻辑隔离与更强隔离设计的区别。
+6. 项目：[Qdrant Store](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)、[知识库搜索 API](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts)、[KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts)、[document-processor.ts](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)。
+
+---
+
+### 【3.2 妙码 AI Flow 文本检索源码与 BM25 改造】
+
+*原讨论问题：妙码 AI Flow 当前文本检索的实现、与 BM25 的区别以及改造方案*
+
+
+#### 【问题背景与结论】
 
 上一题已经理解：BM25 借助词项、TF/DF/IDF、文档长度与倒排索引快速找到相关 Chunk；Dense Search 则依据 Embedding 向量进行语义近邻检索。现在回到项目源码回答三个实际工程问题：**当前所谓“全文/关键词检索”到底如何执行？它和真正的 BM25 差在哪里？如果用现有 Qdrant 引入 BM25，应该调整哪些代码与数据结构？**
 
@@ -1615,7 +1489,7 @@ Qdrant 可以通过 BM25 Sparse Vector 索引实现这套能力，并允许同�
 
 为帮助理解，下文先重建源码调用链，再对照 BM25 的处理链，最后按模块给出可实施但**尚未写入项目代码、尚未运行验证**的方案。
 
-### 【业务上下文：两个入口共用同一个检索器，但分别组装 Provider】
+#### 【业务上下文：两个入口共用同一个检索器，但分别组装 Provider】
 
 **入口一：用户在知识库管理页面发起搜索。**
 
@@ -1631,7 +1505,7 @@ Qdrant 可以通过 BM25 Sparse Vector 索引实现这套能力，并允许同�
 
 因此两处都需要调整 Provider，**只修改 API 会造成页面与工作流结果不一致**。知识库执行器自身虽然接受知识库 ID 数组，但不能仅据此证明该执行入口已经做了与 API 相同的最终用户权限校验；改造不得弱化或越过调用链上的授权边界。
 
-### 【离线入库：存储了正文，并不等于对正文建立关键词检索索引】
+#### 【离线入库：存储了正文，并不等于对正文建立关键词检索索引】
 
 源码：[`apps/workflow/lib/services/document-processor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts) 与 [`QdrantVectorStore`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)。
 
@@ -1696,7 +1570,7 @@ documentId = doc-008    → 找到归属 doc-008 的 Point
 
 Qdrant 目前支持这几种不同能力，但**项目仅使用了第一种和 Dense 向量索引**。
 
-### 【在线全文检索：scroll 后在 Node.js 逐个扫描】
+#### 【在线全文检索：scroll 后在 Node.js 逐个扫描】
 
 源码：[`QdrantVectorStore.textSearch()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)。
 
@@ -1786,7 +1660,7 @@ return matchedResults.slice(0, topK).map(({ result, matchScore }) => ({
 
 **边界与缺陷**：直接 `new RegExp(term, 'gi')` 未对用户提供的词项做正则转义；输入若包含 `.`、`[`、`(` 等正则元字符，可能改变匹配语义或触发正则解析异常。这是独立于是否引入 BM25 的当前实现风险。
 
-### 【与标准 BM25 的主要差异：索引结构和运行成本比公式更关键】
+#### 【与标准 BM25 的主要差异：索引结构和运行成本比公式更关键】
 
 | 对比项 | 当前 `textSearch()` | 传统 BM25 或 Qdrant BM25 Sparse |
 |---|---|---|
@@ -1814,7 +1688,7 @@ BM25：
 
 **不能只给当前 JS 循环加上一段 BM25 评分公式就认为完成了改造**。如果依然从有限的前 1000 个 Point 里计算分数，未进入此批次的正确证据依旧永远找不到。真正解决候选发现与规模化检索问题，需要替换数据组织和索引查询方式。
 
-### 【现有 HybridRetriever 如何把文本候选与 Dense 结果融合】
+#### 【现有 HybridRetriever 如何把文本候选与 Dense 结果融合】
 
 源码：[`packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)。
 
@@ -1838,7 +1712,7 @@ RRF(d)
 
 **因此当前可复用的能力是“检索模式控制 + 两路异步调用 + 候选去重融合”**；升级 BM25 的第一阶段无需强制重写 RRF，但要保证真实 BM25 通道返回的 Chunk ID、文档信息与现有类型兼容。RRF 的公式、权重与逐条计算在下一题单独展开。
 
-### 【建议改造目标：让同一 Chunk 拥有 Dense 与 BM25 两种表示】
+#### 【建议改造目标：让同一 Chunk 拥有 Dense 与 BM25 两种表示】
 
 本项目已有 Qdrant、Ollama Embedding 与 RRF，可以优先引入 Qdrant 的 BM25 Sparse Vector，暂不增加 Elasticsearch 这一独立基础设施。建议目标：
 
@@ -1864,7 +1738,7 @@ Query ──→ Dense Query Embedding ──→ Dense Search ─┐
 
 注意：**同一 Point 可以存多种向量，但必须把新字段值实际写入每个 Point**；仅为 Collection 增加 `sparse_vectors` Schema 不会自动从现有 Payload 正文构建 BM25 Sparse 值。Qdrant 官方对现有 Collection 的命名向量扩展也明确了这一点。
 
-### 【改造步骤一：Qdrant Collection 的向量 Schema】
+#### 【改造步骤一：Qdrant Collection 的向量 Schema】
 
 建议对于首次验证创建一个新 Collection（例如 `knowledge_chunks_v2`），可与旧 Collection 并存以保证回滚。**以下为目标配置示例，不是当前已执行代码**：
 
@@ -1892,7 +1766,7 @@ await client.createCollection("knowledge_chunks_v2", {
 | 原 Collection 增加 Sparse 字段并补录（适用版本需确认） | 复用已有 Point 和 Dense 表示，降低搬迁量 | 与在线写入竞争、补录中数据不完整、版本/API 兼容 |
 | 新 `knowledge_chunks_v2` 并行迁移（更适合首次验证） | 双版本对照和回滚明确，可独立验收 | 双倍暂存成本、增量数据同步与切换一致性 |
 
-### 【改造步骤二：离线 Chunk 生成 BM25 Sparse 表示】
+#### 【改造步骤二：离线 Chunk 生成 BM25 Sparse 表示】
 
 现有 [`processDocument()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts) 只运行：
 
@@ -1960,7 +1834,7 @@ const point = {
 
 **不是必须同时为同一 Chunk 再建一张 SQL 关键词表**。Qdrant 会管理稀疏向量、维度对应的索引和与其配置兼容的 IDF 修正；Embedding 和 BM25 编码负责提供可检索的表示，而不是自己实现物理倒排表。
 
-### 【改造步骤三：在线使用 BM25 Sparse Index，而不是 scroll 正文】
+#### 【改造步骤三：在线使用 BM25 Sparse Index，而不是 scroll 正文】
 
 旧链路：
 
@@ -2017,7 +1891,7 @@ async function bm25Search(
 
 原有 `knowledgeBaseIds` 范围过滤必须保留；若同一 Collection 存储多租户知识，BM25 的 IDF 统计范围与 Query 结果过滤范围并不天然相同。使用 Qdrant 支持的 per-tenant IDF 统计或隔离策略前，需要核对版本和统计语义，不能把授权过滤误当作自动的租户隔离 IDF。参考 [Qdrant Multitenancy](https://qdrant.tech/documentation/tutorials/multiple-partitions/)。
 
-### 【改造步骤四：复用 HybridRetriever，统一两个业务入口】
+#### 【改造步骤四：复用 HybridRetriever，统一两个业务入口】
 
 **优先采用最小改动**：保留 `HybridRetriever.retrieve()`、`vector/fulltext/hybrid` 三模式及 `reciprocalRankFusion()`，只替换 `FulltextSearchProvider.search()` 的底层实现。
 
@@ -2051,7 +1925,7 @@ HybridRetriever
 
 **关于阈值和 Score**：原 `threshold` 用于 Dense 相似度检索，不能自动沿用为 BM25 的得分阈值，因为两种 Score 不同尺度。现有应用层加权 RRF 以排名为输入而非直接相加两路 Score，因此第一阶段可以复用，但替换了文本检索算法后，融合顺序仍需要由 Ground Truth 实验验证。
 
-### 【历史数据迁移与回滚】
+#### 【历史数据迁移与回滚】
 
 不能只改 `ensureCollection()` 配置然后宣布历史数据都已具备 BM25。旧 Point 存的是 Dense 与 Payload；必须为每个历史 Chunk 提供 BM25 表示。
 
@@ -2061,7 +1935,7 @@ HybridRetriever
 
 如使用 `upsert()` 全量更新原有 Point，必须验证新的 Vector/Payload 组合不会意外覆盖或丢失旧字段；仅补写向量可优先查验对应的 `updateVectors` 等增量 API 并选择适配当前 Server 的操作。**不要默认“新增 Sparse 字段”能够自动从既有 Payload 反向生成向量值。**
 
-### 【验证方案：证明升级比当前实现更好】
+#### 【验证方案：证明升级比当前实现更好】
 
 不要把“BM25 API 能返回结果”当完整验收。建议沿这条链路验证：
 
@@ -2073,7 +1947,7 @@ HybridRetriever
 6. **质量可归因**：按同义表达、专业编号、多证据、条件/否定等查询类别单独分析收益与退化；对融合前、融合后有序候选保存必要的 Trace，防止平均分掩盖特定场景失败。
 7. **部署与回滚**：保持新旧 Collection/入口的切换策略、迁移幂等、索引补录进度和失败恢复方案；验证原检索模式可以在出现异常时恢复。
 
-### 【面试标准回答】
+#### 【面试标准回答】
 
 妙码 AI Flow 当前通过 Qdrant 存储 Dense 向量及 Chunk 正文，对 `knowledgeBaseId` 和 `documentId` 建立 `keyword` Payload Index，用于权限范围或文档定位；它没有为正文建立 BM25 倒排索引。现有 `textSearch()` 在查询时一次 `scroll` 最多 1000 个 Point，在 Node.js 中对 Query 按标点/空格拆分、执行子串匹配和出现次数打分，再取 Top-K，因此既缺少规范 TF/IDF/长度归一化，也存在语料扫描覆盖上限和中文分词不足的问题。
 
@@ -2081,7 +1955,7 @@ HybridRetriever
 
 由于项目采用自建 Docker Qdrant，还必须验证 Qdrant Server/Client 版本与推理部署条件；官方面向支持服务端文本推理的 `qdrant/bm25` 请求不能不经验证就当成本地可用。对现有数据选择新增 Sparse 字段并补录，或建立新 Collection 蓝绿迁移，最终保证历史与增量数据都拥有完整的 Dense/Sparse 表示。
 
-### 【参考文档与本项目证据】
+#### 【参考文档与本项目证据】
 
 1. [Qdrant Collections：Update Vector Schema](https://qdrant.tech/documentation/manage-data/collections/)：Qdrant v1.18 起为现有 Collection 新增命名 Dense/Sparse Vector，已有 Point 需要补录实际向量值。
 2. [Qdrant Inference：Choose Your Approach](https://qdrant.tech/documentation/inference/)：自建环境优先通过客户端或 FastEmbed 管理 Sparse 生成；服务端 `qdrant/bm25` 推理有部署差异。
@@ -2094,9 +1968,16 @@ HybridRetriever
 
 ---
 
-## 【第六题：RRF 如何融合不同检索通道的排序，以及它与 Rerank 有什么区别】
+## 【四、多路候选融合与语义重排序】
 
-### 【问题背景：多路检索的分数不能直接相加】
+候选来自不同检索通道后，需要先解决分数不可直接比较的问题，再判断融合排序是否真正理解证据与问题的关系，循序展开 RRF、Bi-Encoder 和 Cross-Encoder Rerank。
+
+### 【4.1 RRF 排名融合、加权计算与源码实现】
+
+*原讨论问题：RRF 如何融合不同检索通道的排序，以及它与 Rerank 有什么区别*
+
+
+#### 【问题背景：多路检索的分数不能直接相加】
 
 前一题已经明确，Dense Search 利用 Embedding 语义相似度查找候选，BM25 利用词项统计和倒排索引查找候选；妙码 AI Flow 目前第二路仍是应用层字符串匹配，而不是标准 BM25。
 
@@ -2128,7 +2009,7 @@ RawSum(D1) = 19.45
 
 BM25 与 Cosine 的来源、数值尺度和统计意义不同。直接相加可能因 BM25 数值量级较大而支配合并得分。即使把两路分数都变到 0～1，也需要核查归一化范围、分布漂移与跨 Query 可比性，而不是简单认为量纲已经完全相同。
 
-### 【知识概述：RRF 用排名代替原始分数】
+#### 【知识概述：RRF 用排名代替原始分数】
 
 RRF（Reciprocal Rank Fusion，倒数排名融合）不直接比较 Dense 与 BM25 的原始 Score，而只使用**候选在每一路排序中的位置**，将倒数贡献累加为融合分数。
 
@@ -2147,7 +2028,7 @@ RRF(d) = Σ 1 / (k + rank_i(d))
 
 RRF 结果是**排名融合信号**，不是原始 Cosine Score、BM25 Score，也不是“答案正确的概率”。
 
-#### 【Weighted RRF：妙码 AI Flow 使用了什么公式】
+##### 【Weighted RRF：妙码 AI Flow 使用了什么公式】
 
 项目的加权变体：
 
@@ -2171,7 +2052,7 @@ const fulltextWeight = 1 - vectorWeight;
 
 这表示向量排名贡献按系数 0.7 计算，文本排名贡献按 0.3 计算。**不是**要求最终结果 70% 出自 Dense，也不是“该结果正确概率为 70%”；若某个 Chunk 同时位于两路候选中，两路贡献都会累加。
 
-### 【完整教学手算：合并候选 → 算每路得分 → 最终排序】
+#### 【完整教学手算：合并候选 → 算每路得分 → 最终排序】
 
 使用本节最初的排序，不再需要两路原始 Score：
 
@@ -2234,7 +2115,7 @@ D2 → D1 → D4 → D3 → D5
 - **双路共识累积优势**：D4 即便在 Dense 只有第 4、文本第 3，也因两路都包含它而最终超过仅 Dense 第 2 的 D3。
 - **通道权重影响冲突结果**：D1 在文本第 1，但 D2 在 Dense 第 1；向量通道权重更高，使 D2 最终仍领先 D1。**RRF 在本例中没有将正确证据 D1 排到第 1**，因此 RRF 不是正确性保证。
 
-### 【k 为什么通常选择 60，它改变的是什么】
+#### 【k 为什么通常选择 60，它改变的是什么】
 
 单路名次贡献为：
 
@@ -2260,7 +2141,7 @@ score(d) = Σ [ 1 / (k + (rank_in_result / weight) - 1) ]
 
 其权重作用于排名的有效位置，而妙码 AI Flow 使用的是 `weight / (k + rank)`。两者默认 `k`、权重表达及可能的排序都**不一定相同**。文档解释和代码迁移时要分别标注具体公式/版本，不能把项目源码 `k=60` 直接视为 Qdrant 原生的默认参数。
 
-### 【源码分析：HybridRetriever.reciprocalRankFusion()】
+#### 【源码分析：HybridRetriever.reciprocalRankFusion()】
 
 源码路径：[`packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)。
 
@@ -2318,7 +2199,7 @@ return Array.from(scoreMap.values())
 
 **项目事实边界**：当前 Fulltext Provider 仍使用 `QdrantVectorStore.textSearch()` 的 `scroll(limit:1000)` + Node.js 字符串匹配，而不是标准 BM25。RRF 已实现，并不代表第二路已经升级到 Qdrant 原生 BM25 或新增了 Cross-Encoder Reranker。
 
-### 【RRF 为什么不能替代检索器，也不能替代 Rerank】
+#### 【RRF 为什么不能替代检索器，也不能替代 Rerank】
 
 **第一，RRF 不改变候选的来源。**若正确 Chunk 同时缺席于 Dense Top-15 与文本 Top-15，RRF 没有它的文本、Score 和 ID，无法产生这一候选。它只能**融合已有候选的排序**。
 
@@ -2328,7 +2209,7 @@ return Array.from(scoreMap.values())
 
 **第四，RRF 的每路质量与候选深度很重要。**项目全文检索当前的 `scroll(limit:1000)` 可能漏掉大量相关片段；盲目给该通道更高权重，不一定提高准确性。`expandedTopK=ceil(1.5*topK)` 也是工程经验值，可通过初始 Recall 与最终 nDCG 的变化验证是否合理。
 
-### 【RRF 与 Rerank：排序融合和语义重排之间的边界】
+#### 【RRF 与 Rerank：排序融合和语义重排之间的边界】
 
 | 对比对象 | RRF / Rank Fusion | Cross-Encoder Rerank（常见模型方案） |
 |---|---|---|
@@ -2364,7 +2245,7 @@ Query
 
 RRF 和 Rerank 都不能“找到从未被上游召回的正确证据”，不过前者整合多个 Rank，后者重新计算文本与 Query 的相关性。实际系统可只使用 Dense、Dense+RRF，或引入 Cross-Encoder，是否值得由评测与成本约束决定。
 
-### 【验证方案：不要只看最终融合得分】
+#### 【验证方案：不要只看最终融合得分】
 
 在相同 Ground Truth/语料/权限/Query 集合下分别执行：
 
@@ -2379,7 +2260,7 @@ RRF 和 Rerank 都不能“找到从未被上游召回的正确证据”，不�
 
 **注意相关性口径**：RRF Score 只是融合排序数，不适合作为“答对概率”的阈值；要判断最终答案是否准确，还需要保留进入 LLM 的 Context 并评估 Faithfulness / Answer Correctness。
 
-### 【面试标准回答】
+#### 【面试标准回答】
 
 RRF 是基于候选在多个检索通道中的**排名**进行融合的方法。标准算法对每条候选在第 i 个结果列表中的贡献使用 `1/(k+rank_i)`，累加得到融合分数；缺席某一路时该路贡献为零。同一 Chunk 在多路都出现就可以获得累积得分，有助于不经原始 Score 归一化就组合不同检索器。
 
@@ -2387,7 +2268,7 @@ RRF 是基于候选在多个检索通道中的**排名**进行融合的方法。
 
 RRF 的局限是依赖候选召回、忽略原始 Score 间隔、不能判断文本是否真正支持 Query；因此它不是语义 Rerank，也无法找回不在候选池中的正确证据。若需要进一步提高精排，可以在融合之后对有限候选使用 Cross-Encoder Rerank；是否引入及选参必须由 Ground Truth 下的 nDCG、Recall、延迟和成本实测决定。
 
-### 【权威参考与源码】
+#### 【权威参考与源码】
 
 1. [Cormack, Clarke & Büttcher (2009), Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)：RRF 原始研究与 k 的经验值。
 2. [Qdrant Hybrid Queries](https://qdrant.tech/documentation/search/hybrid-queries/)：原生 RRF 的文档公式、权重和默认 k=2。
@@ -2397,9 +2278,12 @@ RRF 的局限是依赖候选召回、忽略原始 Score 间隔、不能判断文
 
 ---
 
-## 【第七题：Rerank 如何重新判断候选相关性，Cross-Encoder 与 Bi-Encoder 有什么区别】
+### 【4.2 Cross-Encoder Rerank 与两阶段检索】
 
-### 【提问与知识目标】
+*原讨论问题：Rerank 如何重新判断候选相关性，Cross-Encoder 与 Bi-Encoder 有什么区别*
+
+
+#### 【提问与知识目标】
 
 前六题已经建立完整的前半段检索体系：Document/Chunking → Dense Vector/HNSW 与 BM25 词项索引 → Ground Truth 和 Recall/MRR/nDCG → 多路候选的 RRF 融合。现在进一步研究：**RRF 已将多路检索结果合成一个排名，为何还要使用 Rerank？如果要让模型直接判断 Query 与 Document 是否相关，为什么不从最开始就对整个知识库使用 Cross-Encoder？**
 
@@ -2409,7 +2293,7 @@ RRF 的局限是依赖候选召回、忽略原始 Score 间隔、不能判断文
 2. **运行**：初始 Retrieval 负责在大规模语料中寻找有限候选，Fusion 合并候选，Rerank 在候选集合内精排；随后 Context Construction 负责组织最终证据。
 3. **工程支撑**：结合妙码 AI Flow 的已有检索器，讨论可选 Rerank 接口、分数来源保留、性能与相关性评测，明确项目现有能力与建议改造的边界。
 
-### 【为什么已经有 RRF，仍然可能需要 Rerank】
+#### 【为什么已经有 RRF，仍然可能需要 Rerank】
 
 RRF 只消费各路检索器输出的**Chunk ID 与排名位置**，通过倒数排名贡献得出最终排序；不需要重新读取 Query 与 Chunk 内容。因此，如果一个错误文档在 Dense 与 BM25 中都排名靠前，它可能获得很高的融合分数，但这不代表它实际能支持用户问题的正确答案。
 
@@ -2441,7 +2325,7 @@ RRF 不会拿查询中的“E-1042”与正文中的“E-1043”做模型级的�
 
 Rerank 不特指 Cross-Encoder 模型：它是一个**重排序阶段/能力**。Cross-Encoder 是常见实现，也可以存在列表式 LLM 评判、轻量打分模型等方法。这里重点讨论最典型的 Cross-Encoder 方案。
 
-### 【Bi-Encoder：为什么适合第一阶段大规模召回】
+#### 【Bi-Encoder：为什么适合第一阶段大规模召回】
 
 Bi-Encoder（双编码器）对 Query 和 Document **分别编码**得到独立向量，再根据向量距离进行检索：
 
@@ -2470,7 +2354,7 @@ Query → Query Encoder → Query Vector
 
 因此 Bi-Encoder 重点优化的是**大规模候选发现的效率与初始覆盖**。但由于 Query 与候选在编码阶段并未联合处理，单一向量通常压缩了大量细节，对错误编号、复杂否定、长距离条件、数值差异或需要逐条对照的匹配，不能天然保证业务正确性。HNSW 只能加速相似向量的近邻搜索，不会修复向量表示本身遗漏的事实。
 
-### 【Cross-Encoder：Query 和 Document 一起输入模型意味着什么】
+#### 【Cross-Encoder：Query 和 Document 一起输入模型意味着什么】
 
 Cross-Encoder（交叉编码器）将 Query 与**某一条候选正文**拼成一个文本对，共同输入 Transformer Encoder，输出该 Query–Document 配对的相关性 Score。
 
@@ -2513,7 +2397,7 @@ Cross-Encoder → Relevance Score = -1.2
 
 相较于独立 Embedding，联合编码能让模型在本次计算中关注具体 Query 与候选的 Token 对应关系，例如编号是否相同、提问需要的是原因还是处理步骤、候选是否只讨论近似主题、是否存在明显限定词冲突。因此 Cross-Encoder **有机会**比原有 Dense Score/RRF Rank 进行更细粒度判断，但也不是对事实真伪、逻辑或引用正确性的绝对保证。
 
-### 【Bi-Encoder 与 Cross-Encoder 的关键区别】
+#### 【Bi-Encoder 与 Cross-Encoder 的关键区别】
 
 | 对比 | Bi-Encoder（典型 Dense Retrieval） | Cross-Encoder（典型 Rerank） |
 |---|---|---|
@@ -2528,7 +2412,7 @@ Cross-Encoder → Relevance Score = -1.2
 
 **重要边界**：Cross-Encoder 不能替代**大规模**初始召回，是效率和索引表达的工程判断，并非数学上“完全不能搜索”。若文档集合只有几十条，直接对全部候选运行 Cross-Encoder 也可以；但当语料达百万级时，逐对推理通常不可接受。
 
-### 【为什么通常需要“两阶段检索”：代价和候选覆盖】
+#### 【为什么通常需要“两阶段检索”：代价和候选覆盖】
 
 给定一百万条 Chunk、一个新 Query：
 
@@ -2579,7 +2463,7 @@ Cross-Encoder 即使使用 Batch/GPU 优化，计算仍随每次 Query 需要处
 
 **流程的变体**：只有 Dense 时也可直接 Dense → Rerank；只有 BM25 时可 BM25 → Rerank；Rerank 不必须位于 RRF 之后。是否需要这层依赖 Query 类型、初始排序质量及推理成本。
 
-### 【接着第六题的教学数据，Rerank 如何改变结果】
+#### 【接着第六题的教学数据，Rerank 如何改变结果】
 
 假设 Query 仍为“E-1042 故障应该如何处理？”，RRF Top-5 为 D2、D1、D4、D3、D5。重新将 Query 与这五条 Chunk 分别配对评分，得到**假设**的模型输出：
 
@@ -2607,7 +2491,7 @@ Rerank：D1 → D2 → D4 → D3 → D5
 
 因此 **Initial Evidence Recall@N 决定第二阶段能够处理的证据范围**；Rerank 的目标是改善候选范围内的最终排名、Precision、MRR、nDCG，以及较小 Top-K 的正确证据覆盖。
 
-### 【妙码 AI Flow 项目：现有什么、缺什么】
+#### 【妙码 AI Flow 项目：现有什么、缺什么】
 
 本轮核对的实际源码：
 
@@ -2619,7 +2503,7 @@ Rerank：D1 → D2 → D4 → D3 → D5
 
 **在上述实际检查过的检索模块和业务调用链中，尚未发现实现独立的 Cross-Encoder Rerank 接口、调用与配置**。仓库原有答辩手册也将“增加中文分词、BM25、Reranker”列为后续改进方向。不能把以下设计当作已经上线、跑过评测的项目现状。
 
-### 【推荐接入方案：可选 Rerank 阶段，避免过早重构检索底座】
+#### 【推荐接入方案：可选 Rerank 阶段，避免过早重构检索底座】
 
 第一版建议在既有 `HybridRetriever.retrieve()` 之后增加**可选的 Rerank 能力**，而不是重写 Qdrant 索引或将 Cross-Encoder 插入 Dense 查询计算内部。
 
@@ -2672,7 +2556,7 @@ interface Reranker {
 
 模型部署选项可以是自建的 Cross-Encoder 推理服务，或提供 Rerank API 的托管模型；选择时需要验证实际的中文表现、输入长度、并发、成本和数据访问约束。**接口抽象可以先建立，是否真正增加服务由评测增益决定**。
 
-### 【质量与性能评测：证明 Rerank 提高了哪些指标】
+#### 【质量与性能评测：证明 Rerank 提高了哪些指标】
 
 把候选发现与候选排序分开评价：
 
@@ -2693,7 +2577,7 @@ interface Reranker {
 
 **一个重要评价口径**：同一候选集合、完全没有额外取回任何新证据的纯重排，对于 `K≥N` 的集合级 Evidence Recall 无法提高，因为结果包含的文档集合没有变化；但对更小的最终 K，或者 MRR/nDCG 等排序指标，重排可以改善。不要笼统声称“Rerank 必然提高召回”。
 
-### 【面试标准回答】
+#### 【面试标准回答】
 
 Rerank 是初始检索之后，在已有候选集合内重新计算与 Query 的相关性并调整排序的阶段。常见实现是 Cross-Encoder：将 Query 和候选文档组成文本对共同输入 Transformer，让两段文本在联合编码过程中进行 Token 交互，再输出相关性分数。
 
@@ -2701,7 +2585,7 @@ Bi-Encoder 独立编码 Query/Document，文档向量可以离线存储，并通
 
 RRF 与 Rerank 的区别是：RRF 只使用多个检索通道提供的 Rank 做数学融合；Cross-Encoder Rerank 则联合阅读 Query 和每条候选正文并计算新分数。两者都无法恢复初始候选中根本不存在的正确证据，因此工程上应先验证 Candidate Recall，再通过固定 Ground Truth 判断 Rerank 是否改善最终 Top-K 的 MRR、nDCG、证据覆盖及成本。对于妙码 AI Flow，可在现有 HybridRetriever 后设计可选 Reranker，同时记录不同阶段的 Score 和候选身份，避免误把尚未实现的重排模块说成项目已有能力。
 
-### 【权威资料与源码】
+#### 【权威资料与源码】
 
 1. [Sentence Transformers：Retrieve & Re-Rank](https://sbert.net/examples/sentence_transformer/applications/retrieve_rerank/README.html)：先以 BM25/Bi-Encoder 获得候选，再由 Cross-Encoder 精排的两阶段结构。
 2. [Sentence Transformers：Cross-Encoders](https://www.sbert.net/examples/cross_encoder/applications/README.html)：Bi-Encoder 与 Cross-Encoder 的输入、输出、预计算与代价区别。
@@ -2711,9 +2595,16 @@ RRF 与 Rerank 的区别是：RRF 只使用多个检索通道提供的 Rank 做�
 
 ---
 
-## 【第八题：Context Construction 如何组织最终送入 LLM 的证据】
+## 【五、Context Construction 与确定性证据组织】
 
-### 【提问与知识概述】
+候选已经排好序，仍需决定哪些真实、有效、上下文充足的证据进入模型；先研究 Token Budget、事实覆盖与引用，再区分可以由程序可靠完成的结构处理和无法直接证明的语义充分性。
+
+### 【5.1 最终 Context 的事实覆盖、预算与来源组织】
+
+*原讨论问题：Context Construction 如何组织最终送入 LLM 的证据*
+
+
+#### 【提问与知识概述】
 
 在 Retrieval、Fusion（RRF）及可选的 Cross-Encoder Rerank 之后，为什么不直接把排名前 K 的 Chunk 拼接成 Prompt？**因为候选排序优化的是单条证据与 Query 的相关性，Context Construction 优化的是有限 Token Budget 内“整组证据是否完整、有效、无明显冗余且可引用”。**
 
@@ -2727,7 +2618,7 @@ RRF 与 Rerank 的区别是：RRF 只使用多个检索通道提供的 Rank 做�
 
 候选里的某条正确事实可能在最终预算选择、截断、去重时消失，所以**候选已召回 ≠ 最终 LLM 真正获得了证据**。
 
-### 【一个具体案例：排名高不等于事实覆盖完整】
+#### 【一个具体案例：排名高不等于事实覆盖完整】
 
 用户 Query：“员工申请年假需要提前多久，由谁审批，试用期是否适用？”
 
@@ -2753,7 +2644,7 @@ RRF 与 Rerank 的区别是：RRF 只使用多个检索通道提供的 Rank 做�
 
 关键限定：**线上程序不会天然知道人工 Ground Truth 的 F1/F2/F3 列表**。只有预先定义领域事实、利用模型分析 Query，或使用经验证的规则才能推断用户需要哪些事实，不能把离线人工标注直接当成线上可自动获得的信息。
 
-### 【Token Budget 的真实约束】
+#### 【Token Budget 的真实约束】
 
 简化表达：
 
@@ -2782,7 +2673,7 @@ EvidenceBudget
 
 被删去的适用条件会影响回答。优先按完整证据或句子/事实边界选择；如果确实截断则应明确标记，不要继续将截断证据视为无条件完整的事实支持。
 
-### 【Context Construction 的职责和运行链路】
+#### 【Context Construction 的职责和运行链路】
 
 ~~~text
 有序候选 Chunk
@@ -2812,7 +2703,7 @@ LLM
 
 研究 [Lost in the Middle: How Language Models Use Long Contexts](https://aclanthology.org/2024.tacl-1.9/) 在特定模型与任务下发现长上下文中间位置的证据可能更难被使用。故“在窗口内”并不保证“模型稳定用到”；但证据摆放顺序需依据具体模型与任务评测，而不是固定认定放在末尾最好。
 
-### 【妙码 AI Flow 当前怎么组织 Context：源码核对】
+#### 【妙码 AI Flow 当前怎么组织 Context：源码核对】
 
 代码：[KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts)、[LLMExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/llm-executor.ts)、[BaseExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/base-executor.ts)、[VariableResolver](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/core/variable-resolver.ts)。
 
@@ -2832,7 +2723,7 @@ LLM
 
 **源码结论**：在上述已核对链路中，没有独立自动执行“权限/版本/背景/去重/Token Budget/最终证据核验”的 ContextBuilder。不能因为有 `topK` 或 `maxTokens` 就宣称实现了这套能力。
 
-### 【建议的第一版 ContextBuilder 数据协议】
+#### 【建议的第一版 ContextBuilder 数据协议】
 
 建议增加独立工程层，而非让 KnowledgeExecutor / LLMExecutor 各自夹杂复杂规则：
 
@@ -2872,7 +2763,7 @@ interface ContextBuilder {
 
 **以上仅是方案接口，不是已经编写的项目业务代码**。实现优先级：可信有效来源、明确重复去除、正确 Token 计数、稳定证据 ID 和调用前检查；复杂的多事实语义覆盖/冲突交给后续独立层评估。
 
-### 【评测：定位证据在哪个阶段消失】
+#### 【评测：定位证据在哪个阶段消失】
 
 假设：
 
@@ -2896,13 +2787,16 @@ Final Context：{F1,F2}    ← 预算/去重等造成 F3 丢失
 
 ---
 
-## 【第八题追问一：不引入模型，哪些证据完整性和背景补充检查能用代码完成】
+### 【5.2 基于结构和规则的证据补齐与有界复检】
 
-### 【提问】
+*原讨论问题：不引入模型，哪些证据完整性和背景补充检查能用代码完成*
+
+
+#### 【提问】
 
 Context Construction 提到事实对齐、条件覆盖、判断缺少背景、补充检索和证据冲突。如果不引入额外模型，能否全部用 TypeScript/脚本完成？代码需要依据什么信息作判断？
 
-### 【知识概述：结构检查和语义判断不是同一件事】
+#### 【知识概述：结构检查和语义判断不是同一件事】
 
 | 判断 | 依赖的信息 | 不用模型是否可靠 |
 |---|---|---|
@@ -2920,7 +2814,7 @@ Context Construction 提到事实对齐、条件覆盖、判断缺少背景、�
 
 **原则**：能通过结构与可信规则证明的事实让代码处理；若仅能由模糊关键词推断，则保留 `unknown` 状态，而不是自动宣布“完整”。
 
-### 【无需模型的结构补齐：标题、邻接、显式引用】
+#### 【无需模型的结构补齐：标题、邻接、显式引用】
 
 假设文档：
 
@@ -2966,7 +2860,7 @@ function hasExplicitReference(text: string) {
 
 命中后，如果有条款编号、`sectionId`、`parentSectionId`、可靠原文 Offset，可以定位被引用条款或有限范围的同节背景。但**出现“上述条件”并不代表最近一个 Chunk 必然正确**；邻接关系只是候选关联，跨页/跨章节引用需要更明确的指向。
 
-### 【固定领域的事实覆盖可用集合差集】
+#### 【固定领域的事实覆盖可用集合差集】
 
 如果业务领域已经有审核过的数据模式：
 
@@ -2995,7 +2889,7 @@ const missing = [...required].filter(x => !covered.has(x));
 
 但这段代码本身**只完成集合差集**：没有证明模型之外的系统能够自动从任意中文 Query 得到 `required`，也没有证明含“试用期”的文档一定支持 `probationEligibility`。在固定业务领域可以用严格意图模板、表单或人工维护的知识字段建立可靠映射；自由问答无法只靠几条正则准确发现全部隐含需求。
 
-### 【如何进行可控补充与复检】
+#### 【如何进行可控补充与复检】
 
 ~~~text
 初始候选
@@ -3013,19 +2907,26 @@ const missing = [...required].filter(x => !covered.has(x));
 
 状态建议拆分为 `complete`、`incomplete`、`unknown`。**未知与缺失不同**：无可靠语义检查能力时，不能因为规则没有命中就认定全部事实已覆盖。
 
-### 【本题标准回答】
+#### 【本题标准回答】
 
 规则和代码可以完成来源权限、版本时效、章节定位、Offset 重叠、Token Budget、显式交叉引用以及有预定义字段的覆盖检查与补检。它们的可靠性来自**入库阶段形成的结构与业务事实数据**，不是脚本天然具有自然语言理解能力。对于任意 PDF、Markdown 和非结构化文本，能识别结构不等于能判断语义充分；即使所有结构检查通过，也不能据此证明不存在遗漏事实或冲突，应保留 `unknown` 并在离线评测中验证实际效果。
 
 ---
 
-## 【第八题追问二：究竟怎样判定结构完整、背景不足和证据冲突】
+## 【六、证据完整性、冲突检测与智能补充检索】
 
-### 【提问】
+进一步研究“怎样判断”而不是只讨论“怎样拼接”：明确结构完整、缺少背景、事实冲突的判定依据，再区分纯规则、Evidence Verifier、有限补检 Workflow 与自主 Agent 的职责。
+
+### 【6.1 结构完整性、背景依赖与事实冲突的判定】
+
+*原讨论问题：究竟怎样判定结构完整、背景不足和证据冲突*
+
+
+#### 【提问】
 
 不能只说“代码检查”。需要明确：**判断结构是否完整，实际比较什么？如何决定需不需要补充？两条证据是否存在冲突，又依据哪些维度？**
 
-### 【结构完整性的判定依据】
+#### 【结构完整性的判定依据】
 
 建议离线记录明确的结构边界：
 
@@ -3058,7 +2959,7 @@ const isCompleteSection =
 
 切分后的 `trim()` 和 Markdown 标题/段落处理可能导致记录 Offset 与原文文本的精确对应关系需要特别测试。不能不经校验就在 ContextBuilder 中按 Offset 直接取回原文。
 
-### 【背景完整性：判断“是否存在依赖”和“依赖是否满足”】
+#### 【背景完整性：判断“是否存在依赖”和“依赖是否满足”】
 
 例如 C2：“由直属主管审批”，`headerPath` 已包含“员工休假制度 > 年假申请 > 审批流程”。可以始终追加轻量章节标题，这是确定性结构增强。
 
@@ -3066,7 +2967,7 @@ const isCompleteSection =
 
 还有更难的情况：Query 问“哪些例外情形可以申请？”而片段只是讲一般规则，无显式代词也没有说明例外。**脚本无法仅凭“句子完整、标题完整”推出例外不存在或已经齐全**。若有预先定义的 `requiredFacts`，可针对字段检查；开放式自然语言需要额外语义判断或人工审核。
 
-### 【证据冲突：先检查同一主体、属性、适用范围与有效时间】
+#### 【证据冲突：先检查同一主体、属性、适用范围与有效时间】
 
 举例：
 
@@ -3123,7 +3024,7 @@ function mayConflict(a: PolicyFact, b: PolicyFact) {
 
 这里 `mayConflict` 只表示潜在冲突，不代表已完成对制度层级、授权来源、例外条件、废止关系的裁决。自然语言事实未结构化时，简单关键词检测或向量相似度**不能可靠判断否定的作用范围和条件互斥性**。
 
-### 【多维状态，不要一个布尔值】
+#### 【多维状态，不要一个布尔值】
 
 ~~~typescript
 type CheckStatus =
@@ -3152,7 +3053,7 @@ consistency: unknown
 
 表示“文档结构符合已定义的规则，但语义是否充分与是否冲突尚未被可靠验证”。这比将所有未知静默转换为 `passed` 更符合工程安全边界。
 
-### 【妙码 AI Flow 已发现的实际数据缺口】
+#### 【妙码 AI Flow 已发现的实际数据缺口】
 
 已核对项目源码：
 
@@ -3164,15 +3065,18 @@ consistency: unknown
 
 **第一步不是立即新增模型，而是修复现有 Metadata 传递、验证 Offset，补齐 `sectionId/documentVersion/parentSectionId` 等来源结构，使后续确定性规则真正有可信数据可用。**
 
-### 【本题标准回答】
+#### 【本题标准回答】
 
 代码能根据可靠的章节/原文结构判断 Chunk 是否覆盖完整章节、是否有显式引用依赖，并可以在业务字段已结构化时比较主体、属性、条件、时间和互斥结论，发现缺失或潜在冲突。但结构完整不等于语义完整，两个文本相似不等于内容一致，两个相反结论也可能只是适用条件或版本不同。对于无法判断的自然语言情况，应保留 `unknown`，不能把规则未命中等同于完成了语义核验。
 
 ---
 
-## 【第八题追问三：实际工程需要 Evidence Verifier、专门模型还是 Agent】
+### 【6.2 Evidence Verifier、补检 Workflow 与 Agentic RAG】
 
-### 【提问与结论】
+*原讨论问题：实际工程需要 Evidence Verifier、专门模型还是 Agent*
+
+
+#### 【提问与结论】
 
 在企业通用知识库中，如果要综合多个非结构化片段，判断“是否具备用户问题要求的全部事实、是否互相矛盾、是否需要补充缺失背景”，代码无法通用保证语义判断。是否应引入 LLM、专用模型，还是让 Agent 自主编排全部步骤？
 
@@ -3184,7 +3088,7 @@ consistency: unknown
 | 语义验证 | 多事实要求、证据支持、语义冲突、缺失背景 | 现有 LLM / 专门 NLI 分类模型 |
 | 行动控制 | 依据验证结果是否继续检索、最多几轮、何时停止 | 先固定 Workflow，复杂时再考虑 Agent |
 
-### 【模型实际要判断什么】
+#### 【模型实际要判断什么】
 
 教学问题：
 
@@ -3210,7 +3114,7 @@ F3：若适用，由谁审批？
 
 可以借鉴 NLI（Natural Language Inference）的 `entailment/contradiction/neutral` 分类：某条证据对某个明确断言是支持、矛盾还是信息不足。但 NLI 文本对分类不等于自动完成整个多文档规则冲突判决，仍要先核对来源、时间、主体与条件。
 
-### 【为什么建议结构化 EvidenceVerifier，而不是自由文本总结】
+#### 【为什么建议结构化 EvidenceVerifier，而不是自由文本总结】
 
 建议输出 JSON（设计草案，当前仓库未实现）：
 
@@ -3243,7 +3147,7 @@ interface EvidenceVerification {
 
 **模型负责语义判断与提出补检建议；代码负责权限制约、执行、回退和停止。**
 
-### 【一个无需引入 Agent 的最小 Workflow】
+#### 【一个无需引入 Agent 的最小 Workflow】
 
 ~~~text
 Query
@@ -3272,7 +3176,7 @@ EvidenceVerifier：是否支持各子问题、是否缺背景/存在可能冲突
 
 设置硬停止条件：最大循环轮数、超时/Token/模型调用次数预算、同一 Query 去重、无新有效 Chunk、不可解决的证据冲突。这样即使有模型决定 `missing`，整个流程仍属于固定编排的受控 Workflow。
 
-### 【Workflow 与 Agentic RAG 的边界】
+#### 【Workflow 与 Agentic RAG 的边界】
 
 普通受控 Workflow：
 
@@ -3307,7 +3211,7 @@ Agentic RAG 则更侧重：
 
 **不是 Agent 越复杂就越好**。只有固定检索与最多几次补检无法解决的开放式、多跳、跨系统研究任务，才考虑 Agentic RAG。
 
-### 【需要从头训练专门模型吗】
+#### 【需要从头训练专门模型吗】
 
 一般不必在第一版训练。
 
@@ -3320,7 +3224,7 @@ Agentic RAG 则更侧重：
 
 **Reranker 不等于 NLI Verifier**：Reranker 主要输出 Query–Chunk 的排序相关性；NLI 输出针对明确断言的关系判断；多片段的事实完整性又需要综合每个问题要求、适用条件与来源。
 
-### 【分阶段落地到妙码 AI Flow】
+#### 【分阶段落地到妙码 AI Flow】
 
 根据已核对源码，当前有 `HybridRetriever`、工作流知识库节点和 `LLMExecutor`，但在这些已检查模块中**没有独立 ContextBuilder、EvidenceVerifier 或用于主动补检的 Agent**。要区分设计建议与项目已交付功能。
 
@@ -3332,7 +3236,7 @@ Agentic RAG 则更侧重：
 4. **增量引入有界补检**：如果结构化输出明确指出缺少事实，在可信知识库范围内执行至多 1～2 次定向搜索，最后复核模型实际使用的 Context。
 5. **依据评测决定是否升级**：当固定 Workflow 无法解决多跳场景时才考虑 Agent；验证器成为成本热点且有领域标注时再考虑小模型/微调。
 
-### 【评测：证明模型验证不是单纯增加成本】
+#### 【评测：证明模型验证不是单纯增加成本】
 
 在同一语料版本、授权环境、Query、Ground Truth 下对照**规则 ContextBuilder**与**ContextBuilder + EvidenceVerifier + 有界补检**：
 
@@ -3347,13 +3251,13 @@ Agentic RAG 则更侧重：
 
 特别记录 `unknown/abstain` 的比例和**误判“证据充分”**的比例。验证器本身也可能幻觉或漏看条件，因此模型判定不能取代人工标注、源文核对和生产安全边界。
 
-### 【本轮标准回答】
+#### 【本轮标准回答】
 
 对于企业通用非结构化知识库，ContextBuilder 应由确定性代码完成权限、版本、章节定位、文本重叠、Token Budget 和引用映射；多个自然语言片段是否覆盖用户所需的全部事实、是否存在隐含条件或语义冲突，通常需要独立语义判断，或者先建立可审核的结构化事实模型。可以优先复用现有 LLM 作为 EvidenceVerifier，输出事实要求、已支持的证据 ID、缺失信息和可能冲突，再由代码对来源和权限进行校验并在有限轮次内补检。
 
 这是一个受控 Workflow，不需要从开始就建独立 Agent 或训练专门模型。只有确实需要模型动态规划下一次搜索、选择工具并反复观察新结果时，才考虑 Agentic RAG。最后需要通过 Ground Truth 检验新增判断能力对事实完整性、冲突识别和最终回答质量是否真正有收益，以及额外的延迟、成本是否值得。
 
-### 【资料与源码衔接】
+#### 【资料与源码衔接】
 
 1. [Lost in the Middle（ACL Anthology）](https://aclanthology.org/2024.tacl-1.9/)：长上下文位置对模型利用证据的影响。
 2. [Ragas：Context Recall](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/)：参考事实与上下文证据的覆盖评测。
@@ -3364,323 +3268,493 @@ Agentic RAG 则更侧重：
 
 ---
 
-## 【第八题追问四：RAG 的权限与有效性过滤应在离线建索引、检索中还是检索后执行】
+## 【七、分阶段质量评测、失效归因与工程验收】
 
-### 【提问】
+最后把检索、融合、重排和上下文组织的输出作为不同评测对象，使用 Ground Truth 检查证据在哪一层丢失，再通过源码级 Trace、对照实验和延迟成本数据验证优化。
 
-在 RAG 检索中，如果需要按照知识库/租户权限、文档状态、有效版本、生效时间等条件限制检索范围，这些条件通常在**离线入库时**处理，还是在**执行向量检索前/过程中**过滤，或应当先检索再由应用程序做**检索后过滤**？Qdrant 的 Payload Keyword Index 是如何发挥作用的？已有项目采取了什么机制？
+### 【7.1 最终 Context 的事实覆盖与相关性评测】
 
-### 【结论与知识概述：离线建索引、在线定范围、检索时过滤、必要时检索后复核】
+*原讨论问题：Context Construction 是否也属于 RAG 评测*
 
-这并非三个互斥方案，而是不同职责分层：
 
-| 阶段 | 目标 | 核心输入与操作 | 对最终证据的影响 |
+#### 【提问与结论】
+
+**是。Context（上下文）质量是完整 RAG 评测不可缺少的对象。**但需要先区分：
+
+- **Context Construction（上下文构建）**是系统实际执行的环节：它从检索候选中挑选、去重、补充、压缩、截断并组织 LLM 最终收到的证据文本。
+- **Context Evaluation（上下文评测）**是对检索所得材料或者最终模型输入的相关性、完整性和可用性进行评价。
+
+不同研究和评测框架对术语的归属不完全一致。Ragas 将 `Context Precision`、`Context Recall` 放在 RAG 相关评测指标中，通常用来衡量检索到的上下文是否有用；它们**不必然**意味着工程系统里有一个独立的名为 `ContextEvaluator` 的运行组件，也**不自动**覆盖最终 Prompt 组装导致的证据损失。必须先明确一个指标的输入数据来自哪个阶段。
+
+#### 【知识概述：检索输出与最终 Context 是不同的数据对象】
+
+~~~text
+用户 Query
+  → 初始检索：返回一批候选 Chunk
+      │  评测：Evidence Recall@K（正确证据有没有进入候选）
+      ▼
+  → Fusion / Rerank：融合、重新排序
+      │  评测：MRR / nDCG（正确证据有没有排靠前）
+      ▼
+  → Context Construction：选择、去重、扩展、压缩、截断
+      │  评测：最终证据覆盖、引用可定位、Token 成本和冗余
+      ▼
+  → LLM Generation：依据最终 Context 生成回答
+         评测：Faithfulness（回答是否受 Context 支持）、
+               Answer Correctness（事实是否正确）
+~~~
+
+注意图中“初始检索返回候选”和“LLM 最终收到 Context”**不一定相同**。例如初始召回允许 50 条，而模型只接收重排后的 5 条；或者因 Token 预算只保留部分正文。Context 也可能添加来源标题、父章节说明或多个 Chunk 的合并文本，不能始终按原始 Chunk 个数衡量其内容。
+
+#### 【同一问题：召回成功而上下文构建失败的完整过程】
+
+沿用前面的问题：“年假申请需要提前多久，由谁审批？”Ground Truth 仍是：
+
+~~~text
+C1：年假须提前三个工作日申请
+C2：年假由直属主管审批
+~~~
+
+假设：
+
+~~~text
+初始检索 Top-5：
+[C3, C1, C4, C2, C5]
+→ 包含 C1 与 C2；Evidence Recall@5 = 2/2 = 100%
+
+重排 Top-3：
+[C1, C2, C3]
+→ C1/C2 均在前两位；证据覆盖仍为 100%
+
+Context Construction：
+由于错误截断、错误去重或不当的 Token 预算策略，
+实际只组装了 C1 的正文
+→ 最终可用证据只支持“申请时限”
+→ 最终必要事实覆盖 = 1/2 = 50%
+
+LLM 收到的 Prompt：
+参考资料只有“年假须提前三个工作日申请”
+问题却同时询问“由谁审批”
+→ 无法从收到的资料确定审批人
+~~~
+
+这个例子只表示**人为构造的故障场景**。它证明检索器已经完成任务，不代表整个 RAG 链路能够完整回答。若此时仅调高 `hnsw_ef` 或增大初始 `topK`，并不会自动修正组装阶段丢弃 C2 的问题。
+
+| 阶段 | C1：时限 | C2：审批人 | 对两条必要事实的覆盖 |
+|---|---|---|---:|
+| 初始候选 Top-5 | 有 | 有 | 100% |
+| 重排后 Top-3 | 有 | 有 | 100% |
+| 最终送入 LLM 的 Context | 有 | 无 | 50% |
+
+需要把**能用于回答的证据是否保留**当成实际指标，而不是把 Query 相关主题的文本数量误当作覆盖度。
+
+#### 【Context 的几种评价维度及边界】
+
+**第一类：相关性与排序质量。**最终组织的资料是否回答本次 Query？是否有大量“年假申请入口、病假证明”等与“时限+审批人”无关的片段？相关性通常可用二元或分级 Qrels 检验，检索排序可继续使用 Precision / nDCG 等指标。
+
+**第二类：必要证据覆盖。**最终 Context 能否支持问题中的每个必要事实？一种教学式的覆盖公式为：
+
+~~~text
+Final Context Fact Coverage
+  = （被最终 Context 支持的必要事实数）
+    / （该 Query 需要的必要事实总数）
+~~~
+
+例如两个事实只保留一个，则 `1/2=50%`。**这只是清晰定义后的工程自定义检查，不应冒充所有框架通用的 Context Recall 公式。**一条较大的父章节可能同时支持多个事实，不能直接用“保留了几个 Chunk”替代“支持几个事实”。
+
+**第三类：上下文预算与冗余。**片段即使都相关，重复段落、过长的父章节、无关 Metadata 也会占用 Token，导致重要证据被截断。应记录输入 Token 预算、实际上下文 Token 数、选择了哪些证据、因何丢弃哪些候选及是否发生截断。冗余与成本是工程观测项，不能仅凭某一条指标就推断模型答案质量。
+
+**第四类：引用与版本有效性。**最终 Context 中的每段事实能否回溯原 Document、版本、章节位置，以及调用者是否有权访问？版本失效和越权不能通过高相似度或相关性得分抵消。
+
+#### 【Ragas 中 Context Precision 与 Context Recall 的含义】
+
+这里要区分**框架明确提供的指标**和**我们针对特定流水线自定义的验收指标**：
+
+| 评价名称 | 在 Ragas 中的典型含义 | 不能误解为 |
+|---|---|---|
+| Context Precision | 衡量检索结果中相关 Chunk 是否优先排在前面；其计算思想结合相关项出现位置的 `Precision@k` | 普通的 `相关条数 / 检索总条数` 就完全等同该指标 |
+| Context Recall | 参考答案中的必要断言是否能从所提供 Context 中找到支持；LLM-based 版本会分解参考答案的 Claims，再核对证据支持 | 任意场景下都只需对比 Chunk ID |
+| Final Context Coverage（本篇的检查） | 对齐固定的必要事实标注，检查最终实际输入 LLM 的材料是否覆盖这些事实 | 所有框架都有的统一标准化指标 |
+
+Ragas 官方 Context Recall 的基于断言计算思路是：
+
+~~~text
+Context Recall
+ = 参考答案中被检索上下文支持的断言数 / 参考答案中的断言总数
+~~~
+
+如果用户问题需要两个事实，最终 Context 只支持时限、不支持审批人，则该口径下可能是 1/2；但 LLM 评判器的断言抽取与支持判定可能发生错误，需要标注抽检和明确使用的评测版本。Ragas Context Precision 更接近强调排名的相关性评测，而**不是简单记录系统是否超出 Token 上限**。
+
+参考：[Ragas Context Precision](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/)、[Ragas Context Recall](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/)、[Ragas 指标列表](https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/)。
+
+#### 【与答案生成评测的区别】
+
+Context 评测判断“模型**看到了什么**”；Faithfulness（答案忠实度）判断“模型**说出的断言有没有证据支持**”；Answer Correctness（答案正确性）进一步检查“回答是否符合真实事实和问题需求”。
+
+例如最终 Context 正确包含 C1/C2，模型却说“审批将在两小时内完成”，这个两小时的信息没有证据支持，属于生成阶段的 Faithfulness 问题。另一种情况是旧版政策被错误选入 Context，模型忠实引用旧版但结论过时，此时答案可能忠于 Context，却仍然不符合现行规则。**这两个问题需要追溯不同的失效阶段。**
+
+#### 【项目实践：应该在哪里采集哪些数据】
+
+从已核对的妙码 AI Flow 源码，可以确认 [`VectorRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 和 [`HybridRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 返回有序 `RetrievalResult[]`，其中包含 `chunkId`、`documentId`、`content`、`score`。这能作为**检索器输出候选集**的观察点；仅凭这些文件，尚不能确认最终 Prompt 如何组装，也不能确认系统已把“实际发送给 LLM 的 Context”完整记录。
+
+因此以下属于**建议的可观测性设计，不是已完成的项目现状**：
+
+~~~typescript
+type RagEvaluationTrace = {
+  queryId: string
+  corpusVersion: string
+  retrieverMode: "vector" | "fulltext" | "hybrid"
+  retrievedChunkIds: string[]   // 初始召回的顺序与身份
+  rerankedChunkIds?: string[]   // 实际有重排时才记录
+  contextEvidenceIds: string[]  // 实际进入 LLM Context 的来源
+  contextTokenCount: number
+  droppedEvidence: Array<{
+    id: string
+    reason: "low-relevance" | "duplicate" | "token-budget" | "permission"
+  }>
+  promptVersion: string
+}
+~~~
+
+一次质量故障可以按顺序定位：
+
+1. **Retrieved Run 是否覆盖正确证据？**未覆盖时查解析、切分、Embedding、检索/ANN 与过滤。
+2. **重排后是否保留正确证据？**候选存在但被截断时查融合、Rerank、`topK` 策略。
+3. **最终 Context 中是否仍包含完整事实？**丢失时查去重、父子扩展、Token 预算与 Prompt 模板组装。
+4. **生成是否正确引用这些事实？**证据完整但答案错误时查模型生成及来源引用逻辑。
+
+项目实现上述 Trace 时，还应对敏感内容采取权限约束、采样与脱敏；测试并不要求把真实的全部私密文档原文都记录到日志中。
+
+#### 【面试标准回答】
+
+Context 属于 RAG 的评测对象，但 Context Construction 是运行阶段，Context Evaluation 则评估这个阶段交付给 LLM 的资料是否相关、完整、可靠。检索器输出和最终 LLM 输入通常不相同：候选在融合、重排、去重、父章节扩展或 Token 截断过程中可能丢失证据。因此初始 Evidence Recall@K 很高，不代表最终 Context 一定能支持全部答案事实。
+
+应区分检索相关性与排序、最终 Context 的必要事实覆盖、Token 成本与冗余、来源版本和权限有效性。Ragas 的 Context Precision 通常衡量相关 Chunk 在检索列表中的排序质量，Context Recall 关注参考答案断言能否从提供的上下文找到支持；工程侧还可以单独记录最终 Context Fact Coverage、被丢弃证据及原因。
+
+最后，Context 完整也不保证生成正确，应继续区分 Faithfulness（生成是否受证据支持）与 Answer Correctness（事实与问题是否正确）。这样才能根据质量损失位置决定该优化检索、重排、上下文构建还是生成环节。
+
+#### 【资料依据】
+
+1. Ragas：[Context Precision](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/)。
+2. Ragas：[Context Recall](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/)。
+3. Ragas：[Available Metrics](https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/)。
+4. Qdrant：[Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/) 与 [Evaluating Pipeline Output Quality](https://qdrant.tech/documentation/search-evaluation/pipeline-output-quality/)。
+5. 项目源码：[VectorRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts)、[HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)。
+
+---
+
+### 【7.2 检索全链路质量损失的定位与优化实验】
+
+*原讨论问题：如何根据评测结果定位 RAG 检索质量的真正瓶颈*
+
+
+#### 【提问与知识目标】
+
+前三题已经解决三件事：建立 Query—Evidence Ground Truth，使用 Hit@K、Recall@K、MRR、nDCG 等指标识别质量差异，设计可靠、可复现的测试样本。新的问题是：**某个 RAG 知识库在固定评测集上的 Evidence Recall@10 只有 72%，是否应该增大 Top-K、改 Chunk Size、换 Embedding，还是调整 HNSW？**
+
+答案是：**单一结果指标不能直接确定故障原因。应先找到质量损失发生的链路，再针对那个层次设计单变量对照实验**。本题把之前的知识构建、索引与评测连成一条“观察 → 归因 → 实验 → 复核”链路，避免把参数调优误当作质量优化本身。
+
+在开始诊断之前，需确保标注、实际语料、权限范围、Embedding 版本、过滤条件、索引状态与测试 Query 对齐。若评测基础自身失真，优化判断也会失真。[Qdrant《What to Check Before Tuning a Qdrant Collection》](https://qdrant.tech/documentation/search-tuning/before-tuning-a-qdrant-collection/) 明确建议先确定质量目标、检查索引/过滤配置、使用标注数据评估症状，而非直接从参数表选值。
+
+#### 【知识概述：按数据流区分六类可能的质量损失】
+
+诊断时先区分**离线知识构建**与**在线检索生成**：
+
+~~~text
+离线：原始文档 → 解析与版本 → Chunking → Embedding → Point/索引
+                 │             │             │        │
+                 │             │             │        └─ 是否真正完成索引及过滤配置？
+                 │             │             └─ 当前向量是否能表达正确语义？
+                 │             └─ 必要事实/限制条件是否仍完整？
+                 └─ 正确来源是否存在、有效、已入库？
+                                ↓
+在线：Query + 身份/权限/版本 → 向量 / 词项检索 → 候选集合
+                                              │
+                    独立对照：Exact kNN vs ANN（几何近邻误差）
+                                              │
+                                              ▼
+                              融合 / 重排 / 最终 Top-K 截断
+                                              │
+                                              ▼
+                            Context Construction（最终模型输入）
+                                              │
+                                              ▼
+                                        LLM 答案输出
+~~~
+
+这是一条**因果诊断结构**，不是强制要求每个 RAG 系统都独立部署六个服务。有的系统仅使用向量检索，没有融合；有的系统将 Rerank 和 Context 选择放在一个调用中。无论实现如何，都可以通过阶段性输入输出定位证据在哪里消失。
+
+| 观察症状 | 可能的瓶颈 | 优先检查 | 不应立即做的事 |
 |---|---|---|---|
-| 离线文档入库/索引准备 | 提供可过滤的数据结构 | 将 `knowledgeBaseId`、`documentId`、`tenantId`、`status`、`effectiveFrom/To` 等适用字段写入 Payload，建立相应类型的 Payload Index | 为之后的高效过滤提供数据与索引，但不能替当前用户做授权决策 |
-| 在线查询发起前 | 计算本次合法访问范围 | 验证身份；读取后端的知识库/文档授权关系、当前有效版本与时间约束，构造查询 Filter | 得到当前调用者真正被允许访问的数据集合 |
-| Qdrant 检索执行期间 | 在 Filter 约束下求相关 Top-K | Query Vector 或 Sparse Query + Payload Filter，由 Qdrant 查询规划器选择执行策略 | 避免不合法候选先占据无过滤 Top-K，再被应用层删掉 |
-| 检索后、Rerank/Context 前 | 必要的二次校验 | 检查版本、文档是否失效、权限是否撤销、来源信息是否仍有效 | 增加一致性与安全保护，但不能取代检索期的范围约束 |
+| 原始事实没有可检索记录 | 文档解析、同步/入库、版本 | 原文、文档状态、Point/Chunk 实际存储 | 直接调高 K |
+| 原始事实存在但被截成不能独立理解的片段 | Chunking/Metadata | 原文位置、标题、条件、Chunk 正文 | 首先重建 HNSW |
+| 正确 Chunk 已入库，Exact kNN 也排得很靠后 | 表示/检索策略与过滤条件 | 查询改写、Embedding、阈值、权限、词项检索 | 认定 ANN 图搜索是唯一问题 |
+| Exact kNN 找到近邻，ANN 丢失对应近邻 | 近似检索或执行配置 | `hnsw_ef`、索引状态、过滤与搜索路径 | 更换所有原始文档 |
+| 初始候选有正确证据，融合/截断后没有 | 排序、候选深度或融合 | 每路 Run、融合 Run、Rerank 结果、最终 K | 盲目增大 Chunk Size |
+| 最终排序正确，LLM 输入缺少事实 | Context 组装、去重、截断 | 最终 Prompt 的证据 ID、Token 预算 | 只改 Embedding/HNSW |
 
-**硬性授权和已知业务约束应尽量下推到检索请求中，而不是依赖“全库 Top-K → 后置删除”**。同时后置复核仍有意义，尤其用于处理动态授权与文档状态变更；如果复核失败，不能继续向 Reranker、LLM、前端或日志释放该证据。
+**重要边界**：一个问题可能同时存在多个瓶颈；上表用于定位**有证据支持的优先排查方向**，不是“看到症状就能唯一判定故障”的规则。
 
-注意这里的“在线检索前”是指**先由业务层计算授权与过滤条件**；向量数据库内部并不一定按“先物化所有过滤后的 Point，再对它们启动 HNSW”的固定顺序执行。应从**逻辑约束**和**物理执行计划**两个层次理解。
+#### 【一次完整的故障：入职不满一年能否申请年假】
 
-### 【概念边界：Payload、Payload Index、Filter 与向量索引分别做什么】
+以下是用于展示因果关系的**教学情境，不是妙码 AI Flow 的实际线上故障**：
 
-假设 Point：
+用户 Query：“入职不满一年的员工可以申请年假吗？”
 
-~~~json
-{
-  "id": "point-001",
-  "vector": [0.12, 0.84, 0.23],
-  "payload": {
-    "chunkId": "doc-001_0",
-    "content": "员工应提前三个工作日申请年假。",
-    "knowledgeBaseId": "kb-A",
-    "documentId": "doc-001",
-    "tenantId": "tenant-01",
-    "status": "ACTIVE"
+现行制度中的参考证据为：
+
+~~~text
+C8：入职不满一年的员工不适用本年假制度。
+~~~
+
+当前 Top-5 未召回 C8，表现为 Evidence Recall@5=0。接下来需要逐层排除，而不是立刻尝试五种参数。
+
+#### 【第一层：原始数据是否存在且已正确入库】
+
+先检查：
+
+1. 当前知识库是否包含**现行版本**的休假制度？问题是否处于该调用者有权检索的知识范围？
+2. 原始文档能否定位到“入职不满一年不适用”的条款？
+3. 解析产物和实际入库的 Chunk 中是否存在这句话及其否定关系？
+4. 文档处理是否成功、所选 Collection 是否正确、更新/删除是否遗留旧 Point？
+
+反例：
+
+~~~text
+原始 PDF：包含 C8 的完整规定
+    ↓ 解析遗漏了尾部条款
+Chunk 集合：没有该条
+    ↓
+Embedding、HNSW、Top-K 再好也无法找回从未入库的事实
+~~~
+
+此时优先修复文档解析、增量处理或数据完整性。仅仅增大 `topK` 不能检索不存在的 C8。
+
+**不要把“向量查询没有结果”直接视为未入库**：先通过可信的原文/文档索引/存储检查确认事实是否存在，避免把过滤范围或阈值造成的不可见误判为缺失。
+
+#### 【第二层：Chunking 是否保留了事实的完整语义】
+
+假设原文完整，但切分后的内容是：
+
+~~~text
+Chunk A：入职不满一年的员工
+Chunk B：不适用本年假制度
+~~~
+
+这两个片段单独看时都不包含完整的“适用人群—限制结论”关系。系统可能检索到 A，却无法判断到底是否适用，或只检索到 B 而不知道主体。
+
+排查的重点不是“Chunk 字符数够不够大”，而是：
+
+- 限制条件（入职不满一年）是否和结论（不适用）建立了可检索的联系？
+- 章节标题、文档级背景及对应 Offset 是否保留，后续能否取回父段落？
+- 相邻或父子片段能否组合恢复完整事实？
+- 更换 Chunk Size/Overlap 后，是否真的提升了多条件、例外规则的 Evidence Recall，并且没有牺牲其他查询类型？
+
+可进行结构化切分、按标题补充背景、父子检索或合理调整边界的单项实验。**Chunk 越大越好是错误命题**：过大的片段可能包含更多噪声、提高存储/上下文成本，并影响相似度区分能力。
+
+#### 【第三层：为什么需要先做 Exact kNN 对照】
+
+当我们确认 C8 已正确表示、当前查询范围内可见后，应区分：
+
+1. **当前向量空间本身不善于把 C8 排在前面**；
+2. **向量空间认为 C8 很近，但 ANN 近似索引没有找到它**。
+
+为区分二者，保持**相同 Query Vector、Embedding 版本、距离度量、语料快照、过滤条件、阈值口径与 K**，运行 Exact kNN 和 ANN 两次查询。
+
+Qdrant 的 `SearchParams(exact=true)` 会强制精确搜索，对照 ANN Top-K 的近邻集合；文档见 [Measuring ANN Recall](https://qdrant.tech/documentation/tutorials-search-engineering/ann-recall/) 和 [Search](https://qdrant.tech/documentation/concepts/search/)。
+
+**情况 A：Exact 也找不到 C8（业务参考证据）**：
+
+~~~text
+Ground Truth：C8
+
+Exact Top-5 = [C3, C5, C1, C4, C9]
+ANN   Top-5 = [C3, C5, C1, C4, C9]
+~~~
+
+若 Exact 和 ANN 一致，`ANN Recall@5=100%`，但 `Evidence Recall@5=0`。这是**向量相似度排序与业务相关性目标不一致**的示例，而不是图搜索近似误差。应检查文本与 Query 的语义匹配、向量模型、搜索阈值与授权范围；随后测试查询改写、精确词项匹配或 Hybrid Search 等能力。
+
+**情况 B：Exact 找到了 C8，ANN 没有**：
+
+~~~text
+Ground Truth：C8
+
+Exact Top-5 = [C3, C8, C1, C4, C9]
+ANN   Top-5 = [C3, C5, C1, C4, C9]
+~~~
+
+两组向量 Top-5 的交集是 {C3,C1,C4,C9}，因此本例 `ANN Recall@5=4/5=80%`；Exact 的 `Evidence Recall@5=1`，ANN 的 `Evidence Recall@5=0`。此时有证据进一步检查近似索引的搜索参数、索引构建情况及过滤方式。需要注意：**总体 ANN Recall 和 Evidence Recall 不是同一个分数，单个查询上的业务命中也不总是随 ANN Recall 单调变化**。
+
+**索引状态是前提**：Qdrant 可能对没有建立 HNSW 或满足扫描策略的 Segment 使用精确扫描，这时修改 `hnsw_ef` 并不影响该部分搜索；必须核对 Collection/Segment 的索引状态、过滤 Payload Index 和实际搜索路径，不能认为调用“向量搜索 API”就必然走 HNSW。
+
+#### 【第四层：初始召回是否需要改变检索方式】
+
+如果 C8 在精确向量检索中仍排名靠后，可以先依据 Query 类型提出假设。
+
+示例：对于“入职不满一年”“不适用”这样的条件/否定表达，当前向量模型可能不能稳定区分主体和规则；对于 `E-1042`、SKU、代码标识符等，精确词项匹配可能更有价值。
+
+可比较的实验条件包括：
+
+~~~text
+固定 Ground Truth / 语料 / 版本 / 权限
+               ↓
+             同一 Query
+               ↓
+      ┌────────┼─────────┐
+      ▼        ▼         ▼
+  Dense ANN  Text/BM25   Hybrid
+      │        │         │
+      └────────┼─────────┘
+               ▼
+          对比相同 K 的：
+          Evidence Recall、MRR、nDCG、P95、成本
+               ↓
+     按 Query 类型检查改善与退化
+~~~
+
+**术语边界**：简单的子串匹配不等于 BM25，定义了 `hybrid` 模式也不等于实际已经执行了稠密+稀疏双路检索。是否采用 BM25、Query Rewrite 或混合检索，必须看真实失效的查询类型与对照结果。
+
+#### 【第五层：融合、重排与 Top-K 截断是否丢失正确证据】
+
+假设初始召回：
+
+~~~text
+Dense Top-20 包含 C8
+Text  Top-20 也可能包含 C8
+                ↓
+融合（Fusion）
+                ↓
+Final Top-5 不包含 C8
+                ↓
+LLM 无从使用这条证据
+~~~
+
+这里初始检索可能已经找到正确资料，但融合得分、Rerank 排序或者最终 Top-K 截断将其排除。应该检查**每条检索通道的候选 ID/排名、融合后排序、最终截断前后 ID 集合**。
+
+特别注意三点：
+
+- **候选集合与排序不是同一个目标。**如果正确证据在初始候选里却不在最终 Top-5，应该研究 Fusion/Rerank/最终 K，而不是直接归责 Embedding 或 HNSW。
+- **“增加初始 Top-K”不保证最终 Context 更完整。**更多候选可能只增加延迟和噪声；必须检验融合/重排是否能利用这些新候选。
+- **同一 K 下的一次 Recall 差异不能唯一证明是哪一行代码导致**，还应检查相同语料、合法权限、去重、阈值及是否存在动态候选扩展。
+
+#### 【第六层：最终 Context 是否仍然保留必要证据】
+
+假设：
+
+~~~text
+候选 Top-20：含 C8
+Rerank Top-5：含 C8
+Prompt 实际 Context：不含 C8
+最终答案：缺少适用人群的限制条件
+~~~
+
+此时要检查 Context Construction：是否因 Token 预算、合并去重、父章节提取、格式化错误或来源过滤导致证据丢失。
+
+应分别保存或记录**候选排序**和**最终确实传入模型的证据 ID/事实支持关系**。最关键的结论：
+
+> 初始 Evidence Recall 高，不证明最终 Context 完整；最终 Context 完整，也不证明 LLM 一定会生成正确答案。
+
+若 C8 已进入最终 Context，模型仍回答“入职半年适用年假”，则故障可能在模型生成、证据理解或旧版本引用，应进入 Faithfulness 与 Answer Correctness 的评测。
+
+#### 【分阶段指标如何用于归因：哪些差值能比较、哪些不能】
+
+教学示例：假设固定 Ground Truth 和一批 Query，做不同方式的实验，获得如下结果：
+
+| 阶段或方案 | 评价对象 | 示例结果 |
+|---|---|---:|
+| Exact kNN，Top-20 | 业务 Evidence Recall@20 | 90% |
+| HNSW，Top-20 | 业务 Evidence Recall@20 | 88% |
+| 稠密 + 词项候选合并，Top-20 | 业务 Evidence Recall@20 | 94% |
+| 融合后 Top-5 | 业务 Evidence Recall@5 | 83% |
+| 最终 Context | 必要事实覆盖比例 | 76% |
+
+**全部为假设数字，并非项目实际评测**。还需注意：
+
+1. `Exact kNN` 与 `ANN` 的候选集合不同，可用同一 Query、K、语料和过滤计算它们的 **ANN Recall@K**，另分别计算两套结果的业务 Evidence Recall。这两个指标不能混称。
+2. `Dense` 与 `Hybrid` 是**可比较的策略分支**，并非简单的流水线“下一步”；Hybrid Recall 比 Dense 高只能说明本示例多路方案覆盖更多证据，不代表它必然更优。
+3. Top-20 与 Top-5 的 Recall 本来受**截断深度**影响：如果前 20 中包含正确证据，后 5 没有，这可能只说明 K 缩小，并不自动证明 RRF 算错。需要对照排序和截断前后的结果。
+4. “必要事实覆盖率”与 Chunk-ID Evidence Recall 的评价粒度不同，不能把 83%→76% 的百分点差值直接解释为“Context 额外丢失 7% 个 Chunk”。应在逐 Query 的事实标注下另算上下文阶段损失。
+5. 总体平均值可能掩盖低频但高风险的失败，应按精确编号、条件/否定、多证据、过期/版本及无答案查询分类诊断。
+
+只有在明确相同的评价对象、分母、K、语料和权限时，阶段差值才有更直接的可比意义。否则需要使用**同一查询的证据传递轨迹**解释丢失位置。
+
+#### 【将诊断转化为可验证的优化实验】
+
+推荐按以下顺序组织一次实验：
+
+1. **固定 Baseline**：冻结当前 `corpusVersion`、`datasetVersion`、Query 列表、Ground Truth、Embedding 模型、过滤权限、`topK`/`threshold`、索引状态；记录候选 ID/排名、Recall、nDCG、P95 延迟与资源成本。
+2. **找到失效模式**：例如多条精确编号类 Query 在 Dense Top-10 缺证据，但词项搜索能命中。
+3. **提出明确假设**：例如“关键词匹配将改善编号类 Query 的候选覆盖，而不是改善普通语义问题”。
+4. **只改变关键方案**：增加或切换一种实际可用的词项检索策略，其他条件固定；不要同时换 Chunking、Embedding、Top-K、权重和索引参数。
+5. **观察质量与代价**：除了总体 Recall、MRR、nDCG，按 Query 类型比较改善、退化；记录 P50/P95、检索服务成本、异常及无结果率。
+6. **验证稳健性**：在未用于选择参数的验证/测试查询上复核，必要时通过重复运行、置信区间或统计检验判断增益是否可能只是样本噪声。
+
+对改变索引构建、Embedding 或 Chunking 的实验，无法严格做到其他所有条件不变（例如 Chunk ID 会变化）；此时要**固定业务事实和 Query**，对不同版本建立可审核的证据映射，清楚披露语料重建带来的混杂因素。
+
+#### 【与妙码 AI Flow 的现有源码如何对应】
+
+项目业务链路包含文档处理 → 切分 → Embedding → Qdrant Collection 存储 → 在线 Retriever。需要知道每个模块在干什么，才能选择采集位置：
+
+- [`document-processor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts) 是文档入库服务，负责生成 Chunk、Embedding 后写入 Qdrant。诊断“是否有知识、是否切分完整”应先回溯该入口和对应原文/数据状态。
+- [`QdrantVectorStore.search()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 用 `limit: topK`、`score_threshold: threshold` 和 `knowledgeBaseId` 过滤调用 Qdrant，返回 `chunkId`、`documentId`、`content`、`score`。该结果可作**向量搜索 Run**。源码当前未在此调用中设置 `exact:true`，因此要做 Exact kNN 对照需要额外提供独立的测试调用或显式的搜索参数，而不能声称当前 API 已有一键 Exact 对照。
+- [`VectorRetriever.retrieve()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 把 Query 交给 Embedding 服务得到 Query Vector，再调用 `vectorStore.search`；此处可以记录**初始向量候选排序**。
+- [`HybridRetriever.retrieve()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 支持 `vector/fulltext/hybrid`；在 `hybrid` 模式下，`expandedTopK = ceil(topK*1.5)`，再按加权 RRF 进行融合（常数 `k=60`，默认向量权重 `vectorWeight=0.7`），最后截取 `topK`。若 `FulltextSearchProvider` 不存在或未返回结果，则降级为向量结果，不保证真正实现双通道召回。这里可作为**融合前后对照**的测试位置。
+- 同一源码中的 `textSearch()` 是从 Qdrant `scroll(limit:1000)` 获取一批片段后，在应用层进行字符串出现频次评分。它**不是 BM25**，也没有在该调用中遍历全部分页；因此不能仅因类名叫“文本搜索”就把它当成完整关键词索引能力的基线，更不能把它等同于 BM25 的倒排索引。
+
+上述均为对**已核对源码行为**的说明；它们不意味着项目已经接入 Ground Truth、记录全部阶段 Trace、部署真正的 BM25 检索服务或实现 Reranker。是否值得新增这些能力，应由真实实验决定。
+
+#### 【最小可观测性：怎样知道证据究竟在哪一步消失】
+
+可以参考以下**设计草案**（非项目既有实现）：
+
+~~~typescript
+type RetrievalDiagnosticTrace = {
+  queryId: string
+  corpusVersion: string
+  datasetVersion: string
+  sourceEvidenceIds: string[]       // Ground Truth，在受限评测系统内保存
+  denseCandidateIds: string[]       // Dense 初始 Run
+  exactCandidateIds?: string[]      // 仅在执行了 Exact 对照时存在
+  textCandidateIds?: string[]       // 实际启用第二路检索时才有
+  fusedCandidateIds?: string[]      // 实际发生融合时才有
+  rerankedCandidateIds?: string[]   // 实际经过 Rerank 时才有
+  finalContextEvidenceIds?: string[]// 实际送给 LLM 的来源
+  retrievalMs: number
+  contextTokenCount?: number
+  searchConfig: {
+    mode: "vector" | "fulltext" | "hybrid"
+    topK: number
+    threshold?: number
   }
 }
 ~~~
 
-上面的向量只是教学示例，实际维度与项目 Embedding 模型一致。
+逐 Query 将 Ground Truth ID 映射到各阶段 ID，记录首次不再出现的位置；如果 Chunk 边界变化、父子扩展或同义证据替换，应按原子事实和源文档映射判断，不能简单用原 ID 做全部归因。生产环境还需为这些 Trace 配置权限、必要字段脱敏、采样和存储保留策略，避免记录不必要的敏感文本。
 
-- **Payload**：附在 Point 上的正文和业务属性，作为过滤表达式可访问的数据；存在 Payload **不自动等于**已为字段建立索引。
-- **Payload Index**：按字段类型为 Qdrant 的过滤和查询规划提供加速、基数估计及过滤式 HNSW 关联能力；例如 `keyword` 适合精确匹配的知识库 ID，不是对 `content` 做 BM25 倒排索引。
-- **Filter**：某次请求真正要执行的业务范围约束，例如当前用户仅可访问 `kb-A`；必须在在线 Query 中传入，**建立索引本身不代表自动启用该条件**。
-- **Dense HNSW / Sparse Index**：决定相似度/词项候选如何发现并排序；Payload Index 是与之协作的过滤机制，不是把过滤字段本身变成语义向量。
+#### 【边界与进一步验证】
 
-重要澄清：将 `tenantId` 建立为 Payload Keyword Index，并不意味着给每位用户创建一个物理隔离的 Collection 或独立向量空间。共享 Collection 上的 Filter 首先提供**逻辑隔离**；是否采用 per-tenant 布局、`is_tenant` 优化、独立 Shard 或独立 Collection，是另一层有关隔离、性能与租户规模的架构决策。高隔离要求还应考虑服务端权限、密钥与数据部署边界。
+- **权限过滤是先决条件**：即使 Ground Truth 引用某份文档，也必须核实当前 Query 对该文档是否有合法访问权；否则不应将“不返回未授权证据”视为检索失败。
+- **阈值导致的空结果**：`score_threshold` 过高可能提前过滤正确片段，此时要检查阈值与 Embedding 分数分布，不能归因于 HNSW。
+- **索引构建状态**：Qdrant 未建 HNSW 或选择精确扫描时，`hnsw_ef` 的变化不一定影响查询；优化前检查真正生效的执行策略。
+- **样本与查询类型**：单条 Exact/ANN 的比较是诊断证据，不足以证明总体的 ANN Recall 达标；需要代表性的 Query 集、重复性与按类型统计。
+- **生成层不混淆**：如果正确证据已经进入最终 Context，但模型依然回答错误，应继续看 Faithfulness/Answer Correctness，不再把所有问题笼统记在 Retriever 名下。
+- **成本约束**：在 Recall 提升很小的情况下显著增加 P95/内存/Token 成本，不一定是适合业务的改进。
 
-### 【Qdrant 如何把 Filter 与 HNSW 搜索结合起来】
+#### 【面试标准回答】
 
-Qdrant 官方[Filtering in Vector Search](https://qdrant.tech/documentation/search-patterns/vector-search-filtering/)明确区分：
+RAG 检索优化应先建立以 Ground Truth 为标准的固定评测基线，再根据**质量第一次损失的位置**选择要研究的环节，而不是盲目增大 Top-K、修改 Chunk Size 或 HNSW 参数。
 
-- **纯后置过滤**：先执行无约束近邻搜索，截断 Top-K，再删除不满足条件的候选。它可能导致返回数量不足，且正确的合法候选根本未进入无约束 Top-K。
-- **朴素完全前置过滤**：先找到所有符合条件的 Point，再逐一精确计算向量距离。对匹配很少的情况可行，但过滤后集合较大时穷举开销可能很高。
-- **Qdrant 的检索中融合过滤**：结合 Payload Index、过滤条件及分段查询规划，可能直接评分少量过滤后的候选，也可能在 Filterable HNSW 上进行带约束的近邻搜索；具体执行路径与过滤基数、索引构建状态和配置有关。
+先检查源文档、版本、授权、解析与入库是否正确，确认参考事实确实存在且被 Chunk 完整表达；然后对同一 Query Vector、语料、距离度量与过滤范围比较 Exact kNN 和 ANN。如果 Exact 自身也找不到业务正确证据，重点研究 Embedding 表示、查询表达、阈值以及词项/混合检索；如果 Exact 能找到但 ANN 遗漏，才有依据研究 `hnsw_ef`、索引状态及过滤策略。
 
-逻辑链路：
+如果正确证据已在初始候选中，则检查融合、Rerank 和最终 Top-K 是否改变排序并丢失证据；若排序后仍保留但最终 Prompt 没有，问题发生在 Context Construction。每次针对清楚的假设做受控实验，在同一 Ground Truth 下比较 Evidence Recall、MRR、nDCG、P95 和成本，并用独立查询验证收益。**优化的是业务证据质量，不只是几何最近邻的搜索速度。**
 
-~~~text
-查询者身份
-     ↓
-后端鉴权与权限计算
-     ↓
-授权的 KnowledgeBase/Document IDs、有效版本等
-     ↓
-[Query Embedding + Qdrant Payload Filter + topK]
-     ↓
-Qdrant Query Planner
-     ├─ 少量匹配候选：直接评分
-     └─ 大范围匹配：利用支持过滤的向量索引
-     ↓
-在过滤约束下返回相似候选 Top-K
-     ↓
-必要时进行失效/授权复核
-     ↓
-Fusion → Rerank → Context Construction → Generation
-~~~
+#### 【权威资料与项目源码】
 
-因此不能在面试中笼统回答“Qdrant 总是先过滤完所有文档，再去运行一次 HNSW”。正确表达是**在向量检索执行中施加 Filter 约束，并由 Qdrant 选择合适的搜索策略**。
-
-**过滤不意味着 ANN 一定变为精确搜索**：当采用近似 HNSW 时，严格 Filter、多个过滤条件的交集以及索引状态都可能影响 Recall 和延迟。可使用精确过滤向量搜索作为小样本基线，对比正常过滤式 HNSW 的 Recall@K 和 P95；部分 Qdrant 版本/部署支持 ACORN 等提高严格过滤场景召回的策略，应基于实际 Server 版本测试。
-
-### 【为什么不能先取全库 Top-K 再在应用端过滤：正确性与安全性】
-
-假设用户只允许访问知识库 A，查询返回上限为 `topK=3`，知识库 B 不可访问。全库原始相似度排序：
-
-| 全库名次 | Chunk | 知识库 | 当前用户是否有权 |
-|---:|---|---|---|
-| 1 | B1 | B | 否 |
-| 2 | B2 | B | 否 |
-| 3 | A1 | A | 是 |
-| 4 | B3 | B | 否 |
-| 5 | A2 | A | 是 |
-| 6 | A3 | A | 是 |
-
-错误方案：
-
-~~~text
-无过滤 Query → 全库 Top-3 = [B1, B2, A1]
-                         ↓
-                    应用层删除 B1/B2
-                         ↓
-                     最终仅 [A1]
-~~~
-
-虽然 A2/A3 合法且相关，但已在无过滤 Top-3 之外，被提前截断；返回仅一条而非请求的三条，损害**授权语料内的 Candidate Recall**。
-
-正确的查询约束：
-
-~~~text
-filter = { knowledgeBaseId in ["A"] }
-              ↓
-     在 A 范围内执行 Top-3
-              ↓
-          [A1, A2, A3]
-~~~
-
-这个例子是假设 A 中确实有三条候选的教学情况，实际 ANN Top-K 还受阈值和近似搜索影响。
-
-还有权限与信息流问题：无约束检索可能把 B 的 Payload 带回应用服务，并在调试日志、Reranker 或模型输入中产生不必要的越权处理风险。**所以应在服务端使用经过授权的 Filter 限制候选发现，不能仅在最后输出 HTML/JSON 前过滤**。
-
-后置验证仍然可以作为额外检查，例如检索执行期间某文档刚好被撤销或者文档发布状态变更；此时可丢弃失效候选并在合法范围内适度补检，但不能只依赖这种后续修复。
-
-### 【妙码 AI Flow 的源码现状：已建立两种 Keyword Index，在线只按知识库 ID 过滤】
-
-#### 【一、离线创建 Collection 与 Payload Index】
-
-[`packages/ai-engine/src/knowledge/store/qdrant-store.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 的 `ensureCollection()` 会在**新建 Collection** 后执行：
-
-~~~typescript
-await this.client.createPayloadIndex(
-  this.collectionName,
-  {
-    field_name: "knowledgeBaseId",
-    field_schema: "keyword",
-  },
-);
-
-await this.client.createPayloadIndex(
-  this.collectionName,
-  {
-    field_name: "documentId",
-    field_schema: "keyword",
-  },
-);
-~~~
-
-作用：
-
-- `knowledgeBaseId`：在 Dense Search 与 `textSearch()` 的 `scroll` 过滤中使用，限制检索范围；
-- `documentId`：在 `deleteByDocumentId()` 删除点数据的过滤等操作中使用，也方便后续文档级查询。**不能因为建立了该字段索引就声称当前 Dense Search 已经自动增加 `documentId` 查询过滤**。
-
-`upsertVectors()` 将 `chunkId/content/chunkIndex/documentId/knowledgeBaseId` 等作为 Point Payload 写入 Qdrant。这样离线将业务字段编码成可过滤的数据。
-
-**源码细节**：`ensureCollection()` 检查到 Collection 已存在时会提前返回。因此若对老 Collection 新增过滤字段索引或发现旧索引缺失，不能只调用此方法就假设索引已被自动补齐；应单独检查索引 Schema 并执行可重复的索引迁移/修复逻辑。
-
-Qdrant 官方建议在已知过滤字段时**优先在写入 Point 前建立 Payload Index**，让 Filterable HNSW 的过滤关联随着索引结构创建得更充分；如果先积累大规模数据、后来再补索引，可能需要重建 HNSW 相关结构才能得到相同的过滤性能。参见 [Production: Bulk Data Import](https://qdrant.tech/documentation/production-operations/bulk-data-import/)。
-
-#### 【二、业务 API 在线先判断知识库归属】
-
-[`apps/workflow/app/api/knowledge/[id]/search/route.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts) 首先：
-
-~~~typescript
-const userId = await getCurrentUserId();
-if (!userId) {
-  return apiError(ErrorCode.UNAUTHORIZED);
-}
-
-const knowledgeBase = await prisma.knowledgeBase.findFirst({
-  where: { id: knowledgeBaseId },
-});
-if (!knowledgeBase || knowledgeBase.userId !== userId) {
-  return apiError(ErrorCode.KNOWLEDGE_BASE_NOT_FOUND);
-}
-~~~
-
-即这条 API 在调用检索器之前，先核对用户身份及其对指定 Knowledge Base 的所有权，然后传入：
-
-~~~typescript
-const results = await retriever.retrieve({
-  query,
-  knowledgeBaseIds: [knowledgeBaseId],
-  mode,
-  topK,
-  threshold,
-  vectorWeight: knowledgeBase.vectorWeight,
-});
-~~~
-
-这说明 API 的权限边界并非依靠 Qdrant 自动识别当前用户，而是由**业务层核验之后，将合法的知识库 ID 作为检索过滤范围传入**。
-
-#### 【三、Qdrant 向量检索在 Query 内执行 Filter】
-
-同一个 `QdrantVectorStore.search()` 通过：
-
-~~~typescript
-const response = await this.client.search(
-  this.collectionName,
-  {
-    vector,
-    limit: topK,
-    score_threshold: threshold,
-    filter: {
-      must: [
-        {
-          key: "knowledgeBaseId",
-          match: { any: knowledgeBaseIds },
-        },
-      ],
-    },
-    with_payload: true,
-    with_vector: false,
-  },
-);
-~~~
-
-对结果施加 `knowledgeBaseId` 限制。当前的文本分支 `textSearch()` 虽然仍是 `scroll(limit:1000)` 后在 Node.js 进行字符串匹配，但 `scroll` 同样带有 `knowledgeBaseId` Filter；这不能被误写成真正 BM25 Sparse Search，也不能消除该分支只读第一页 1000 个 Point 的限制。
-
-**结论：此 API 的“业务侧所有权校验 + 向量库检索时字段过滤”是明确的现有机制**。但项目尚未实现 `tenantId`、文档有效时段、状态或复杂 ACL 字段的统一检索过滤体系，不能将建议架构描述为已交付。
-
-#### 【四、工作流知识节点的授权边界需要单独说明】
-
-[`packages/ai-engine/src/nodes/executors/knowledge-executor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts) 使用工作流节点配置里的 `knowledgeBaseIds` 调用 Retriever，在该执行器自身的代码中检查了 ID 列表非空、Query 非空等，但**没有在该执行器内做与知识库搜索 API 相同的 `userId → knowledgeBase.userId` 所有权查询**。
-
-因此不能由“知识库搜索 API 安全”推断“所有工作流执行入口都已做同样授权”。应在所有运行入口/服务层统一保证传入执行器的是**按当前调用者授权确定的合法知识库集合**；更强的方案可把已验证的授权 Scope 当作不可由用户任意覆盖的运行时上下文，以避免节点配置绕过权限边界。
-
-### 【如果进一步增加生效时间、版本和细粒度 ACL，应怎样建模】
-
-可以将已知且稳定、需要用于高频查询过滤的字段放入 Payload；示例为未来改造结构：
-
-~~~typescript
-type KnowledgeChunkPayload = {
-  chunkId: string;
-  documentId: string;
-  knowledgeBaseId: string;
-  tenantId: string;
-  content: string;
-  status: "ACTIVE" | "ARCHIVED";
-  effectiveFrom?: string;
-  effectiveTo?: string;
-  version?: string;
-};
-~~~
-
-入库/维护阶段：
-
-- `keyword` 适于精确 ID、状态和版本匹配；
-- 日期或数值范围应使用适当的 `datetime`、`integer` 等字段索引及 `range` 条件；
-- 选择真正高频过滤字段建立索引，索引会增加存储/维护成本，且需匹配字段的值类型；
-- 文档发布、版本变动、权限撤销后应确保 Qdrant Payload 与业务权威数据源间的一致性，不应让旧 `ACTIVE` 状态无限期滞留。
-
-在线语义示意，**以下为新功能设计草案，不是当前代码**：
-
-~~~typescript
-const allowedKnowledgeBaseIds =
-  await authorizationService.getAllowedKnowledgeBaseIds(currentUser);
-
-const response = await client.query("knowledge_chunks", {
-  query: queryVector,
-  filter: {
-    must: [
-      {
-        key: "knowledgeBaseId",
-        match: { any: allowedKnowledgeBaseIds },
-      },
-      {
-        key: "status",
-        match: { value: "ACTIVE" },
-      },
-    ],
-  },
-  limit: topK,
-  with_payload: true,
-});
-~~~
-
-其中 `authorizationService` 是拟新增或复用的可信业务授权服务，而不是已有实现；若授权列表为空应直接拒绝/返回空，不可删除 Filter 退化为全库查询。
-
-对于生效日期，既要支持开始时间约束，也要考虑 `effectiveTo` 为空（长期有效）的语义；复杂范围条件必须根据具体的 Qdrant Filter Schema 显式表达，不要把日期字符串简单当成 Keyword 做字典序比较。
-
-**动态用户权限不宜全部当成静态 Payload**：例如用户加入/退出团队、权限变更、文档共享名单变动，真正的权限关系通常在业务数据库或授权服务中，以该权威数据源计算当前可见集合，再生成 Qdrant Filter。若 ACL 很复杂，可以考虑文档可见性物化或不同粒度的索引隔离设计，但必须平衡更新成本、查询选择性和安全性。
-
-### 【过滤与索引的工程验收】
-
-应同时衡量**访问控制正确性、授权语料中的检索质量以及性能**，而不只是响应是否有结果：
-
-| 检查 | 用例与方法 | 预期 |
-|---|---|---|
-| 用户隔离 | A/B 两个用户拥有不同 Knowledge Base，相同 Query | A 无法获取 B 的 Chunk 内容或来源 Metadata |
-| 文档状态 | ACTIVE/ARCHIVED 两个版本同时留在存储 | 本次请求只检索当前许可且生效的版本 |
-| 精确范围与后置过滤对照 | 教学情形：全库前 K 被大量越权数据占据 | 检索期 Filter 不会先让越权候选占据 Top-K |
-| ANN 近似误差 | 选取严格过滤 Query，对比精确评分与普通 Qdrant 搜索 | 检查过滤范围内的 Recall@K 与 P95，必要时调整索引/参数 |
-| 撤权/版本变更 | 查询期间修改权限或文档状态 | 不释放过期越权证据，必要时失败关闭、复核与补检 |
-| 多入口一致性 | 管理 API、工作流知识节点、批处理调用 | 相同调用者授权 Scope 可解释、一致且不会被任意扩大 |
-| 索引维护 | 新 Collection 创建、已有 Collection 迁移 | 检查字段索引存在、类型正确、索引构建状态可追踪 |
-
-注意：`Payload Index` 能改善过滤检索性能，但本身**不等于访问控制系统**；访问控制由受信任的服务端鉴权与 Filter 构造实现，并应避免将 Qdrant 无约束查询能力直接暴露给不可信调用者。
-
-### 【面试标准回答】
-
-在 RAG 系统中，权限与文档有效性过滤通常采用**离线建索引、在线检索时约束和检索后必要复核**的分层模式。离线入库时将知识库/租户 ID、文档状态、生效范围、版本等字段写入 Payload，并针对高频过滤字段创建 Payload Index；在线由服务端验证用户身份与授权，生成 Filter，与 Query Vector 一起提交给 Qdrant。
-
-Qdrant 可以结合 Payload Index 和 Filterable HNSW，把过滤约束纳入近邻搜索执行；查询规划器依据匹配量选择对少量候选直接评分或在过滤式 HNSW 上搜索，并非固定“先把所有文档过滤完，再启动一次 HNSW”。相比“全库 Top-K 后应用层删除”，检索时 Filter 可以避免不合法候选先挤占 Top-K，减少无效数据处理，也有利于保障授权语料下的召回质量。
-
-妙码 AI Flow 现已对 `knowledgeBaseId` 和 `documentId` 建立 Keyword Payload Index；知识库搜索 API 先核对知识库归属，再把合法 `knowledgeBaseId` 下推给向量检索及文本 `scroll` 分支。工作流 KnowledgeExecutor 本身未重复执行用户所有权校验，需要依赖受信任的运行入口统一保证其知识库 ID 范围。未来扩展有效版本和动态 ACL 时，应在可靠授权数据源上计算过滤约束，检索后对撤权、失效和来源进行必要复核，但不应把后置检查作为唯一控制。
-
-**一句话：离线准备索引，在线计算授权范围，向量检索中执行 Filter，使用证据前必要时复核；Payload Index 是加速与查询规划工具，不是自动授权或独立向量空间。**
-
-### 【参考资料与源码】
-
-1. [Qdrant：Filtering in Vector Search—Filter During the Search, Not Before or After](https://qdrant.tech/documentation/search-patterns/vector-search-filtering/)：过滤时机、Filterable HNSW 与基数感知策略。
-2. [Qdrant：Bulk Data Import—Create Payload Indexes Before Uploading](https://qdrant.tech/documentation/production-operations/bulk-data-import/)：先建索引和过滤式 HNSW 关联的性能影响。
-3. [Qdrant：Filtering and Exact String Matching](https://qdrant.tech/documentation/search/text-search/text-filtering/)：Keyword Index 的准确职责。
-4. [Qdrant：Production Checklist](https://qdrant.tech/documentation/production-checklist/)：过滤索引与查询优化建议。
-5. [Qdrant：FAQ（Logical Separation、Per-tenant Index、Sharding）](https://qdrant.tech/documentation/faq/)：共享 Collection 中的逻辑隔离与更强隔离设计的区别。
-6. 项目：[Qdrant Store](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)、[知识库搜索 API](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts)、[KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts)、[document-processor.ts](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)。
+1. [Qdrant：What to Check Before Tuning a Qdrant Collection](https://qdrant.tech/documentation/search-tuning/before-tuning-a-qdrant-collection/)：按查询失效症状选择检查与调优方向，注意未建索引、过滤与评测设置。
+2. [Qdrant：Measuring ANN Recall](https://qdrant.tech/documentation/tutorials-search-engineering/ann-recall/)：Exact kNN 与 ANN 对照、`hnsw_ef` 的召回/延迟取舍。
+3. [Qdrant：Search](https://qdrant.tech/documentation/concepts/search/)：搜索参数中的 `exact`、`hnsw_ef`、`limit`。
+4. [Qdrant：Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/)：有标注的业务检索相关性评测。
+5. 项目源码：[文档处理](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)、[VectorRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts)、[HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)、[QdrantVectorStore](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)。
 
 ---
 
