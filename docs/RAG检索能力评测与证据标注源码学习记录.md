@@ -1207,6 +1207,399 @@ RAG 检索优化应先建立以 Ground Truth 为标准的固定评测基线，�
 
 ---
 
-## 【下一题讨论方向：为什么 Dense Vector Search 与 BM25 具有互补性】
+## 【第五题：为什么 Dense Vector Search 与 BM25 具有互补性，什么时候应该引入 Hybrid Search】
 
-先从查询需求理解 Dense Embedding 与 BM25 的不同匹配机制：语义相似、精确编号/术语、否定与条件查询各自如何影响召回；再分析什么时候值得引入 Hybrid Search，使用本篇 Ground Truth 与检索指标对照证据。之后自然进入 RRF 和 Rerank，仍按一题一轮讨论，**本段不提前包含下一题的标准答案**。
+### 【提问与知识目标】
+
+此前已掌握文档切片、Embedding、Qdrant Dense Vector、HNSW 与 Evidence Recall 等基本链路。接下来讨论一个架构决策：**已经有了语义向量检索，为何还要建立词项检索？** 关键不是“检索算法越多越好”，而是确认不同查询对语义泛化和精确词项的依赖不同，进而用 Ground Truth 检验是否存在可弥补的召回缺口。
+
+仍从企业知识检索的通用问题出发；妙码 AI Flow 的实现作为后续源码实例。所有排序和分数均为教学假设，而非实际项目评测数据。
+
+### 【相同主题下，为什么语义接近不等于证据正确】
+
+假设企业知识库保存：
+
+| 文档 | 文本内容 |
+|---|---|
+| D1 | E-1042：数据库连接池耗尽，导致接口超时 |
+| D2 | E-1043：数据库连接超时，需要检查网络配置 |
+| D3 | E-1088：数据库连接异常，需要检查服务健康状态 |
+| D4 | API 请求异常的通用排查流程 |
+
+Query：“E-1042 故障应该如何处理？”
+
+在一个假设的 Dense 排序中，D2、D3 可能排在 D1 前：因为这些文档都包含数据库连接、超时等近似语义，**Embedding 并不天然保证两个字符相近但身份不同的故障编号能被可靠区分**。
+
+若建立合适的词项索引，BM25 能利用 `E-1042` 这个具有区分度的匹配词项，将 D1 作为重要候选。要真正保证“编号完全相同”，实际系统还应给编号建立精确字段或设计不拆分编号的 Analyzer，**不要把 BM25 词项匹配误当严格的业务身份校验**。
+
+换一种 Query：“系统运行一阵后，接口为什么越来越慢？”正确资料可能写“连接池耗尽，排队请求增多，使响应时间持续上升”。Query 和文档词汇不同，Dense Embedding 有机会学习表达之间的语义关系；不带同义词扩展的 BM25 可能漏掉。
+
+**互补的根本原因**：稠密检索以向量空间距离衡量语义相关性；BM25 以显式词项匹配及统计权重衡量文本相关性。两种机制会产生不同的正确候选和不同的错误。
+
+### 【Dense Search 与 BM25 的输入、索引和匹配机制】
+
+**Dense Search**：
+
+~~~text
+离线：
+原始文档 → Chunking → Embedding → Dense Vector → Qdrant Point
+                                                     ↓
+                                             HNSW 等近邻索引
+
+在线：
+Query → 同一语义空间的 Query Embedding → kNN/ANN → 相似度排序 Top-K
+~~~
+
+优势是语义泛化和同义表达匹配；局限包括精确编号/型号、版本数字、否定条件、稀有术语的权重可能无法按业务需要稳定保持。HNSW 解决**高效搜索近邻**，并不改变 Embedding 对业务相关性的定义。
+
+**BM25**：
+
+~~~text
+离线：
+原始文档 → Chunking → Tokenization/规范化 → 词项频率等统计
+                                             ↓
+                                       倒排索引
+                          词项 → Posting（哪些文档/Chunk 含有它）
+
+在线：
+Query → 兼容的分词规则 → 查询词项
+                         ↓
+                 倒排列表获得候选
+                         ↓
+               TF、IDF、长度归一化评分
+                         ↓
+                       Top-K
+~~~
+
+BM25 关注三个主要因素：
+- TF：某词项在**当前文档**中出现的次数；
+- IDF：某词项在**整个参考语料**中有多稀少（依赖文档总数 N 和文档频率 DF）；
+- 文档长度归一化：防止较长文档仅因包含更多文本而获得不合理优势；参数 `k1`、`b` 控制词频饱和及长度校正。
+
+虽然 BM25 不需要训练 Dense Embedding 模型，但仍需要一致的 Tokenizer、大小写/标点规范化、特殊标识符处理、存储统计和索引维护。中文语料尤其需要重视分词粒度与同义词策略。
+
+简化公式：
+
+~~~text
+BM25(Q,D) = Σ IDF(t) × [ TF(t,D) × (k1+1)
+                        / (TF(t,D) + k1 × (1-b+b×|D|/avgdl)) ]
+        t∈Query
+~~~
+
+该公式是常见 BM25 写法，具体 IDF 平滑和权重的实现存在差异；它表示**对当前 Query 包含的词项，按该文档 TF、全局 IDF 与长度因素累计得分**，而不是离线把所有词只排列一次。
+
+**对比与边界：**
+
+| 维度 | Dense Vector Search | BM25 |
+|---|---|---|
+| 查询匹配依据 | Query/Document 向量距离 | Query/Document 的词项匹配及统计 |
+| 典型索引 | HNSW 等向量近邻结构 | Inverted Index / Posting List |
+| 同义表达 | 往往更有优势 | 缺少共同词项时可能漏检 |
+| 编号/术语 | 可能混淆接近形式 | 适当词项分析下常有优势 |
+| 否定/条件 | 可能忽略关键约束 | 可能匹配文字，但仍不理解逻辑关系 |
+| 工程限制 | Embedding 版本、维度、索引质量 | 分词、统计、查询词项、索引维护 |
+
+**误区**：BM25 匹配“入职不满一年”“不适用”等词，不意味着算法理解条件推理；Dense 与 BM25 都不能替代权限、版本有效性和复杂规则验证。
+
+### 【Hybrid Search 怎样结合互补能力】
+
+典型实现不是把语义向量与 BM25 原始分数硬相加，而是并行进行两路候选检索，再做融合：
+
+~~~text
+                       Query
+                     /       \
+       Query Dense Embedding  Query Tokenization / BM25 表示
+                  |                  |
+             Dense Top-K        BM25 Top-K
+                  \                  /
+                  去重、融合/排序（Fusion）
+                            ↓
+                       Final Top-K
+                            ↓
+                     Context / LLM
+~~~
+
+例如：
+
+~~~text
+Dense 排序：D2、D3、D1、D4
+BM25 排序： D1、D2、D4、D5
+
+候选并集：D1、D2、D3、D4、D5
+~~~
+
+两路召回的**并集**可能带来覆盖增益，但最终只保留较小 Top-K 时，融合排序仍可能再次丢失正确证据。候选召回要看 Evidence Recall，最终排序还需看 MRR/nDCG，不能仅因两路并行就宣布 RAG 质量改善。
+
+两种评分尺度不能直接无条件相加。例如 Cosine Score 可能在 0～1 附近，而某个 BM25 分数可能为 14.5；原始相加会产生不可解释的偏置。可使用 RRF（基于排序位置）、经过校准的分数融合或额外 Rerank，下一题再详解 RRF 的计算与适用边界。
+
+### 【妙码 AI Flow：现有检索链路究竟是什么】
+
+源码需要先按业务入口理解，而不是仅看到 `hybrid` 名称就推断已具备“标准 BM25”：
+
+1. [知识库检索 API](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts) 核验用户对知识库的访问权后，读取 `mode`、`topK`、`threshold`，创建 Ollama Embedding、Qdrant Store 与 FulltextSearchProvider，调用 `HybridRetriever.retrieve()`。
+2. [VectorRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 将 Query 交给 Embedding，然后通过 Qdrant VectorStore 获取 Dense 检索结果。
+3. [QdrantVectorStore.textSearch()](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 通过一次 `scroll(limit:1000)` 读取所选知识库的部分 Point，再在应用层做子串匹配、匹配次数加权、排序。它未执行完整分页遍历，且没有 BM25 的规范 TF/IDF/长度归一化计算与独立倒排索引；**不能称为 BM25**。
+4. [HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 支持 `vector/fulltext/hybrid`；混合模式将 `topK` 扩到 `ceil(1.5*topK)` 作为两路候选深度，并行获取后使用加权 RRF 融合（代码 `k=60`，默认 `vectorWeight=0.7`），最后截取最终 `topK`。
+5. [KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts) 在工作流的知识库节点中也构建相同风格的文本 Provider 并调用 HybridRetriever，将结果组织成工作流输出；不能仅根据执行器已创建 Provider 就认为运行时总是有有效的第二路结果。
+
+**对当前项目准确的描述**：`Dense Vector + 应用层自定义文本匹配 + 加权 RRF`，而不是“Dense + 标准 BM25 倒排索引 + RRF”。如果全文搜索未返回结果，混合检索会返回向量结果的前 K 条。
+
+### 【通过评测决定是否引入标准 BM25】
+
+固定 Query/Qrels、语料版本、授权范围、Embedding 模型和候选 K，对照：
+
+~~~text
+A：Dense
+B：标准 BM25（确认词项分析和索引真实可用）
+C：Dense + BM25 + Fusion
+~~~
+
+至少分组检验：精确编号/产品型号、口语同义表达、跨文档多事实、否定与条件问题。计算 Evidence Recall@K、nDCG@K、MRR、P95 延迟和索引维护成本；如果混合方案相对最强单路没有显著收益，未必值得额外增加基础设施复杂度。
+
+### 【面试标准回答】
+
+Dense Vector Search 利用 Embedding 将 Query 与知识表示为稠密向量，通过向量距离衡量语义相似，适合措辞不同但语义相近的问题；BM25 基于分词及词项的 TF、IDF 和长度归一化计算相关性，常通过倒排索引高效查询，能够突出精确编号和稀有术语等显式匹配信号。两者保留的相关性信息不同，因此可能互相弥补召回缺陷。
+
+Hybrid Search 分别执行两路候选检索，再去重并通过 RRF、分数融合或 Rerank 得到统一排序。引入双路检索前应通过统一 Ground Truth 检查各类 Query 的真实召回互补性及增益成本，不能仅因存在 Hybrid 类型就认定拥有标准 BM25。妙码 AI Flow 当前实现的是 Dense + 应用层自定义文本匹配 + 加权 RRF，需要另行建设 BM25 词项索引才能与标准方案等同。
+
+### 【资料与源码】
+
+1. [Qdrant：The Two Families of Search](https://qdrant.tech/course/beginners/module-3/the-two-families-of-search/)：Dense/稀疏两类检索的机制与互补性。
+2. [Qdrant：Hybrid Search](https://qdrant.tech/documentation/search-tuning/hybrid-search/)：候选预取、BM25 稀疏通道与 RRF。
+3. [Qdrant：Understanding Vector Search](https://qdrant.tech/documentation/overview/vector-search/)：向量和倒排索引的语义与词项匹配边界。
+4. [Qdrant：Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/)：使用有标注查询评价真实收益。
+5. 妙码 AI Flow 源码：以上知识库检索 API、`textSearch()`、`VectorRetriever`、`HybridRetriever` 和 `KnowledgeExecutor`。
+
+---
+
+## 【第五题追问：BM25 的词项、倒排索引和稀疏向量怎样在离线与在线阶段协作】
+
+### 【提问与知识目标】
+
+问题集中在五个连续判断：
+
+- BM25 是否需要把文档先做词向量拆分，再计算 TF？
+- 离线时建立“词与文档”还是“词与词”的关联？
+- 是不是离线直接把词按 TF 排序？
+- 在线如何对 Query 分词、定位候选和计算 Top-K？
+- 这些结构存哪里，Qdrant 是否自带 BM25，它与现有 Dense Point 能否共存？
+
+**先统一术语**：Chunking 按段落/章节形成可检索片段；Tokenization 将片段拆成词项；Sparse Vectorization 将词项映射到稀疏向量的非零维度及权重；Dense Embedding 则是另外一条语义表示链路。BM25 不要求为每个词训练 Dense Embedding。
+
+### 【离线处理：从 Chunk 到词项倒排索引】
+
+假设同一知识库有：
+
+~~~text
+C1：数据库连接池耗尽，数据库请求超时。
+C2：数据库连接失败，需要检查网络。
+C3：用户登录失败，需要检查密码。
+~~~
+
+为说明机制，假设中文词项分析得到：
+
+~~~text
+C1：数据库、连接池、耗尽、数据库、请求、超时
+C2：数据库、连接、失败、检查、网络
+C3：用户、登录、失败、检查、密码
+~~~
+
+注意这不是任何特定分词器的精确输出；生产使用需验证中文语言分析、停用词、大小写及错误编号等字段的处理规则。
+
+按词项统计得到：
+
+| Token | C1 的 TF | C2 的 TF | C3 的 TF | DF（包含它的文档数） |
+|---|---:|---:|---:|---:|
+| 数据库 | 2 | 1 | 0 | 2 |
+| 连接池 | 1 | 0 | 0 | 1 |
+| 失败 | 0 | 1 | 1 | 2 |
+| 登录 | 0 | 0 | 1 | 1 |
+
+**TF 是词项与某个文档之间的统计，不是该词整个知识库中的固定名次。**离线构建的核心结构通常为倒排索引（Inverted Index）：
+
+~~~text
+词项（Token） → Posting List（包含它的 Chunk/文档）
+
+数据库 → [(C1, TF=2), (C2, TF=1)]
+连接池 → [(C1, TF=1)]
+失败   → [(C2, TF=1), (C3, TF=1)]
+登录   → [(C3, TF=1)]
+~~~
+
+一条 Posting 还可以存词项位置等信息，以支持短语检索。DF 是从“多少篇文档包含某词”得到的集合统计；平均文档长度需要语料级别的长度统计。**离线组织这些数据是为了快速定位候选，并非按 TF 将所有词项统一排序；文档与 Query 的最终相关分数是在查询到来时才有明确意义的。**
+
+**回答索引关系的核心问题**：
+
+- BM25 的倒排关系：**词项/稀疏维度 → 包含它的文档或 Chunk/Point**。
+- HNSW 的主要近邻关系：**向量点 ↔ 向量点**，通过图连接近邻。
+- 两者都不是将词项顺序连接成“词与词”的邻接图。
+
+### 【在线查询：Tokenization、Posting 合并、BM25 评分、Top-K】
+
+用户提问：“数据库连接池为什么会耗尽？”
+
+~~~text
+1. Query Tokenization：
+   数据库、连接池、耗尽
+
+2. 根据倒排索引查找候选：
+   数据库 → C1、C2
+   连接池 → C1
+   耗尽   → C1
+
+3. 合并 Posting：
+   候选集合 {C1, C2}
+
+4. 对每个候选按 Query 词项计算得分：
+   C1：包含数据库、连接池、耗尽；数据库出现 2 次
+   C2：只包含数据库；其余两个关键词项不匹配
+
+5. 按总得分排序：
+   Top-1 预期 C1，Top-2 可能包含 C2
+~~~
+
+BM25 在离线维护的词项统计基础上，结合当前 Query 执行评分。常见公式：
+
+~~~text
+BM25(Q,D) = Σ[ IDF(t) ×
+               TF(t,D)(k1+1)
+             / (TF(t,D)+k1(1-b+b|D|/avgdl)) ]
+           t∈Query
+~~~
+
+- `TF(t,D)`：t 在 D 中出现的次数；
+- `DF(t)`：包含 t 的文档数；与总文档数 N 一起决定 `IDF(t)`；
+- `|D|`：D 的词项长度；`avgdl`：平均文档长度；
+- `k1`：词频饱和控制；`b`：文档长度归一化强度。
+
+不同引擎对 IDF 平滑以及 TF 权重预计算与否的实现有所差异，不能将公式的每个计算步骤误认为所有数据库完全相同的运行时序。
+
+示例中 C1 同时匹配更多词项，且包含罕见的“连接池”“耗尽”，因此**通常有理由预期** C1 比 C2 排名更靠前；这不是不经实际统计就可保证的任何文本下的严格次序。
+
+### 【词项索引保存在哪里：传统检索引擎与数据库的职责】
+
+倒排索引一般由搜索引擎/数据库持久化维护，业务代码不必自己建立如下 SQL 表：
+
+~~~text
+term | chunk_id | tf
+~~~
+
+这个表只是理解“关联关系”的逻辑模型。Lucene/Elasticsearch 等全文搜索系统持久化管理词项字典、Posting、文档长度与其他评分统计；更新文档时维护相应索引。真实的物理编码、压缩、合并段机制通常比一张关系表复杂。
+
+**索引不一定离线一次完成后永久不变**：新文档增删、分词策略和语料统计变化都可能触发增量索引更新或段优化。这里说“离线构建”是从用户 Query 的实时路径中分离文档入库，而不意味着只能批量停机重建。
+
+### 【Qdrant 是否提供 BM25：Sparse Vector 索引与原生文本推理】
+
+**提供。**但需分清三个能力：
+
+| Qdrant 结构/能力 | 主要作用 | 是否直接等于 BM25 排名 |
+|---|---|---|
+| Dense Vector + HNSW | 向量语义近邻搜索 | 否 |
+| Payload Full-text Index | 对文本 Payload 做词项/文本条件过滤 | 否，单独的 Payload Filter 不等于 BM25 |
+| Sparse Vector Index + BM25 表示与 IDF | 词项加权的 BM25 式排序 | 是，正确配置索引、向量模型和 IDF 时 |
+
+在 Qdrant 中，Sparse Vector 的非零维度可以对应词项的数值标识，权重则编码该词在文档中的重要性。示意：
+
+~~~json
+{
+  "indices": [12, 35, 79],
+  "values": [1.4, 0.8, 2.1]
+}
+~~~
+
+这里 `indices` 是稀疏向量的非零维度列表，**不是倒排索引本身**；Qdrant 另行维护“维度 → 含此维度的 Point”的稀疏索引。官方把这种索引描述为倒排索引风格的结构，且稀疏检索默认是精确的向量得分计算，不像 HNSW 主要使用 ANN 近似近邻。见 [1][2]。
+
+**同一个 Point 可以同时存 Dense 与 BM25 Sparse 表示**：
+
+~~~text
+Collection：knowledge_chunks
+      │
+      └── Point C1
+           ├─ Payload：chunkId、documentId、content、knowledgeBaseId
+           ├─ Dense Vector：语义嵌入，用于 Dense Search
+           └─ BM25 Sparse Vector：词项非零维度和权重
+                  ↓
+               Sparse Index（倒排式）
+~~~
+
+Collection 配置**概念示例**（REST 创建新 Collection 的形态）：
+
+~~~json
+{
+  "vectors": {
+    "dense": {
+      "size": 1024,
+      "distance": "Cosine"
+    }
+  },
+  "sparse_vectors": {
+    "bm25": {
+      "modifier": "idf"
+    }
+  }
+}
+~~~
+
+其中 `dense`/`bm25` 是命名向量；`size:1024` 仅是示例，应与实际 Embedding 维度一致；`modifier:"idf"` 表示为稀疏检索启用 Qdrant 管理的 IDF 权重。创建不同名称的索引或更换 Embedding 不能简单把旧 Point 原样当成已经同时持有两种向量，需要确认新 Vector 字段已配置并给现有 Point 补录对应稀疏表示。
+
+**两种可行的 Sparse 生成方式**：
+
+1. 服务端能力允许时，向 Qdrant 提交带 `model:"qdrant/bm25"` 的原始文本，使用其服务器侧 BM25 推理；实际可用性取决于 Qdrant 版本、部署方式和相应推理功能。
+2. 使用兼容的客户端（如 FastEmbed）在文档写入时产生 BM25 Sparse Vector，再按命名字段写入 Qdrant；在线 Query 需使用**兼容的模型、Tokenizer 与维度映射**编码。
+
+Qdrant 官方 [Server-side Inference: BM25](https://qdrant.tech/documentation/inference/inference-bm25/) 展示直接使用原始文本构建 BM25 Sparse 表示；[Hybrid Search](https://qdrant.tech/documentation/search-tuning/hybrid-search/) 展示同一请求对 Dense/BM25 做预取、RRF 融合；[Indexing](https://qdrant.tech/documentation/manage-data/indexing/) 说明稀疏索引和其维护机制。
+
+**IDF 不是永远固定在“离线预计算结果”中**。使用 `modifier:"idf"` 时，Qdrant 在检索中依赖存储的语料级统计对稀疏匹配加权，文档增删可能使 IDF 变化。默认统计范围通常是被查询 Shard 的全体数据；对于使用 `knowledgeBaseId` 过滤的多租户知识库，检索结果限制和 IDF 参考语料的范围未必相同，必须依据部署版本、索引配置和隔离设计判断是否需要独立的统计范围。参考 [Qdrant Multitenancy - Per-Tenant IDF](https://qdrant.tech/documentation/manage-data/multitenancy/)。
+
+**中文与特殊标识符**：BM25 要对文档与 Query 使用相兼容的词项分析与 ID 映射；若针对中文，只按英文空格切分会遗漏真正的词边界，需检查 Qdrant 模型/Tokenizer 对语言的支持，并根据精确编号与语义评测结果选择合适配置。对于代码、版本号和故障编号，精确过滤字段通常比仅依赖 BM25 排名更安全。
+
+### 【妙码 AI Flow 的当前实现与推荐改造位置】
+
+**项目现状（已核对）**：
+
+- [`document-processor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts) 根据 Markdown/普通文本选择 Splitter；调用 Ollama Embedding 后将 `ChunkWithVector[]` 写入 `QdrantVectorStore.upsertVectors()`。该步骤目前构建的是 Dense 向量，不会自动生成 BM25 Sparse 向量。
+- [`QdrantVectorStore.ensureCollection()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 创建 Cosine Dense Vector 集合并为 `knowledgeBaseId`、`documentId` 建立 Payload Index，没有配置 `sparse_vectors.bm25`。
+- [`QdrantVectorStore.textSearch()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 用单次 `scroll(limit:1000)` 拿一批 Point，按标点/空格拆 Query，使用 JS 字符串包含与匹配次数自定义打分，并对该批结果排序；这不是 BM25、没有针对全部语料维护真正的 BM25 倒排索引，且没有取完分页就存在覆盖限制。
+- [`HybridRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 已有双路候选和加权 RRF 的编排。**需要改造的是文本检索的索引及 Provider 实现，不必为了 BM25 重新发明融合框架**，但也要重新验证融合效果。
+
+**建议方案（尚未实施）**：
+
+~~~text
+离线文档写入：
+Chunk → Dense Embedding ──────────→ Qdrant Point 的 dense
+     → BM25 Tokenizer/Sparse ─────→ 同 Point 的 bm25
+                                     ↓
+                       Qdrant 持久化向量 + 索引
+
+在线查询：
+Query → Dense Query Embedding → Dense 候选
+     → BM25 Sparse Query ─────→ BM25 候选
+                             ↓
+                    Fusion（RRF） → Top-K
+~~~
+
+需要核实项目当前部署的 Qdrant 版本/推理功能与客户端 API，再确定使用服务端 BM25 推理或客户端 FastEmbed；对已有 Point 执行稀疏表示补录/重建，确保原 Payload、知识库过滤、授权边界不丢失。对于新增 BM25 通道，应对照此前构建的 Ground Truth，在相同 Query 集上比较现有文本匹配、独立 BM25 和 Dense+BM25 的 Evidence Recall@K、nDCG、MRR、P95 及索引开销。
+
+### 【本题标准回答】
+
+BM25 的离线阶段不是将词项变成 Dense Embedding，也不是按 TF 给词建立一个全局排行榜，而是将 Document 或 Chunk 分词、统计词项在每个文档中的频率以及语料统计，建立**词项到文档/Chunk 的倒排索引**，并持久化在搜索引擎或数据库中。在线 Query 使用兼容的分词规则，查询词项关联的 Posting，汇总候选后结合 TF、IDF 和文档长度计算与当前 Query 的相关性，排序获得 Top-K。倒排索引的核心是词与文档的关联，而不是 HNSW 那样的向量近邻图。
+
+Qdrant 可以通过 BM25 Sparse Vector 索引实现这套能力，并允许同一个 Point 同时拥有 Dense 向量和 BM25 稀疏向量。Sparse 向量的非零维度与权重由 BM25 表示生成，Qdrant 维护对应的倒排式索引和可用的 IDF 统计，支持独立 BM25 查询以及 Dense/稀疏结果融合。但 Payload Full-text Filter 不等于 BM25，离线词项权重也不是永远固定的完整查询分数。
+
+妙码 AI Flow 当前只写入 Dense 向量，文本检索依靠从 Qdrant 获取一批 Payload 后在 Node.js 层字符串匹配，尚未接入 Qdrant BM25 Sparse 通道。升级时应在已有 Chunk 入库和检索 Provider 处补齐 Sparse 表示、索引及在线 Query 编码，再结合 Ground Truth 验证质量和成本，而不是仅更改 `retrievalMode` 的名称。
+
+### 【资料与实现边界】
+
+1. [Qdrant：Sparse Vectors and Inverted Indexes](https://qdrant.tech/course/essentials/day-3/sparse-vectors/)：`indices/values` 与真实倒排索引的区别、稀疏检索。
+2. [Qdrant：The Two Families of Search](https://qdrant.tech/course/beginners/module-3/the-two-families-of-search/)：词项到 Point 的倒排链路。
+3. [Qdrant：Indexing](https://qdrant.tech/documentation/manage-data/indexing/)：Sparse Index 的精确性质及索引构建/优化。
+4. [Qdrant：Server-side Inference BM25](https://qdrant.tech/documentation/inference/inference-bm25/)：`qdrant/bm25` 的原生文本推理。
+5. [Qdrant：Hybrid Search](https://qdrant.tech/documentation/search-tuning/hybrid-search/)：Dense/BM25 预取与融合机制。
+6. [Qdrant：Multitenancy - Per-Tenant IDF](https://qdrant.tech/documentation/manage-data/multitenancy/)：多租户情况下的 IDF 语料统计范围。
+7. 项目源码：[知识入库](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)、[Qdrant Store](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)、[HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)、[检索 API](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts)。
+
+---
+
+## 【下一题讨论方向：RRF 如何融合不同检索通道的排序】
+
+在掌握 Dense 与 BM25 两种候选生成机制后，使用同一组真实 ID/排序的教学例子，逐项计算 RRF 的分数及最终排序：为什么对排名求倒数而不是直接相加原始 Score、`k` 与两路权重如何影响结果、候选截断/重复 ID 怎样处理、RRF 和 Rerank 的职责边界。结合妙码 AI Flow 的 `HybridRetriever.reciprocalRankFusion()` 源码逐行说明，下一题先对话讨论再归档。
