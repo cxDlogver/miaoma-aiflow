@@ -55,7 +55,7 @@ Top-K：返回最多 K 条排序后的 Chunk 候选
 | B | 年假由直属主管审批 | 0.91 | 否：仅描述审批 |
 | C | 年假必须提前三个工作日申请 | 0.86 | 是：包含申请时限 |
 
-若 §TopK=2§，系统返回 A/B，可能完全符合向量距离排序，但没有包含 C。**向量检索在当前索引距离定义下排序正确，不等于业务证据召回成功。**这组分数为解释机制而假设，不是模型真实运行结果。
+若 `TopK=2`，系统返回 A/B，可能完全符合向量距离排序，但没有包含 C。**向量检索在当前索引距离定义下排序正确，不等于业务证据召回成功。**这组分数为解释机制而假设，不是模型真实运行结果。
 
 ### 【Ground Truth、Qrels 与评测集的输入输出】
 
@@ -135,15 +135,15 @@ Ground Truth：{C1, C2}
 
 ### 【项目实践：妙码 AI Flow 目前已经具备哪些基础数据】
 
-业务上下文：系统从文档处理模块得到 Chunk 和对应 Embedding，写入 Qdrant 中的 §knowledge_chunks§ Collection；用户问题在线生成 Query Vector 后，经 Retriever/VectorStore 搜索得到 Chunk 候选，交给后续工作流。此处关注**向量存储搜索接口返回的可验证证据 ID**，不假定应用已接入完整评测模块。
+业务上下文：系统从文档处理模块得到 Chunk 和对应 Embedding，写入 Qdrant 中的 `knowledge_chunks` Collection；用户问题在线生成 Query Vector 后，经 Retriever/VectorStore 搜索得到 Chunk 候选，交给后续工作流。此处关注**向量存储搜索接口返回的可验证证据 ID**，不假定应用已接入完整评测模块。
 
 需要核对的源码：
 
-- [知识库类型与配置：§types.ts§](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/types.ts)
-- [Qdrant 搜索实现：§qdrant-store.ts§](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)
-- [文档切分、Embedding 与写库：§document-processor.ts§](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)
+- [知识库类型与配置：`types.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/types.ts)
+- [Qdrant 搜索实现：`qdrant-store.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)
+- [文档切分、Embedding 与写库：`document-processor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)
 
-§VectorSearchOptions§ 规定 §vector§（Query 向量）、§knowledgeBaseIds§（检索范围）、§topK§（返回数量上限）、可选 §threshold§（相似度阈值）；§VectorSearchResult§ 保留 §chunkId§、§documentId§、§content§、§knowledgeBaseId§、§score§ 等字段。
+`VectorSearchOptions` 规定 `vector`（Query 向量）、`knowledgeBaseIds`（检索范围）、`topK`（返回数量上限）、可选 `threshold`（相似度阈值）；`VectorSearchResult` 保留 `chunkId`、`documentId`、`content`、`knowledgeBaseId`、`score` 等字段。
 
 核心数据库调用：
 
@@ -165,14 +165,14 @@ const response = await this.client.search(this.collectionName, {
 })
 ~~~
 
-**上游来源**：§vector§ 是查询文本经过 Embedding 得到的向量；§knowledgeBaseIds§ 应由业务可信授权范围决定，而不仅仅由用户自行提交。**本段执行**：Qdrant 在所选 Collection 范围内按知识库字段过滤，计算近邻，返回最多 §topK§ 条达到阈值的 Point。**下游结果**：映射为包含 Chunk/Document ID、正文与分数的 §VectorSearchResult[]§，可以作为评测器的 Run 输入。
+**上游来源**：`vector` 是查询文本经过 Embedding 得到的向量；`knowledgeBaseIds` 应由业务可信授权范围决定，而不仅仅由用户自行提交。**本段执行**：Qdrant 在所选 Collection 范围内按知识库字段过滤，计算近邻，返回最多 `topK` 条达到阈值的 Point。**下游结果**：映射为包含 Chunk/Document ID、正文与分数的 `VectorSearchResult[]`，可以作为评测器的 Run 输入。
 
 源码事实与边界：
-1. 现有 §search()§ 返回的 §chunkId§/§documentId§ 可以用于对齐人工标签，§score§ 保留检索排序分数。
+1. 现有 `search()` 返回的 `chunkId`/`documentId` 可以用于对齐人工标签，`score` 保留检索排序分数。
 2. 源码包含检索、范围过滤和 Top-K，但**尚不能仅据此认定已实现 Ground Truth 数据集、自动化指标评测或达到某个实际 Recall 数值**。
-3. 评测时应固定合法授权范围；§knowledgeBaseIds§ 作为搜索条件不等于接口独立完成了身份认证。
-4. 如更换 Chunking 或重新入库，§document-processor.ts§ 使用 §documentId + index§ 构造 Chunk ID；索引位置可能变化，必须重新对齐标注，不能把跨版本 ID 相同当成同一事实。
-5. Qdrant 返回的 §score§ 是向量相关性信号，**不是标注的业务相关性分数**。
+3. 评测时应固定合法授权范围；`knowledgeBaseIds` 作为搜索条件不等于接口独立完成了身份认证。
+4. 如更换 Chunking 或重新入库，`document-processor.ts` 使用 `documentId + index` 构造 Chunk ID；索引位置可能变化，必须重新对齐标注，不能把跨版本 ID 相同当成同一事实。
+5. Qdrant 返回的 `score` 是向量相关性信号，**不是标注的业务相关性分数**。
 
 ### 【最小评测方法：先用现有 VectorStore 建立基线】
 
@@ -203,7 +203,7 @@ const testCase: RetrievalCase = {
 
 1. 固定知识库及文档版本，确保标注 ID 仍对应正确正文，加载人工审查的 Qrels；
 2. 使用与入库兼容的 Embedding 模型编码 Query；
-3. 调用当前 §QdrantVectorStore.search()§，指定固定的 §topK§、§threshold§ 和合法 §knowledgeBaseIds§；
+3. 调用当前 `QdrantVectorStore.search()`，指定固定的 `topK`、`threshold` 和合法 `knowledgeBaseIds`；
 4. 从返回结果提取排名、Chunk ID、Document ID、得分，产生每题的 Run；
 5. 按同一评测粒度与 Ground Truth 比较，记录命中/覆盖和漏检原因；
 6. 用固定样本、版本、权限和指标对照不同配置，避免把数据变动误判为参数收益。
@@ -233,14 +233,14 @@ Hit@3 = 1；Evidence Recall@3 = 1
 | 文档是否已经完整入库？ | 正确原文不存在、更新失败或旧版本残留 | 数据接入与版本生命周期 |
 | Chunk 是否保留完整条件？ | 原始事实被错误切开、Metadata 丢失 | 文档解析、Chunking、上下文保真 |
 | 精确向量检索能否找出对应 Chunk？ | Exact kNN 的前 K 也不包含正确证据 | Embedding、Query 表示、混合检索 |
-| ANN 与精确向量结果差多少？ | Exact Top-K 包含目标、ANN Top-K 不包含 | HNSW、§hnsw_ef§、过滤执行/近似误差 |
+| ANN 与精确向量结果差多少？ | Exact Top-K 包含目标、ANN Top-K 不包含 | HNSW、`hnsw_ef`、过滤执行/近似误差 |
 | 候选已包含正确证据但最终答案不正确？ | 排序或上下文、生成阶段未使用证据 | Rerank、上下文构建、生成与引用 |
 
 **ANN Recall@K** 的参考集合是 Exact kNN 的 Top-K（同一向量空间、同一过滤条件、同一语料快照），评估近似索引是否遗漏几何近邻。
 
 **Evidence Recall@K** 的参考集合是业务标注的正确证据，评估结果是否有助于回答实际问题。
 
-假设 HNSW 与 Exact kNN 完全一致，但它们都优先返回“年假申请入口”和“年假审批人”，漏掉“提前三个工作日”。ANN Recall@K 可能是 100%，Evidence Recall@K 却仍然不足。此时不能靠继续调 §hnsw_ef§ 从根本上修复业务语义表示问题。Qdrant 将这两类评测明确分层，参见资料 [2][3]。
+假设 HNSW 与 Exact kNN 完全一致，但它们都优先返回“年假申请入口”和“年假审批人”，漏掉“提前三个工作日”。ANN Recall@K 可能是 100%，Evidence Recall@K 却仍然不足。此时不能靠继续调 `hnsw_ef` 从根本上修复业务语义表示问题。Qdrant 将这两类评测明确分层，参见资料 [2][3]。
 
 ### 【实践边界与下一步验收】
 
