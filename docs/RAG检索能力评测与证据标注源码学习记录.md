@@ -628,6 +628,273 @@ Context 属于 RAG 的评测对象，但 Context Construction 是运行阶段，
 
 ---
 
-## 【下一题讨论方向：如何建立可靠的 RAG Ground Truth 评测数据集】
+## 【第三题：如何构建可靠的 RAG Ground Truth 评测数据集】
 
-围绕真实用户查询、人工标注和 LLM 辅助生成测试问题的角色分工，讨论 Qrels 的构建、相关性等级、标注不完整与数据偏差，以及语料、模型和评测数据版本如何统一。下一题先在对话中展开，讨论清楚后再整理写入，不提前将问题提纲当作标准答案。
+### 【提问与知识目标】
+
+前两题建立了评价对象（Query、Ground Truth/Qrels、Run）和 Hit@K、Evidence Recall@K、Precision@K、MRR、nDCG 等指标。**指标计算依赖一个前提：我们能够可靠地区分哪条知识是正确证据，且测试问题足以代表系统应处理的实际需求。**
+
+本题讨论如何从真实查询、人工标注与 LLM 合成数据构造可复用的检索评测集，重点研究证据标注完整性、测试场景覆盖、语料版本、偏差与可复现性。评测数据集不是代码里的几条 `query→expectedChunkId` 测试常量，而是能长期衡量检索方案是否变好的**标准化实验资产**。
+
+### 【知识概述：Query 的来源不等于 Ground Truth 的正确性】
+
+Ground Truth（参考真值）由两类信息构成：
+
+1. **测试输入 Query**：用户想解决什么问题，使用什么表达，在什么业务范围及权限下查询。
+2. **参考证据标注 Qrels**：哪些文档、Chunk 或原子事实可以支持该问题的哪些答案要求，相关程度、有效版本以及允许的替代证据是什么。
+
+对于问答任务，还可以维护参考答案或必须覆盖的事实列表，但它们与检索 Qrels 不是同一种对象。最终答案的正确性，不应该直接当作检索结果 ID 的相关性标签。
+
+设文档包含：
+
+~~~text
+C1：员工申请年假需要提前三个工作日。
+C2：年假申请需要直属主管审批。
+C3：员工申请病假需要提供医疗证明。
+~~~
+
+基于 C1 让 LLM 自动生成：
+
+~~~json
+{
+  "query": "员工申请年假需要提前几个工作日？",
+  "relevantChunkIds": ["C1"]
+}
+~~~
+
+这可以成为**待审核样本**，但不能因为 LLM 由 C1 生成了问题，就宣布 C1 是唯一正确证据。若其他 FAQ 同样完整说明时限，直接只标 C1 会把合理的替代证据误判为错误；若生成的问题过于接近原文，又会让语义召回任务异常简单。
+
+Qdrant 官方指出，LLM 生成的查询通常比真实用户查询更容易被检索，可能抬高离线指标；点击日志也存在位置偏差，不能把点击直接等同人工验证的相关性。见 [1]。**因此应将“样本生成”和“标签验证”分为两个不同环节。**
+
+### 【真实查询、人工标注与 LLM 合成各自负责什么】
+
+| 来源 | 获得方式 | 主要贡献 | 需要控制的风险 |
+|---|---|---|---|
+| 真实用户 Query | 脱敏的查询日志、明确的用户反馈、历史问答 | 真实措辞、问题频率、实际意图 | 高频问题偏置、隐私、没有天然正确答案、点击位置偏差 |
+| 人工设计与标注 | 产品/领域专家提出问题、查阅现行知识确认事实 | 严格的证据定义、高风险与边界问题覆盖 | 标注费用、个人理解差异、漏标 |
+| LLM 合成 Query | 从审核过的源文档与事实生成不同表达和难度的询问 | 低成本扩充覆盖、压力测试复杂场景 | 问句复述原文、事实幻觉、误以来源 Chunk 是唯一答案 |
+
+推荐的职责分工不是固定的百分比分配，而是：
+
+- **真实查询决定主分布**：尽量代表线上会出现的实际问题；按主题/意图/难度分层抽样，避免高频简单问题淹没少量重要困难问题。
+- **人工审核决定参考标准**：至少对进入正式回归集的关键事实与证据对应关系进行核验；有争议的标签应由规则和复核解决。
+- **LLM 负责扩展**：生成同义表达、复杂限定条件、多证据问题、无答案和难例，但正式入库前进行事实校验。合成数据和真实数据分别报告评测结果，避免总体分数被“容易的合成问题”主导。
+
+### 【Ground Truth 的实际构建流程】
+
+~~~text
+确定评测范围（知识领域、版本、权限、业务目标）
+    ↓
+真实 Query 采样 + 专家设计问题 + LLM 辅助合成
+    ↓
+形成待标注 Query：去重、分类、脱敏、难度标记
+    ↓
+构造候选证据池 Pool
+  ├─ 人工查找原始文档/章节
+  ├─ 关键词和字段检索
+  ├─ 向量召回
+  └─ 可用的其他检索器/检索配置
+    ↓
+人工判定证据相关性、事实覆盖、版本/权限适用性
+    ↓
+生成正式 Qrels / 必要事实标注 / 参考答案（按需）
+    ↓
+冻结语料版本 + 标签版本 + 评测配置
+    ↓
+检索器生成 Run，计算指标并逐题分析
+    ↓
+新发现的漏标和新问题 → 复核、增补，发布新的数据集版本
+~~~
+
+**为什么要使用 Pool（候选池）？**如果只运行当前向量检索器，把返回的 Top-K 人工标成相关/不相关，那么它本来检索不到的正确文档永远不进入标注范围。当我们引入 Hybrid Search 后，它找到了另一条真正正确的证据，却可能因旧 Qrels 漏标而被误判。TREC 检索评测使用 Pooling，NIST 也分析过不完整 Pool 可能对未参与建池的新系统产生偏差。见 [2][3]。
+
+**Pooling 不是穷尽所有正确证据的数学保证。**应保留“未审核/未知”状态，必要时追加新检索方法和人工调查扩大候选池；对新系统反复发现的“未知但有用”结果做盲审和补标。不能把“不在标签表里”直接当成“人工确认无关”。
+
+### 【人工标注的粒度：从 Chunk ID 扩展到必要事实】
+
+仍用问题：“年假需要提前多久申请、由谁审批？”
+
+仅存：
+
+~~~json
+{
+  "query": "年假需要提前多久申请、由谁审批？",
+  "relevantChunkIds": ["C1", "C2"]
+}
+~~~
+
+可以计算 Chunk-ID 的 Recall，但无法直接知道返回的一条新父章节是否已经同时覆盖两个事实，亦难以跨 Chunking 方案长期复用。因此建议让评测数据保留**事实与证据两种关联**：
+
+~~~json
+{
+  "queryId": "leave-q-001",
+  "query": "年假需要提前多久申请、由谁审批？",
+  "queryType": "multi-fact",
+  "answerable": true,
+  "requiredFacts": [
+    {
+      "factId": "F1",
+      "description": "提前三个工作日申请",
+      "supportingChunkIds": ["C1"]
+    },
+    {
+      "factId": "F2",
+      "description": "由直属主管审批",
+      "supportingChunkIds": ["C2"]
+    }
+  ],
+  "corpusVersion": "policy-v2",
+  "annotationStatus": "verified"
+}
+~~~
+
+以上是**教学示例的数据结构**，不是妙码 AI Flow 现成的评测记录，也不是所有 RAG 场景必须采用的统一 Schema。
+
+需要解释的数据关系：
+
+1. `queryId` 是稳定的问题身份，可跨不同检索 Run 比较。
+2. `requiredFacts` 表示回答问题需要的独立证据要求；一个 Chunk 可能支持多个 Fact，同一 Fact 也可能被多个 Chunk 支持。
+3. `supportingChunkIds` 记录当前语料版本下可核实的证据映射；如果文档切分或重建，映射可能需要重算/审核。
+4. `answerable` 标记**在当前授权和语料快照内**是否存在足够证据，不应把“知识库外现实中有答案”误判为“系统有权且有能力回答”。
+5. `annotationStatus` 区分刚生成的候选、等待复核、有争议和验证通过，不允许未经审核的样本悄悄进入正式基准。
+
+**Qrels 与必要事实覆盖应分别实现：**普通 Chunk-level 指标可以使用 Qrels；多事实任务可以单独计算“最终候选或 Context 支持了多少 requiredFacts”。只有全部必要事实被证据支持，才可能判断信息覆盖完整；仍不代表最终 LLM 答案必然正确。
+
+### 【怎样设计具有代表性的 Query 覆盖】
+
+**数量多不代表覆盖好。**如果一千条 Query 大多是“某某制度是什么”，评测分数很高也无法证明系统理解编号、例外条款或多文档问题。
+
+可以按照业务风险和用户真实分布设计几个必要切面：
+
+| 查询类别 | 示例 | 主要暴露的检索困难 |
+|---|---|---|
+| 单事实 | 年假需要提前多久？ | 基础语义召回 |
+| 同义/口语 | 下周请年假，什么时候开始报？ | Query 表述与知识措辞差异 |
+| 精确编号 | E-1042 故障如何处理？ | 标识符精确匹配 |
+| 多事实 | 年假时限和审批人分别是什么？ | 必要证据覆盖 |
+| 跨文档 | 年假制度与审批流程如何衔接？ | 多来源召回与关联 |
+| 约束与例外 | 入职半年是否适用年假政策？ | 条件、例外及否定 |
+| 时间/版本 | 新政策的申请期限有何变化？ | 生效版本与时效性 |
+| 无答案 | 资料里是否说明无限期带薪休假？ | 无证据识别与不当召回 |
+
+Ragas 官方提供通过知识结构/关系生成单跳（Single-hop）与多跳（Multi-hop）、具体（Specific）与抽象（Abstract）等查询场景的方法；它们可以帮助生成测试覆盖，但不意味着所有真实业务场景都必须等比例使用这些分类。见 [4]。
+
+推荐分别维护：
+- **主代表集**：分布尽量接近真实查询，用于判断业务整体趋势。
+- **专项挑战集**：刻意增加低频但高风险的复杂、条件、版本、无答案问题，用于发现能力边界。
+- **固定回归集**：包含历史检索失败和已修复问题，避免优化一个环节时破坏另一个环节。
+
+三者可以相互有重合，但报告时注明来源、分组和统计口径；不能随意把挑战集占比变化解释为线上质量变化。
+
+### 【LLM 在数据集构建中的合理工作边界】
+
+LLM 适合做的工作是：从已核实文档中抽取待核实的原子事实、生成不同口语和专业表达、组合多证据场景、建议可能的引用片段、去除明显重复问题。完成后仍需校验：
+
+1. **是否可回答**：能否找到当前授权语料内的直接证据？无答案题是否确实没有充分证据？
+2. **是否真实**：生成答案、日期、编号和例外规则是否完全来自文档？不能把 LLM 常识当源文档事实。
+3. **是否漏标**：其他文档/父章节/同义片段是否也提供等价证据？
+4. **是否具有代表性**：是否仅是原文的机械问句变形？复杂问题是否真实会发生？
+5. **是否有标注分歧**：多个审核人结论不一致时，记录争议并仲裁，而非强制给定一个假确定标签。
+
+数据状态可以分为：
+
+~~~text
+candidate（候选，尚未审核）
+    ↓ 审核原文事实、版本、授权范围、证据完整性
+verified（已经验证，允许进入正式评测）
+    ↓ 固化语料和标签、完成发布检查
+released（固定版本的正式基准）
+~~~
+
+对低风险大样本可以使用自动检查与人工抽样核验，但**正式参考真值的可信度与人工投入之间的取舍，应在评测报告中如实说明**。不能把 LLM 自行生成且自行判分称作无偏的真实人工 Ground Truth。
+
+### 【如何在妙码 AI Flow 当前检索架构上落地】
+
+首先解释项目上下文。已核对的 [`VectorRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 负责把 Query 编码为向量、调用存储层 `search()` 并映射为带 `chunkId`/`documentId`/`content`/`score` 的结果；[`HybridRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 在 `vector/fulltext/hybrid` 模式间调度，双路结果经过加权 RRF 融合。[`QdrantVectorStore`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 支持按 `knowledgeBaseIds` 过滤和 `topK` 返回 Chunk 身份。
+
+**可以证明项目已有检索入口，不能直接推断项目已有标注 Qrels、持久化评测集、人工复核界面或线上 Retrieval Benchmark。**下述为建议的最小独立评测结构：
+
+~~~text
+固定语料快照（文档/Chunk/Embedding/索引和权限范围）
+                        ↓
+evaluation-dataset.json
+  ├─ Query、QueryType、来源（真实/专家/合成）
+  ├─ 正确证据 Qrels / 必要事实
+  ├─ 文档、Chunk 和数据集版本
+  └─ 标注状态与审核信息
+                        ↓
+Evaluation Runner（评测脚本）
+  → 以可信的知识库范围调用 Retriever.retrieve()
+  → 保存每个 Query 的有序结果 Run
+  → 与 Qrels 计算 Recall/MRR/nDCG
+  → 分组分析：类型、来源、难度、权限、版本
+  → 记录漏检案例供补标与检索优化
+~~~
+
+一个可供后续实现的测试用例类型草案：
+
+~~~typescript
+type EvaluationCase = {
+  queryId: string
+  query: string
+  queryType: "single-fact" | "multi-fact" | "exact-code" | "condition" | "unanswerable"
+  source: "production" | "expert" | "synthetic"
+  corpusVersion: string
+  annotationStatus: "candidate" | "verified"
+  knowledgeBaseIds: string[] // 应由可信测试权限映射，不允许越权
+  relevantChunkIds: string[] // 对应此 corpusVersion；需避免漏标
+  requiredFacts?: Array<{
+    factId: string
+    description: string
+    supportingChunkIds: string[]
+  }>
+}
+~~~
+
+在没有验证之前，这是**设计建议**而非项目已经上线的数据结构。实验时固定相同语料/权限/Embedding/检索深度，对比 `vector` 和真实启用全文 Provider 的 `hybrid` Run；不能因源码存在 Hybrid 模式，就假定运行时始终成功调用了两条检索通道。
+
+### 【评测数据集与检索系统的版本应如何关联】
+
+最低限度记录：
+
+| 对象 | 为什么需要固定 |
+|---|---|
+| `datasetVersion` 与标注规则 | 避免不同版本的 Qrels 被当成同一评分标准 |
+| `corpusVersion`、Document ID/版本 | 防止文档修改、删除后“旧答案”成为假真值 |
+| Chunking 参数、Chunk ID 与原文位置 | 切分方案改变时可定位和重标 |
+| Embedding 模型及版本 | 向量空间变化可能影响近邻排序 |
+| 检索模式、过滤权限、`topK`/`threshold` | 保证不同方案在可比条件下运行 |
+| 指标定义、评测工具版本 | 保证计算口径一致，可复算 |
+
+当底层 Chunking 改变时，应保留一份可对齐到源文档和事实的评测定义，必要时映射新 Chunk 并复审；不应强行沿用已经失效的 Chunk ID。测试集标签升级时，应说明历史指标是否需要按新版本重算。
+
+### 【实践边界与质量检查】
+
+- **标签完整性**：未被 Pool 覆盖的结果状态是未知，不能默认为“不相关”；对新检索器发现的合理结果追加审核。
+- **用户反馈偏差**：点击受名次、展示方式影响；点击率不是天然 Qrels。
+- **无答案问题**：对于无可用证据的 Query，不直接套用分母为 0 的普通 Recall；单独测“是否错误地自信返回”和后续拒答能力。
+- **权限与隐私**：生产查询需脱敏、限制评测数据访问，遵守来源数据授权；测试不能无权限检索敏感知识以提高 Recall。
+- **统计可靠性**：除整体平均，至少按 Query 类型和来源分组；对于微小差异，在样本不足、标签不全时不应轻率宣布新方案优越。
+- **避免只考自己擅长的题**：生成测试问题与被评估的模型/检索器高度同源时，需保留独立验证集和真实查询集，避免评测偏乐观。
+
+### 【面试标准回答】
+
+RAG 检索评测的 Ground Truth 是经过验证的 Query—Evidence 相关性标注，而不是模型自动生成的参考答案或初始检索器的 Top-K。数据集应结合真实用户查询、人工设计/审核和 LLM 合成数据：真实查询提供实际分布，人工审核保证事实与证据关系可信，LLM 用于扩充同义表达、复杂问题和边界场景。
+
+构建时先确定任务和知识库快照，收集并分类 Query，再通过人工查找、多路检索 Pooling 收集候选证据，审核相关性、必要事实、文档生效版本与权限，形成 Qrels。对多事实问题还应保留原子事实及可替代的支持证据，避免只靠 Chunk ID 命中判断答案完整性。
+
+评测集按语料/标注/检索配置版本管理，使用同一套已审核样本比较不同检索方案，分别统计真实查询与合成查询、普通与挑战用例。对于未标注但可能正确的结果要复核补标，而不能默认错误。这样构建的 Ground Truth 才能作为后续 Chunking、Embedding、Hybrid Search、Rerank 等技术改进的稳定对照基线。
+
+### 【权威资料与源码】
+
+1. [Qdrant：Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/)：真实用户日志、人工标注、LLM 合成及评测数据质量风险。
+2. [NIST TREC：Relevance Judgments](https://trec.nist.gov/data/reljudge_eng.html)：Pooling、语料与 Qrels 匹配。
+3. [NIST：A Comparison of Pooled and Sampled Relevance Judgments](https://www.nist.gov/publications/comparison-pooled-and-sampled-relevance-judgments)：Pool 不完整导致的评测偏差。
+4. [Ragas：Testset Generation for RAG](https://docs.ragas.io/en/latest/getstarted/rag_testset_generation/)；[RAG Test Data Generation](https://github.com/vibrantlabsai/ragas/blob/main/docs/concepts/test_data_generation/rag.md)：从知识结构生成 Single-Hop/Multi-Hop、具体/抽象测试场景。
+5. [妙码 AI Flow：VectorRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts)、[HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)、[QdrantVectorStore](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)。
+
+---
+
+## 【下一题讨论方向：如何定位 RAG 检索质量的真正瓶颈，并选择优化方向】
+
+以 Ground Truth、阶段性有序 Run 与固定检索基线为依据，分析“数据未入库/切分丢事实、Embedding 语义不匹配、ANN 近似遗漏、候选召回不足、融合与重排排序差、最终 Context 丢失证据”等不同症状。强调**先判断质量在哪一层损失，再选择参数或机制做对照实验**；下一题先在对话中讨论，不提前把本方向的具体方案当成既有实现。
