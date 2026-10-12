@@ -15,6 +15,8 @@
 
 ## 【一、RAG 检索的目标与评价基础】
 
+**通用知识衔接：** [RAG 与知识库工程完整知识体系](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)中的第 7 节：检索 Ground Truth、质量指标与评测闭环解释可迁移的机制；本章保留妙码 AI Flow 的具体数据、源码、方案与验证边界。
+
 先明确“找到正确证据”到底意味着什么，再构建可审核的 Ground Truth，最后学习 Hit、Recall、Precision、MRR 与 nDCG 如何分别衡量候选覆盖和排序质量。
 
 ### 【1.1 检索能力、证据相关性与正确证据】
@@ -743,6 +745,8 @@ Hit@K 表示前 K 条是否至少命中一条正确证据；Recall@K 表示所�
 
 ## 【二、离线知识表示与检索索引】
 
+**通用知识衔接：** [RAG 与知识库工程完整知识体系](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)中的第 4—5 节：Dense/Sparse 表示、BM25 和索引机制解释可迁移的机制；本章保留妙码 AI Flow 的具体数据、源码、方案与验证边界。
+
 从 Dense 向量表示与词项检索的差异入手，理解 BM25 的倒排索引、词项权重、Qdrant Sparse Vector 以及离线与在线数据结构的配合。文档切分和基础 Embedding 的完整工程解释沿用相邻专题，不在本篇以摘要替代原有原理和源码。
 
 ### 【2.1 Dense 与 BM25 的匹配机制和互补性】
@@ -1145,6 +1149,8 @@ Qdrant 可以通过 BM25 Sparse Vector 索引实现这套能力，并允许同�
 ---
 
 ## 【三、在线检索、授权过滤与 Hybrid 候选召回】
+
+**通用知识衔接：** [RAG 与知识库工程完整知识体系](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)中的第 5 节：在线授权过滤与混合召回解释可迁移的机制；本章保留妙码 AI Flow 的具体数据、源码、方案与验证边界。
 
 在理解索引结构后，先明确当前用户允许检索哪些数据、Qdrant 如何执行带约束的近邻搜索，再进入项目真实全文检索链路和 Dense + Sparse 的工程改造。
 
@@ -1970,6 +1976,8 @@ HybridRetriever
 
 ## 【四、多路候选融合与语义重排序】
 
+**通用知识衔接：** [RAG 与知识库工程完整知识体系](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)中的第 5 节：RRF 与 Cross-Encoder Rerank解释可迁移的机制；本章保留妙码 AI Flow 的具体数据、源码、方案与验证边界。
+
 候选来自不同检索通道后，需要先解决分数不可直接比较的问题，再判断融合排序是否真正理解证据与问题的关系，循序展开 RRF、Bi-Encoder 和 Cross-Encoder Rerank。
 
 ### 【4.1 RRF 排名融合、加权计算与源码实现】
@@ -2597,6 +2605,8 @@ RRF 与 Rerank 的区别是：RRF 只使用多个检索通道提供的 Rank 做�
 
 ## 【五、Context Construction 与确定性证据组织】
 
+**通用知识衔接：** [RAG 与知识库工程完整知识体系](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)中的第 6 节：上下文预算、父章节恢复和来源构建解释可迁移的机制；本章保留妙码 AI Flow 的具体数据、源码、方案与验证边界。
+
 候选已经排好序，仍需决定哪些真实、有效、上下文充足的证据进入模型；先研究 Token Budget、事实覆盖与引用，再区分可以由程序可靠完成的结构处理和无法直接证明的语义充分性。
 
 ### 【5.1 最终 Context 的事实覆盖、预算与来源组织】
@@ -2914,6 +2924,8 @@ const missing = [...required].filter(x => !covered.has(x));
 ---
 
 ## 【六、证据完整性、冲突检测与智能补充检索】
+
+**通用知识衔接：** [RAG 与知识库工程完整知识体系](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)中的第 6 节：证据语义验证、补检 Workflow 与 Agent 边界解释可迁移的机制；本章保留妙码 AI Flow 的具体数据、源码、方案与验证边界。
 
 进一步研究“怎样判断”而不是只讨论“怎样拼接”：明确结构完整、缺少背景、事实冲突的判定依据，再区分纯规则、Evidence Verifier、有限补检 Workflow 与自主 Agent 的职责。
 
@@ -3269,6 +3281,8 @@ Agentic RAG 则更侧重：
 ---
 
 ## 【七、分阶段质量评测、失效归因与工程验收】
+
+**通用知识衔接：** [RAG 与知识库工程完整知识体系](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)中的第 7 节：分阶段诊断、证据 Trace 与回归实验解释可迁移的机制；本章保留妙码 AI Flow 的具体数据、源码、方案与验证边界。
 
 最后把检索、融合、重排和上下文组织的输出作为不同评测对象，使用 Ground Truth 检查证据在哪一层丢失，再通过源码级 Trace、对照实验和延迟成本数据验证优化。
 
