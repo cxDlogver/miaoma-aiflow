@@ -2397,6 +2397,320 @@ RRF 的局限是依赖候选召回、忽略原始 Score 间隔、不能判断文
 
 ---
 
-## 【下一题讨论方向：Cross-Encoder Rerank 与 Bi-Encoder Retrieval 的原理与边界】
+## 【第七题：Rerank 如何重新判断候选相关性，Cross-Encoder 与 Bi-Encoder 有什么区别】
 
-下一题沿本轮结构逐步讨论：Bi-Encoder 为什么能提前编码文档并建立 Dense Index；Cross-Encoder 为什么需要把 Query 和每个候选 Chunk 一起送入模型、重新判断相关性；精排效果、每 Query 推理量、候选覆盖上限以及是否在妙码 AI Flow 中引入独立 Rerank 能力。下一题先在对话中展开，讨论后再依据指令归档；不提前写入尚未讨论的标准答案。
+### 【提问与知识目标】
+
+前六题已经建立完整的前半段检索体系：Document/Chunking → Dense Vector/HNSW 与 BM25 词项索引 → Ground Truth 和 Recall/MRR/nDCG → 多路候选的 RRF 融合。现在进一步研究：**RRF 已将多路检索结果合成一个排名，为何还要使用 Rerank？如果要让模型直接判断 Query 与 Document 是否相关，为什么不从最开始就对整个知识库使用 Cross-Encoder？**
+
+本题从三个层次理解：
+
+1. **机制**：Bi-Encoder 独立编码并搜索向量近邻；Cross-Encoder 联合阅读 Query 和候选正文，对每个文本对重新评分。
+2. **运行**：初始 Retrieval 负责在大规模语料中寻找有限候选，Fusion 合并候选，Rerank 在候选集合内精排；随后 Context Construction 负责组织最终证据。
+3. **工程支撑**：结合妙码 AI Flow 的已有检索器，讨论可选 Rerank 接口、分数来源保留、性能与相关性评测，明确项目现有能力与建议改造的边界。
+
+### 【为什么已经有 RRF，仍然可能需要 Rerank】
+
+RRF 只消费各路检索器输出的**Chunk ID 与排名位置**，通过倒数排名贡献得出最终排序；不需要重新读取 Query 与 Chunk 内容。因此，如果一个错误文档在 Dense 与 BM25 中都排名靠前，它可能获得很高的融合分数，但这不代表它实际能支持用户问题的正确答案。
+
+例子：
+
+~~~text
+用户 Query：
+E-1042 故障应该如何处理？
+
+D1：
+E-1042 为数据库连接池耗尽，需排查连接泄漏并调整连接池参数。
+
+D2：
+E-1043 为数据库网络连接超时，应检查网络连通性。
+~~~
+
+D1、D2 主题接近，但 E-1042 与 E-1043 在业务上是不同故障编号。假设之前加权 RRF 的结果：
+
+~~~text
+RRF Top-5：
+1. D2 — E-1043 网络超时
+2. D1 — E-1042 连接池耗尽（Ground Truth 正确证据）
+3. D4 — 通用故障排查流程
+4. D3 — 其他数据库连接异常
+5. D5 — 其他处理规范
+~~~
+
+RRF 不会拿查询中的“E-1042”与正文中的“E-1043”做模型级的联合推理。**Rerank 的目的**是让候选再次接受与**当前 Query**相关的细粒度文本匹配和语义评分，把更能回答问题的候选提升到前面。
+
+Rerank 不特指 Cross-Encoder 模型：它是一个**重排序阶段/能力**。Cross-Encoder 是常见实现，也可以存在列表式 LLM 评判、轻量打分模型等方法。这里重点讨论最典型的 Cross-Encoder 方案。
+
+### 【Bi-Encoder：为什么适合第一阶段大规模召回】
+
+Bi-Encoder（双编码器）对 Query 和 Document **分别编码**得到独立向量，再根据向量距离进行检索：
+
+~~~text
+离线知识侧：
+Document C1 → Encoder → Dense Vector C1
+Document C2 → Encoder → Dense Vector C2
+Document C3 → Encoder → Dense Vector C3
+      ...
+               ↓
+        Qdrant Dense Vectors
+               ↓
+        HNSW / ANN Index
+
+在线 Query：
+Query → Query Encoder → Query Vector
+                              ↓
+                        Vector Search
+                              ↓
+                       Candidate Top-K
+~~~
+
+两路可共享模型参数，也可以使用一组面向 Query/Document 的兼容编码器，关键是它们被训练为能映射到**可比较的向量空间**。文档向量离线生成并存储，可在多个 Query 之间复用。
+
+假设知识库存在一百万个 Chunk。文档入库时生成和索引一百万条向量之后，用户每次提问只需编码当前 Query，再通过 ANN 或其他向量近邻搜索取一个相对较小的候选集。**用户每问一次不需要重新执行一百万个 Query-Document 联合模型推理**。
+
+因此 Bi-Encoder 重点优化的是**大规模候选发现的效率与初始覆盖**。但由于 Query 与候选在编码阶段并未联合处理，单一向量通常压缩了大量细节，对错误编号、复杂否定、长距离条件、数值差异或需要逐条对照的匹配，不能天然保证业务正确性。HNSW 只能加速相似向量的近邻搜索，不会修复向量表示本身遗漏的事实。
+
+### 【Cross-Encoder：Query 和 Document 一起输入模型意味着什么】
+
+Cross-Encoder（交叉编码器）将 Query 与**某一条候选正文**拼成一个文本对，共同输入 Transformer Encoder，输出该 Query–Document 配对的相关性 Score。
+
+假设：
+
+~~~text
+Input Pair A：
+Query：E-1042 故障应该如何处理？
+Document：E-1042 为数据库连接池耗尽，应排查连接泄漏……
+
+Cross-Encoder → Relevance Score = 2.8
+
+Input Pair B：
+Query：E-1042 故障应该如何处理？
+Document：E-1043 为数据库网络连接超时，应检查连通性……
+
+Cross-Encoder → Relevance Score = -1.2
+~~~
+
+这里的 `2.8/-1.2` 是**教学示例原始输出**，不能被当作该模型真实预测，更不是概率。不同 Reranker 可能输出未经 Sigmoid 的 Logit，也可能经 Sigmoid 或其他校准变换输出 0～1 分数；排序要遵循该模型的定义。
+
+典型 BERT 形态：
+
+~~~text
+[CLS] Query Tokens [SEP] Document Tokens [SEP]
+                         ↓
+                Token Embedding
+                         ↓
+             Transformer Encoder
+                         ↓
+       同一序列中的 Self-Attention
+     （Query/Document Token 可以交互）
+                         ↓
+             Relevance Scoring Head
+                         ↓
+                    Score(Query,D)
+~~~
+
+**术语准确性**：这里不是说传统 BERT Cross-Encoder 必须单独实现一个叫 `Cross-Attention` 的模块；它通常让 Query 与 Document Token 在**联合输入序列的 Self-Attention** 中交互。部分其他架构可能采用不同的注意力与评分机制，但不能将 Cross-Encoder 直接等同“跨注意力层”。
+
+相较于独立 Embedding，联合编码能让模型在本次计算中关注具体 Query 与候选的 Token 对应关系，例如编号是否相同、提问需要的是原因还是处理步骤、候选是否只讨论近似主题、是否存在明显限定词冲突。因此 Cross-Encoder **有机会**比原有 Dense Score/RRF Rank 进行更细粒度判断，但也不是对事实真伪、逻辑或引用正确性的绝对保证。
+
+### 【Bi-Encoder 与 Cross-Encoder 的关键区别】
+
+| 对比 | Bi-Encoder（典型 Dense Retrieval） | Cross-Encoder（典型 Rerank） |
+|---|---|---|
+| Query 和 Document 编码方式 | 分别编码，向量空间比较 | 联合输入 Query + Document 文本对 |
+| 文档侧结果能否离线复用 | 可以，提前生成向量与索引 | 不能为所有未来 Query 预先缓存通用配对得分 |
+| 标准输出 | Query/Document 各自的独立向量 | 针对一对 Query–Document 的相关性分数 |
+| HNSW 等向量索引能否直接使用 | 可以 | 典型 Cross-Encoder 不输出适于独立检索的文档嵌入 |
+| 大规模搜索 | 适合百万级语料候选召回 | 不宜与全量文档逐对推理 |
+| 候选顺序 | 由向量相似度/ANN 排名确定 | 由模型对已有候选的相关性评分重新确定 |
+| 主要工程代价 | 文档离线编码、索引及 Query 编码 | 每 Query 的多对文本推理、Token 长度和延迟 |
+| 在 RAG 中的常见位置 | Retrieval 第一阶段 | Retrieval/Fusion 之后的第二阶段精排 |
+
+**重要边界**：Cross-Encoder 不能替代**大规模**初始召回，是效率和索引表达的工程判断，并非数学上“完全不能搜索”。若文档集合只有几十条，直接对全部候选运行 Cross-Encoder 也可以；但当语料达百万级时，逐对推理通常不可接受。
+
+### 【为什么通常需要“两阶段检索”：代价和候选覆盖】
+
+给定一百万条 Chunk、一个新 Query：
+
+~~~text
+方案 A：Bi-Encoder Retrieval
+  文档向量：离线一次编码、建立索引
+  Query：在线编码一次
+  ANN：按距离查有限候选
+  → Candidate Top-20 / Top-100
+
+方案 B：Cross-Encoder 全库评分
+  (Query, Chunk1) → 模型推理
+  (Query, Chunk2) → 模型推理
+  ...
+  (Query, Chunk1000000) → 模型推理
+  → 排序全量结果
+~~~
+
+Cross-Encoder 即使使用 Batch/GPU 优化，计算仍随每次 Query 需要处理的候选文本对数量与文本长度增长；而 Bi-Encoder 将文档编码开销移到入库阶段，并用索引避免穷举每个文本对。
+
+典型两阶段架构：
+
+~~~text
+                      Query
+                       │
+            ┌──────────┴───────────┐
+            ▼                      ▼
+       Dense Retrieval        BM25 Retrieval
+            │                      │
+            └──────────┬───────────┘
+                       ▼
+                 RRF Fusion
+              合并候选 / 去重排序
+                       ▼
+                 Candidate Top-20
+                       ▼
+              Cross-Encoder Rerank
+        (Query,C1), ... , (Query,C20)
+                       ▼
+            Sort by Rerank Score
+                       ▼
+                  Final Top-5
+                       ▼
+              Context Construction
+                       ▼
+                  LLM Answer
+~~~
+
+**流程的变体**：只有 Dense 时也可直接 Dense → Rerank；只有 BM25 时可 BM25 → Rerank；Rerank 不必须位于 RRF 之后。是否需要这层依赖 Query 类型、初始排序质量及推理成本。
+
+### 【接着第六题的教学数据，Rerank 如何改变结果】
+
+假设 Query 仍为“E-1042 故障应该如何处理？”，RRF Top-5 为 D2、D1、D4、D3、D5。重新将 Query 与这五条 Chunk 分别配对评分，得到**假设**的模型输出：
+
+| 候选 | 原 RRF Rank | Cross-Encoder 的假设 Score | Rerank 后 |
+|---|---:|---:|---:|
+| D1：E-1042 连接池故障的处理步骤 | 2 | 3.8 | 1 |
+| D2：E-1043 数据库连接超时 | 1 | 1.5 | 2 |
+| D4：通用故障排查 | 3 | 0.7 | 3 |
+| D3：其他连接异常 | 4 | 0.2 | 4 |
+| D5：其他处理规范 | 5 | -0.8 | 5 |
+
+得到新序列：
+
+~~~text
+RRF：   D2 → D1 → D4 → D3 → D5
+Rerank：D1 → D2 → D4 → D3 → D5
+~~~
+
+这说明在给定假设打分下，Rerank 可以使正确的 D1 从第 2 上升到第 1。**但这不是所有 Cross-Encoder 的真实表现保证**，模型是否擅长编号匹配、中文规则与具体项目术语应通过正式 Ground Truth 测试。
+
+还必须区分两个场景：
+
+1. **D1 已在 Candidate Top-20，只是最终 Top-5 没有 D1**：适合尝试 Rerank，让模型在已有候选中挑选更准确的结果。
+2. **D1 完全缺席 Candidate Top-20**：无论 Cross-Encoder 对 D1 可能评多少分，这次执行都没有机会计算它，应该先改进初始 Retrieval 或扩大可靠候选覆盖。只增加 Rerank 无法恢复缺席结果。
+
+因此 **Initial Evidence Recall@N 决定第二阶段能够处理的证据范围**；Rerank 的目标是改善候选范围内的最终排名、Precision、MRR、nDCG，以及较小 Top-K 的正确证据覆盖。
+
+### 【妙码 AI Flow 项目：现有什么、缺什么】
+
+本轮核对的实际源码：
+
+- [`VectorRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts)：Query 经 Ollama Embedding → Qdrant Vector Search → 映射 Chunk 结果，承担 Dense 候选发现。
+- [`HybridRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)：`vector/fulltext/hybrid` 模式，候选深度 `ceil(topK × 1.5)`，Fulltext 候选与向量结果由加权 RRF 融合，返回最终 `topK`。
+- [`QdrantVectorStore`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)：存储和查询 Dense Point，也包含应用层文本匹配 `textSearch()`，目前并非原生 BM25。
+- [`RetrievalResult` 与 `RetrieverService` 类型](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/types.ts)：目前提供 `chunkId/documentId/content/score` 等字段；并没有定义每阶段多个来源分数的专门 Trace 类型。
+- [知识库搜索 API](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts) 和 [KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts) 都可获得 Retriever 返回的候选结果。
+
+**在上述实际检查过的检索模块和业务调用链中，尚未发现实现独立的 Cross-Encoder Rerank 接口、调用与配置**。仓库原有答辩手册也将“增加中文分词、BM25、Reranker”列为后续改进方向。不能把以下设计当作已经上线、跑过评测的项目现状。
+
+### 【推荐接入方案：可选 Rerank 阶段，避免过早重构检索底座】
+
+第一版建议在既有 `HybridRetriever.retrieve()` 之后增加**可选的 Rerank 能力**，而不是重写 Qdrant 索引或将 Cross-Encoder 插入 Dense 查询计算内部。
+
+~~~text
+Existing HybridRetriever.retrieve()
+              ↓
+     初始/融合候选 Candidate Top-N
+              ↓
+        [可选] Reranker.rerank()
+              ↓
+        输出 Rerank Score
+              ↓
+          Sort / Final Top-K
+              ↓
+       Context Construction
+~~~
+
+可以新增独立接口（**设计草案，不是已实现类型**）：
+
+~~~typescript
+type CandidateForRerank = {
+  chunkId: string;
+  documentId: string;
+  content: string;
+  originalRank: number;
+  retrievalScore?: number;
+  fusionScore?: number;
+};
+
+type RerankResult = CandidateForRerank & {
+  rerankScore: number;
+};
+
+interface Reranker {
+  rerank(
+    query: string,
+    candidates: CandidateForRerank[]
+  ): Promise<RerankResult[]>;
+}
+~~~
+
+比“输入候选就覆盖 `score`”更建议的工程约定：
+
+1. **保留候选身份、正文和原文信息**：`chunkId`/`documentId`/`knowledgeBaseId`、引用来源与必要 Metadata；Rerank 不得打破权限与版本过滤结果。
+2. **保留不同阶段分数**：`denseScore`、`fulltextScore`、`fusionScore`、`rerankScore` 及初始名次，用于归因、评测和重现排序；勿混称它们是同一种概率。
+3. **让 Rerank 可配置**：支持关闭、调节 Candidate Top-N 与 Final Top-K、选择模型/版本、设置超时和故障回退；回退规则不得扩大授权数据范围。
+4. **控制上下文长度**：模型的最大输入 Token 数若不足以容纳完整候选，应明确截断策略或分段方案，防止关键规则/否定词恰好在被截掉的后半段。
+5. **控制请求成本**：可 Batch 对多个 Query–Document 配对进行推理，限制并行度和 P95 延迟，在模型调用失败时按规定恢复到可信的 RRF 排序。
+6. **在同一权限/语料/Query 版本下测试**：新模型适用中文、技术编号和业务术语与否，由固定 Ground Truth 判断；不要只凭通用基准推断项目收益。
+
+模型部署选项可以是自建的 Cross-Encoder 推理服务，或提供 Rerank API 的托管模型；选择时需要验证实际的中文表现、输入长度、并发、成本和数据访问约束。**接口抽象可以先建立，是否真正增加服务由评测增益决定**。
+
+### 【质量与性能评测：证明 Rerank 提高了哪些指标】
+
+把候选发现与候选排序分开评价：
+
+| 实验方案 | 主要比较点 |
+|---|---|
+| Dense Only | 语义召回的基础质量 |
+| Dense + 词项检索 + RRF | 多路覆盖与融合后的基线（必须注明当前 Fulltext 仍非 BM25） |
+| 同一候选集 + Cross-Encoder Rerank | 控制输入 Candidate Top-N，判断模型是否改善排序 |
+| 调整 Candidate N 与 Rerank Final K | 初始覆盖、精排质量与延迟的平衡 |
+
+至少记录：
+
+- **Candidate Evidence Recall@N**：初始候选是否已经包含正确证据。这是 Rerank 改善的覆盖前提；
+- **Final Recall@K / MRR / nDCG@K**：Rerank 是否把正确证据提升到最终 K 的前排；本例 D1 从第二升第一，改变 MRR，但如果 K=5，初始和最终“是否包含 D1”可能并无差异；
+- **按 Query 类型分组**：故障编号/精确术语、同义表达、多事实、条件否定、长 Chunk 等；
+- **推理延迟和成本**：P50/P95、候选数、Token 输入量、批处理吞吐/失败率；
+- **模型输出稳定性及异常回退**：Rerank Score 不等于正确概率；要在生产部署前评估不同设备、模型版本或超时时的结果变化。
+
+**一个重要评价口径**：同一候选集合、完全没有额外取回任何新证据的纯重排，对于 `K≥N` 的集合级 Evidence Recall 无法提高，因为结果包含的文档集合没有变化；但对更小的最终 K，或者 MRR/nDCG 等排序指标，重排可以改善。不要笼统声称“Rerank 必然提高召回”。
+
+### 【面试标准回答】
+
+Rerank 是初始检索之后，在已有候选集合内重新计算与 Query 的相关性并调整排序的阶段。常见实现是 Cross-Encoder：将 Query 和候选文档组成文本对共同输入 Transformer，让两段文本在联合编码过程中进行 Token 交互，再输出相关性分数。
+
+Bi-Encoder 独立编码 Query/Document，文档向量可以离线存储，并通过 Qdrant/HNSW 等索引高效查询，因此适合第一阶段大规模召回；Cross-Encoder 对每个 Query–Document 文本对单独计算相关性，更适合有限候选的精细排序，不能像 Bi-Encoder 那样把独立文档向量预先索引用于通用向量近邻搜索。它通常相关性判断更细，但推理量随候选数及文本长度上升。
+
+RRF 与 Rerank 的区别是：RRF 只使用多个检索通道提供的 Rank 做数学融合；Cross-Encoder Rerank 则联合阅读 Query 和每条候选正文并计算新分数。两者都无法恢复初始候选中根本不存在的正确证据，因此工程上应先验证 Candidate Recall，再通过固定 Ground Truth 判断 Rerank 是否改善最终 Top-K 的 MRR、nDCG、证据覆盖及成本。对于妙码 AI Flow，可在现有 HybridRetriever 后设计可选 Reranker，同时记录不同阶段的 Score 和候选身份，避免误把尚未实现的重排模块说成项目已有能力。
+
+### 【权威资料与源码】
+
+1. [Sentence Transformers：Retrieve & Re-Rank](https://sbert.net/examples/sentence_transformer/applications/retrieve_rerank/README.html)：先以 BM25/Bi-Encoder 获得候选，再由 Cross-Encoder 精排的两阶段结构。
+2. [Sentence Transformers：Cross-Encoders](https://www.sbert.net/examples/cross_encoder/applications/README.html)：Bi-Encoder 与 Cross-Encoder 的输入、输出、预计算与代价区别。
+3. [Sentence Transformers：Reranker Training](https://www.sbert.net/examples/cross_encoder/training/rerankers/README.html)：相关性分数可为 Logit 或经过变换的区间分数，并非统一概率。
+4. [Sentence Transformers：Semantic Search](https://www.sbert.net/examples/sentence_transformer/applications/semantic-search/README.html)：双编码器与文档离线向量索引。
+5. 项目源码：[VectorRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts)、[HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)、[类型定义](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/types.ts)、[知识库搜索 API](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts)、[KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts)。
+
+---
+
+## 【下一题讨论方向：Context Construction 如何组织最终送入 LLM 的证据】
+
+本题到此只记录下轮研究方向，不提前预写答案：在已获得 Dense/BM25 候选、RRF 融合与可选 Rerank 排序的前提下，**为什么 Rerank Top-K 不应直接视为最终 Context？**下一轮讨论 Token Budget、原子事实覆盖、引用来源与版本、冗余 Chunk 去重、父章节补全、截断策略以及如何验证“最终 Prompt 实际包含了回答所需证据”。这一题将与第二题追问中已经建立的 Context Evaluation 联系起来。
