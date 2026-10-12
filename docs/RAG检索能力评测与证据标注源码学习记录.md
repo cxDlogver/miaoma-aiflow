@@ -1600,6 +1600,500 @@ Qdrant 可以通过 BM25 Sparse Vector 索引实现这套能力，并允许同�
 
 ---
 
+## 【第五题追问二：妙码 AI Flow 当前文本检索的实现、与 BM25 的区别以及改造方案】
+
+### 【问题背景与结论】
+
+上一题已经理解：BM25 借助词项、TF/DF/IDF、文档长度与倒排索引快速找到相关 Chunk；Dense Search 则依据 Embedding 向量进行语义近邻检索。现在回到项目源码回答三个实际工程问题：**当前所谓“全文/关键词检索”到底如何执行？它和真正的 BM25 差在哪里？如果用现有 Qdrant 引入 BM25，应该调整哪些代码与数据结构？**
+
+**结论先行**：
+
+1. 妙码 AI Flow **有 Dense 向量检索和两个 Payload Keyword 过滤索引，但没有为正文构建真正的全文倒排索引，也没有实现标准 BM25**。
+2. 当前全文分支的实现是：`Qdrant scroll` 读取满足 `knowledgeBaseId` 过滤的一批 Point，Node.js 在返回的 `content` 中执行字符串子串匹配与自定义评分，再从这批结果排序得到 Top-K。该批次仅调用一次、上限为 1000 个 Point，**不保证覆盖同一知识库所有 Chunk**。
+3. 项目已经有 `HybridRetriever` 与加权 RRF 的编排能力。改造重点应放在**离线增加 BM25 Sparse 表示、持久化 Sparse Index、在线把旧 `textSearch()` 替换为真正的 BM25 检索**；第一阶段可以复用原应用层 RRF。
+4. 当前 Docker Compose 部署的是自建 Qdrant（`qdrant/qdrant:latest`），**不能直接照搬 Qdrant Cloud/Cluster 服务端 `qdrant/bm25` 推理代码并当成当前环境必然可运行**。自建部署优先确认客户端/独立服务生成 Sparse Vector 的可行性，或经实际测试证明服务器推理能力存在后再启用相应 API。Qdrant 的官方推理选择指南明确区分这两种部署方案。
+
+为帮助理解，下文先重建源码调用链，再对照 BM25 的处理链，最后按模块给出可实施但**尚未写入项目代码、尚未运行验证**的方案。
+
+### 【业务上下文：两个入口共用同一个检索器，但分别组装 Provider】
+
+**入口一：用户在知识库管理页面发起搜索。**
+
+源码：[`apps/workflow/app/api/knowledge/[id]/search/route.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts)。
+
+该 API 首先识别用户并核对知识库归属，再解析 `query/topK/threshold/mode`，初始化 Ollama Embedding Service、QdrantVectorStore 和 FulltextSearchProvider。Provider 不直接查询独立文本索引，而是调用 `(vectorStore as any).textSearch()`。最后由 `createHybridRetriever(...)` 创建检索器，执行 `retriever.retrieve()`，把有序 Chunk 和执行时长返回页面。
+
+**入口二：工作流中的“知识库”节点。**
+
+源码：[`packages/ai-engine/src/nodes/executors/knowledge-executor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts)。
+
+该执行器解析 `knowledgeBaseIds`、Query、模式和 Top-K，创建自己的全文检索 Provider，同样调用 `vectorStore.textSearch()`，随后由 `HybridRetriever` 返回结果，并将它们整理成工作流输出 `output/results/count/query/mode`。
+
+因此两处都需要调整 Provider，**只修改 API 会造成页面与工作流结果不一致**。知识库执行器自身虽然接受知识库 ID 数组，但不能仅据此证明该执行入口已经做了与 API 相同的最终用户权限校验；改造不得弱化或越过调用链上的授权边界。
+
+### 【离线入库：存储了正文，并不等于对正文建立关键词检索索引】
+
+源码：[`apps/workflow/lib/services/document-processor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts) 与 [`QdrantVectorStore`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)。
+
+实际执行：
+
+~~~text
+上传/解析后的 Document Content
+       ↓
+按 Markdown/普通文本选择 Text Splitter
+       ↓
+chunks = splitter.split(content)
+       ↓
+Ollama Embedding：embedTexts(chunkTexts)
+       ↓
+生成 ChunkWithVector：{id, content, documentId, knowledgeBaseId, vector, ...}
+       ↓
+ensureCollection(dimensions)
+       ↓
+upsertVectors(vectorChunks)
+       ↓
+Qdrant Point：
+  - 未命名 Dense Vector（Cosine）
+  - Payload：chunkId、documentId、knowledgeBaseId、content、chunkIndex、...
+~~~
+
+`ensureCollection()` 为已经存在的 Collection 直接返回；创建新 Collection 时配置：
+
+~~~typescript
+vectors: {
+  size: dimensions,
+  distance: 'Cosine',
+}
+~~~
+
+并分别执行：
+
+~~~typescript
+createPayloadIndex(collectionName, {
+  field_name: 'knowledgeBaseId',
+  field_schema: 'keyword',
+});
+createPayloadIndex(collectionName, {
+  field_name: 'documentId',
+  field_schema: 'keyword',
+});
+~~~
+
+这里 `keyword` 的含义是**字段值的精确过滤索引**：
+
+~~~text
+knowledgeBaseId = kb-001 → 找到归属 kb-001 的 Point
+documentId = doc-008    → 找到归属 doc-008 的 Point
+~~~
+
+它不是对 `payload.content` 建立的中文分词倒排表，也不用于按 BM25 对正文排序。
+
+**概念边界**：
+
+- `keyword Payload Index`：结构化字段过滤。
+- `full-text Payload Index`：按词项进行文本条件过滤；单纯过滤不等于 BM25 排序。
+- `BM25 Sparse Vector Index`：索引稀疏词项维度并使用 BM25 权重计算检索相关性。
+
+Qdrant 目前支持这几种不同能力，但**项目仅使用了第一种和 Dense 向量索引**。
+
+### 【在线全文检索：scroll 后在 Node.js 逐个扫描】
+
+源码：[`QdrantVectorStore.textSearch()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)。
+
+**第一步：按知识库 ID 过滤并读取一批 Chunk**：
+
+~~~typescript
+const response = await this.client.scroll(this.collectionName, {
+  filter: {
+    must: [{
+      key: 'knowledgeBaseId',
+      match: { any: knowledgeBaseIds },
+    }],
+  },
+  limit: 1000,
+  with_payload: true,
+  with_vector: false,
+});
+~~~
+
+上游 `knowledgeBaseIds` 是 Retriever 调用输入，应由可信的业务权限检查和范围决策得到；Qdrant 在此按字段索引过滤。`with_payload: true` 表示返回正文等 Metadata；`with_vector: false` 不要求返回稠密向量。
+
+**本步不使用查询正文匹配的倒排索引**，仅根据 `knowledgeBaseId` 返回一批 Point。`scroll(limit:1000)` 没有使用 `next_page_offset` 再取下一页，因此不能假设本次搜索已经扫描某知识库的全部 Chunk。即使正确文档已经存在，只要不在这批结果里，后面就无从命中。
+
+**第二步：对 Query 进行字符串拆分**：
+
+~~~typescript
+const queryLower = query.toLowerCase();
+const queryTerms = queryLower
+  .split(/[\s,，。.!！?？;；:：、]+/)
+  .filter(term => term.length > 0);
+~~~
+
+这只是**按空格和标点拆开文本**，不是通常意义上的中文词法分析。教学反例：
+
+~~~text
+用户输入：数据库连接池为什么耗尽？
+
+当前逻辑可能只得到：
+["数据库连接池为什么耗尽"]
+
+而不会天然得到：
+["数据库", "连接池", "耗尽"]
+~~~
+
+由于通常以子串而非真正 Token 匹配，中文常见连续句子难以有效利用多个有区分度的查询词项。
+
+**第三步：对每个候选正文执行包含判断和频次评分**：
+
+~~~typescript
+if (contentLower.includes(queryLower)) {
+  matchScore += 2;
+}
+
+for (const term of queryTerms) {
+  if (contentLower.includes(term)) {
+    matchedTerms++;
+
+    const regex = new RegExp(term, 'gi');
+    const matches = content.match(regex);
+    matchScore += matches ? matches.length * 0.5 : 0;
+  }
+}
+~~~
+
+若至少存在一个匹配，还会加上：
+
+~~~typescript
+matchScore +=
+  (matchedTerms / Math.max(queryTerms.length, 1)) * 1.5;
+~~~
+
+**评分的实际含义**：完整 Query 子串命中加 2、分隔得到的 term 每次正则命中乘 0.5、命中词项占比再奖励。没有 IDF、标准 BM25 的词频饱和与文档长度归一化，也没有通过倒排列表先定位匹配文档。
+
+**第四步：排序、截断和归一化**：
+
+~~~typescript
+matchedResults.sort((a, b) => b.matchScore - a.matchScore);
+const maxScore = matchedResults[0]?.matchScore || 1;
+
+return matchedResults.slice(0, topK).map(({ result, matchScore }) => ({
+  ...result,
+  score: matchScore / maxScore,
+}));
+~~~
+
+因此得分是**这一批候选内部相对最高分的归一化结果**，并非跨 Query 具有统一解释的相关性或 BM25 分数。变化这批 Point 就可能变化归一化结果，不能把 `score=0.9` 当作“有 90% 概率是正确证据”。
+
+**边界与缺陷**：直接 `new RegExp(term, 'gi')` 未对用户提供的词项做正则转义；输入若包含 `.`、`[`、`(` 等正则元字符，可能改变匹配语义或触发正则解析异常。这是独立于是否引入 BM25 的当前实现风险。
+
+### 【与标准 BM25 的主要差异：索引结构和运行成本比公式更关键】
+
+| 对比项 | 当前 `textSearch()` | 传统 BM25 或 Qdrant BM25 Sparse |
+|---|---|---|
+| 离线词项处理 | 仅 Chunking 与 Dense Embedding | 对 Chunk 产生与 Query 兼容的词项/稀疏表示 |
+| 词项索引 | 无正文倒排索引 | 词项或稀疏维度 → 包含它的 Chunk/Point |
+| 候选发现 | 查询时先 `scroll` 一批 Payload | 通过倒排式索引找到含查询词项的候选 |
+| TF | 自定义子串出现次数加分 | BM25 的词频饱和贡献 |
+| DF/IDF | 未使用 | 通过语料文档频率区分常见词和稀有词 |
+| 文档长度 | 未归一化 | BM25 按文档长度与平均长度调整 |
+| 词项分析 | 正则按空格/标点拆分 | Tokenizer、词项规范化、中文/编号专门配置 |
+| 持久化索引 | Qdrant 只持久化 Dense 与过滤索引 | Qdrant 同时维护 Sparse Vector 与相应索引 |
+| 语料规模影响 | 一次获取最多 1000 个 Point 后 JS 扫描 | 利用检索索引定位词项对应的 Point |
+| Score 含义 | 自定义匹配分与本批归一化 | 与特定 Query 相关的 BM25/稀疏检索分数 |
+
+最关键的区别是：
+
+~~~text
+当前：
+  Query → 按 knowledgeBaseId 取一批 Chunk → 逐条检查字符串 → 自定义分数 Top-K
+
+BM25：
+  文档离线产生词项和倒排式索引
+  Query → 词项映射 → Posting 候选 → BM25 相关性评分 → Top-K
+~~~
+
+**不能只给当前 JS 循环加上一段 BM25 评分公式就认为完成了改造**。如果依然从有限的前 1000 个 Point 里计算分数，未进入此批次的正确证据依旧永远找不到。真正解决候选发现与规模化检索问题，需要替换数据组织和索引查询方式。
+
+### 【现有 HybridRetriever 如何把文本候选与 Dense 结果融合】
+
+源码：[`packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)。
+
+`retrieve()` 接收 `mode: vector | fulltext | hybrid`，分别选择：
+
+- `vector`：Query 经 Ollama Embedding → Qdrant Vector Search → 带 Score 的有序 Chunk；
+- `fulltext`：调用传入的 `FulltextSearchProvider.search()` → 当前应用层 `textSearch()`；
+- `hybrid`：将 `topK` 扩大为 `ceil(topK × 1.5)`，并行执行前两路，再用 `reciprocalRankFusion()` 进行融合，截取最终 Top-K。
+
+当前加权 RRF 使用 `k=60` 和默认向量权重 `vectorWeight=0.7`：
+
+~~~text
+RRF(d)
+  = vectorWeight / (60 + denseRank(d))
+  + (1 - vectorWeight) / (60 + textRank(d))
+
+缺失于某一路的候选，该路贡献为 0。
+~~~
+
+源码按 `chunkId` 合并重复候选，把原始 Score 替换为融合 Score；如果全文检索结果为空，则直接退化成向量结果。
+
+**因此当前可复用的能力是“检索模式控制 + 两路异步调用 + 候选去重融合”**；升级 BM25 的第一阶段无需强制重写 RRF，但要保证真实 BM25 通道返回的 Chunk ID、文档信息与现有类型兼容。RRF 的公式、权重与逐条计算在下一题单独展开。
+
+### 【建议改造目标：让同一 Chunk 拥有 Dense 与 BM25 两种表示】
+
+本项目已有 Qdrant、Ollama Embedding 与 RRF，可以优先引入 Qdrant 的 BM25 Sparse Vector，暂不增加 Elasticsearch 这一独立基础设施。建议目标：
+
+~~~text
+离线入库：
+Document → Chunking
+                ├─ Ollama Dense Embedding ─────→ dense 表示
+                └─ BM25 Tokenizer/Sparse 生成 ─→ bm25 表示
+                                                 ↓
+                                    Qdrant 持久化 Point + 双索引
+                                      Payload：chunkId/documentId/
+                                               knowledgeBaseId/content
+
+在线查询：
+Query ──→ Dense Query Embedding ──→ Dense Search ─┐
+      └─→ BM25 Sparse Query ──────→ BM25 Search ──┤
+                                                   ▼
+                                         现有 HybridRetriever
+                                            RRF → Final Top-K
+                                                   ↓
+                                             工作流 / LLM
+~~~
+
+注意：**同一 Point 可以存多种向量，但必须把新字段值实际写入每个 Point**；仅为 Collection 增加 `sparse_vectors` Schema 不会自动从现有 Payload 正文构建 BM25 Sparse 值。Qdrant 官方对现有 Collection 的命名向量扩展也明确了这一点。
+
+### 【改造步骤一：Qdrant Collection 的向量 Schema】
+
+建议对于首次验证创建一个新 Collection（例如 `knowledge_chunks_v2`），可与旧 Collection 并存以保证回滚。**以下为目标配置示例，不是当前已执行代码**：
+
+~~~typescript
+await client.createCollection("knowledge_chunks_v2", {
+  vectors: {
+    dense: { size: dimensions, distance: "Cosine" },
+  },
+  sparse_vectors: {
+    bm25: { modifier: "idf" },
+  },
+});
+~~~
+
+这里 `dense` 和 `bm25` 是命名向量：Dense 使用业务 Ollama 模型的维度，Sparse 使用倒排式索引并通过 `modifier:"idf"` 引入词项文档频率信号。同一个 Point 保留现有 `chunkId/documentId/knowledgeBaseId/content` Payload，也应在新 Collection 为 `knowledgeBaseId`、`documentId` 建立必要的 Keyword 过滤索引。
+
+**重要兼容点**：项目旧 Collection 使用的是**未命名** Dense Vector（配置为 `vectors: {size, distance}`），而不是 `dense`。切换到新 Collection 的 `dense` 字段后，所有旧的向量搜索调用必须显式使用该向量名，不能仅换一个 Collection 名称而仍使用旧 API 的未命名搜索约定。
+
+另一个可选方案：若实际自建 Qdrant Server >=1.18，官方提供 `createVectorName(...)` 或 REST `PUT /collections/{collection}/vectors/{name}` 为**现有 Collection** 添加 Sparse 命名向量 Schema，再为已有 Point 补录 Sparse 值；原未命名 Dense 仍需按实际兼容情况测试。参见 [Qdrant Collections — Update Vector Schema](https://qdrant.tech/documentation/manage-data/collections/)。
+
+两种方案的工程取舍：
+
+| 方案 | 优点 | 需要重点防范 |
+|---|---|---|
+| 原 Collection 增加 Sparse 字段并补录（适用版本需确认） | 复用已有 Point 和 Dense 表示，降低搬迁量 | 与在线写入竞争、补录中数据不完整、版本/API 兼容 |
+| 新 `knowledge_chunks_v2` 并行迁移（更适合首次验证） | 双版本对照和回滚明确，可独立验收 | 双倍暂存成本、增量数据同步与切换一致性 |
+
+### 【改造步骤二：离线 Chunk 生成 BM25 Sparse 表示】
+
+现有 [`processDocument()`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts) 只运行：
+
+~~~text
+splitter.split(content)
+  → embeddingService.embedTexts(chunkTexts)
+  → ChunkWithVector[]
+  → vectorStore.upsertVectors()
+~~~
+
+应使 Chunk 经过两条独立表示链：
+
+~~~text
+chunk.content
+   ├─ embedText / embedTexts（原 Ollama 模型）→ dense: number[]
+   └─ BM25 Tokenizer + 参数策略              → sparse: {indices, values}
+                                                        ↓
+                                             Qdrant 同一 Point
+~~~
+
+**部署与能力边界必须特别说明**：
+
+- 项目 Docker Compose 使用 `qdrant/qdrant:latest`，表示自建 Qdrant 容器，当前运行版本需从实际容器或服务端版本接口确认。仓库使用的 `@qdrant/js-client-rest` 声明为 `^1.16.2`，既有联调手册记录过一次本地 Server 为 1.19.0，**不能把历史测试记录当作当前正在运行的服务版本**。
+- Qdrant 官方 [Inference](https://qdrant.tech/documentation/inference/) 将“自建 Qdrant”列为优先使用 **Client-side Inference（如 Python FastEmbed）** 的情形，而直接以 `{text, model:"qdrant/bm25"}` 请求服务端推理的说明面向相应支持该能力的 Qdrant Cluster/Cloud 方案。不能仅因为数据库**能存储 Sparse Vector**就假定当前 Docker Server 必然会处理原始文本的 `qdrant/bm25` 推理请求。
+- 对现有 TypeScript 工作流，实际选择可以是：独立 Python FastEmbed 处理进程/服务生成 `indices/values`；或引入并验证兼容的 TypeScript/Node 稀疏 BM25 编码实现。两者都必须固定分词器版本、中文词项处理、ID 映射和 BM25 参数，确保离线与在线完全兼容。
+- 如果将来验证部署环境确实支持 Qdrant 服务端 BM25 推理，则可直接提交原始文本与模型名；此时应核对 `model`、`tokenizer` 选项与 JS SDK/Server 版本，并用真实自建实例联调后再写成可运行代码，而非把云文档示例当成本地现状。
+
+**客户端生成 BM25 Sparse 的目标数据结构**：
+
+~~~typescript
+type SparseVector = {
+  indices: number[]  // 词项映射得到的非零维度
+  values: number[]   // BM25 文档侧的权重
+};
+
+type ChunkWithHybridVectors = {
+  id: string;
+  content: string;
+  documentId: string;
+  knowledgeBaseId: string;
+  dense: number[];
+  bm25: SparseVector;
+};
+~~~
+
+使用客户端生成方案时，向 Qdrant 写入 Point 的结构可表示为：
+
+~~~typescript
+// 目标结构示意；encoder 是拟新增的 BM25 编码组件，非现有实现。
+const point = {
+  id: pointId,
+  vector: {
+    dense: denseEmbedding,
+    bm25: await bm25Encoder.encodeDocument(chunk.content),
+  },
+  payload: {
+    chunkId: chunk.id,
+    documentId: chunk.documentId,
+    knowledgeBaseId: chunk.knowledgeBaseId,
+    content: chunk.content,
+    chunkIndex: chunk.index,
+  },
+};
+~~~
+
+**不是必须同时为同一 Chunk 再建一张 SQL 关键词表**。Qdrant 会管理稀疏向量、维度对应的索引和与其配置兼容的 IDF 修正；Embedding 和 BM25 编码负责提供可检索的表示，而不是自己实现物理倒排表。
+
+### 【改造步骤三：在线使用 BM25 Sparse Index，而不是 scroll 正文】
+
+旧链路：
+
+~~~text
+textSearch()
+  → scroll(limit:1000, with_payload:true)
+  → JS includes() / RegExp 匹配
+  → 自定义 Score 排序
+~~~
+
+目标新链路：
+
+~~~text
+bm25Search()
+  → Query 使用与入库相同的 BM25 Tokenizer/编码器
+  → 根据 sparse indices/values 查询 Qdrant 的 bm25 命名向量
+  → 按合法 knowledgeBaseIds 过滤
+  → 返回 BM25 排序后的 Top-K Chunk
+~~~
+
+**自建环境的推荐实现草案**，展示 API 职责；假定编码器已按相同词项映射和权重规则实现并通过测试：
+
+~~~typescript
+// 提案伪代码：encoder、collection、client 版本都需真实项目联调。
+async function bm25Search(
+  query: string,
+  knowledgeBaseIds: string[],
+  topK: number,
+) {
+  const sparseQuery = await bm25Encoder.encodeQuery(query);
+
+  const result = await client.query("knowledge_chunks_v2", {
+    using: "bm25",
+    query: sparseQuery, // {indices, values}；需与当前 JS SDK 类型兼容
+    filter: {
+      must: [{
+        key: "knowledgeBaseId",
+        match: {any: knowledgeBaseIds},
+      }],
+    },
+    limit: topK,
+    with_payload: true,
+  });
+
+  // 将 result.points 映射回 RetrievalResult[]；
+  // 注意源 metadata / chunkId / documentId / score 的统一处理。
+  return result.points;
+}
+~~~
+
+在**经验证确实支持原生 BM25 文本推理**的部署环境下，也可以把 `query` 改成 `{text: query, model:"qdrant/bm25", options:{tokenizer:"multilingual"}}`，并设置 `using:"bm25"`。这是**另一条有部署前提的实现路径**，不是当前自建实例可直接保证运行的代码。
+
+可参考 [Qdrant Full-Text Search](https://qdrant.tech/documentation/search/text-search/full-text-search/) 与 [Qdrant Sparse Vectors](https://qdrant.tech/documentation/manage-data/vectors/)。
+
+原有 `knowledgeBaseIds` 范围过滤必须保留；若同一 Collection 存储多租户知识，BM25 的 IDF 统计范围与 Query 结果过滤范围并不天然相同。使用 Qdrant 支持的 per-tenant IDF 统计或隔离策略前，需要核对版本和统计语义，不能把授权过滤误当作自动的租户隔离 IDF。参考 [Qdrant Multitenancy](https://qdrant.tech/documentation/tutorials/multiple-partitions/)。
+
+### 【改造步骤四：复用 HybridRetriever，统一两个业务入口】
+
+**优先采用最小改动**：保留 `HybridRetriever.retrieve()`、`vector/fulltext/hybrid` 三模式及 `reciprocalRankFusion()`，只替换 `FulltextSearchProvider.search()` 的底层实现。
+
+~~~text
+改造前：
+HybridRetriever
+  ├─ vectorSearch()   → Dense Qdrant Search
+  └─ fulltextSearch() → scroll + Node.js 子串匹配
+                             ↓
+                           RRF
+
+改造后：
+HybridRetriever
+  ├─ vectorSearch()   → Dense Qdrant Search
+  └─ fulltextSearch() → BM25 Sparse Qdrant Search
+                             ↓
+                           RRF
+~~~
+
+必须处理的接口及代码位置：
+
+| 文件 | 预期修改 |
+|---|---|
+| `packages/ai-engine/src/knowledge/types.ts` | 定义 `SparseVector`、`bm25Search` 或 `LexicalSearchProvider` 契约，避免 `as any` |
+| `packages/ai-engine/src/knowledge/store/qdrant-store.ts` | Collection 多向量配置；Hybrid Point 写入；BM25 查询及查询结果映射 |
+| `apps/workflow/lib/services/document-processor.ts` | 文档入库时生成或获取 BM25 Sparse 表示，重新入库和删除时维护一致性 |
+| `apps/workflow/app/api/knowledge/[id]/search/route.ts` | 把页面 `fulltextProvider` 改为真实 BM25 检索 |
+| `packages/ai-engine/src/nodes/executors/knowledge-executor.ts` | 同步修改工作流知识节点的 Provider，维持授权边界与可观测性 |
+| `packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts` | 第一阶段保留 RRF；根据真实两路召回测试再确定是否修改候选深度/权重 |
+| 测试/迁移脚本与部署配置 | 固定 Qdrant/Client 与编码器版本，补录旧 Point 并做完整回归测试 |
+
+**关于阈值和 Score**：原 `threshold` 用于 Dense 相似度检索，不能自动沿用为 BM25 的得分阈值，因为两种 Score 不同尺度。现有应用层加权 RRF 以排名为输入而非直接相加两路 Score，因此第一阶段可以复用，但替换了文本检索算法后，融合顺序仍需要由 Ground Truth 实验验证。
+
+### 【历史数据迁移与回滚】
+
+不能只改 `ensureCollection()` 配置然后宣布历史数据都已具备 BM25。旧 Point 存的是 Dense 与 Payload；必须为每个历史 Chunk 提供 BM25 表示。
+
+**方案 A：原 Collection 扩字段**。实际 Server 若支持 Qdrant v1.18+ 的动态向量 Schema，可添加 `bm25` 命名 Sparse Vector 并补写旧 Point 的值；需要测试现有未命名 Dense 表示与新 Sparse 命名字段的兼容性，并在补录期间控制检索结果不一致风险。适合变更窗口、版本与数据量均可控的情况。
+
+**方案 B：新 Collection 蓝绿迁移（建议首次实验使用）**。创建 `knowledge_chunks_v2`，迁移既有 Chunk ID、Payload、Dense Vector，为每个 Point 增加 BM25 Sparse，建立过滤索引；独立验证数量、Chunk 完整性、查询结果与权限；同时处理迁移期间新写入/更新/删除的同步问题，通过受控切换把 API 和工作流两入口统一指向新集合，保留回滚路径。
+
+如使用 `upsert()` 全量更新原有 Point，必须验证新的 Vector/Payload 组合不会意外覆盖或丢失旧字段；仅补写向量可优先查验对应的 `updateVectors` 等增量 API 并选择适配当前 Server 的操作。**不要默认“新增 Sparse 字段”能够自动从既有 Payload 反向生成向量值。**
+
+### 【验证方案：证明升级比当前实现更好】
+
+不要把“BM25 API 能返回结果”当完整验收。建议沿这条链路验证：
+
+1. **环境兼容**：确认运行中的 Qdrant Server 版本与 `@qdrant/js-client-rest` 的实际解析版本；固定 Docker 镜像，不再依赖 `latest`；验证部署中的 BM25 Sparse 生成方式。
+2. **数据覆盖**：确保现有全部 Chunk 已持有 Sparse，检验超出旧 `scroll(limit:1000)` 范围的正确文档仍能被 BM25 召回；计数与正文、文档身份映射一致。
+3. **语言与标识符**：中文无空格查询、技术缩写、故障编号、精确 SKU、否定/条件词；测试词项分析器是否导致编号被错误拆分。
+4. **权限与一致性**：检索结果只能来自已授权知识库；增量上传、更新、删除和迁移切换都同步维护 Dense 与 Sparse，不让旧版本文档残留。
+5. **指标对照**：固定 Qrels/语料/Query/权限，对比当前 `textSearch`、Dense、标准 BM25、Dense+BM25+RRF 的 Evidence Recall@K、MRR/nDCG、无答案误召回、P95 延迟与运行成本。
+6. **质量可归因**：按同义表达、专业编号、多证据、条件/否定等查询类别单独分析收益与退化；对融合前、融合后有序候选保存必要的 Trace，防止平均分掩盖特定场景失败。
+7. **部署与回滚**：保持新旧 Collection/入口的切换策略、迁移幂等、索引补录进度和失败恢复方案；验证原检索模式可以在出现异常时恢复。
+
+### 【面试标准回答】
+
+妙码 AI Flow 当前通过 Qdrant 存储 Dense 向量及 Chunk 正文，对 `knowledgeBaseId` 和 `documentId` 建立 `keyword` Payload Index，用于权限范围或文档定位；它没有为正文建立 BM25 倒排索引。现有 `textSearch()` 在查询时一次 `scroll` 最多 1000 个 Point，在 Node.js 中对 Query 按标点/空格拆分、执行子串匹配和出现次数打分，再取 Top-K，因此既缺少规范 TF/IDF/长度归一化，也存在语料扫描覆盖上限和中文分词不足的问题。
+
+改造应从数据与查询两端同时进行：在 Qdrant 中配置 BM25 Sparse Vector 字段，为每个 Chunk 在入库阶段产生兼容的 Sparse 表示；在线由 Query 编码为 BM25 Sparse 后直接查询 Sparse Index，而不是扫描 Payload。原有 `HybridRetriever` 的加权 RRF 可以先复用，将两个业务入口的 `FulltextSearchProvider` 同时替换为真实 BM25 检索，并在固定 Ground Truth 下检验召回、排序、时延和成本。
+
+由于项目采用自建 Docker Qdrant，还必须验证 Qdrant Server/Client 版本与推理部署条件；官方面向支持服务端文本推理的 `qdrant/bm25` 请求不能不经验证就当成本地可用。对现有数据选择新增 Sparse 字段并补录，或建立新 Collection 蓝绿迁移，最终保证历史与增量数据都拥有完整的 Dense/Sparse 表示。
+
+### 【参考文档与本项目证据】
+
+1. [Qdrant Collections：Update Vector Schema](https://qdrant.tech/documentation/manage-data/collections/)：Qdrant v1.18 起为现有 Collection 新增命名 Dense/Sparse Vector，已有 Point 需要补录实际向量值。
+2. [Qdrant Inference：Choose Your Approach](https://qdrant.tech/documentation/inference/)：自建环境优先通过客户端或 FastEmbed 管理 Sparse 生成；服务端 `qdrant/bm25` 推理有部署差异。
+3. [Qdrant BM25 Sparse Inference](https://qdrant.tech/documentation/inference/inference-bm25/)：具备相应推理能力的实例通过模型名生成 BM25 Sparse Vector。
+4. [Qdrant Full-Text Search](https://qdrant.tech/documentation/search/text-search/full-text-search/)：包括 BM25、`multilingual` Tokenizer、Query API 的搜索调用。
+5. [Qdrant Sparse Vectors](https://qdrant.tech/documentation/manage-data/vectors/)：同 Point 命名 Dense/Sparse、`indices/values` 与稀疏存储。
+6. [Qdrant Hybrid Search](https://qdrant.tech/documentation/search-tuning/hybrid-search/)：BM25 通道、候选深度与 RRF 的工程权衡。
+7. [Qdrant Multitenancy and IDF Scope](https://qdrant.tech/documentation/tutorials/multiple-partitions/)：稀疏 IDF 的统计范围与 Filter 的差异。
+8. [妙码 AI Flow：Qdrant Store](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)、[文档处理](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)、[HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)、[检索 API](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts)、[KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts)、[Docker Compose](https://github.com/cxDlogver/miaoma-aiflow/blob/main/docker/docker-compose.yml)。
+
+---
+
 ## 【下一题讨论方向：RRF 如何融合不同检索通道的排序】
 
 在掌握 Dense 与 BM25 两种候选生成机制后，使用同一组真实 ID/排序的教学例子，逐项计算 RRF 的分数及最终排序：为什么对排名求倒数而不是直接相加原始 Score、`k` 与两路权重如何影响结果、候选截断/重复 ID 怎样处理、RRF 和 Rerank 的职责边界。结合妙码 AI Flow 的 `HybridRetriever.reciprocalRankFusion()` 源码逐行说明，下一题先对话讨论再归档。
