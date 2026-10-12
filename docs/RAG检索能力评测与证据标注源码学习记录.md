@@ -2711,6 +2711,665 @@ RRF 与 Rerank 的区别是：RRF 只使用多个检索通道提供的 Rank 做�
 
 ---
 
-## 【下一题讨论方向：Context Construction 如何组织最终送入 LLM 的证据】
+## 【第八题：Context Construction 如何组织最终送入 LLM 的证据】
 
-本题到此只记录下轮研究方向，不提前预写答案：在已获得 Dense/BM25 候选、RRF 融合与可选 Rerank 排序的前提下，**为什么 Rerank Top-K 不应直接视为最终 Context？**下一轮讨论 Token Budget、原子事实覆盖、引用来源与版本、冗余 Chunk 去重、父章节补全、截断策略以及如何验证“最终 Prompt 实际包含了回答所需证据”。这一题将与第二题追问中已经建立的 Context Evaluation 联系起来。
+### 【提问与知识概述】
+
+在 Retrieval、Fusion（RRF）及可选的 Cross-Encoder Rerank 之后，为什么不直接把排名前 K 的 Chunk 拼接成 Prompt？**因为候选排序优化的是单条证据与 Query 的相关性，Context Construction 优化的是有限 Token Budget 内“整组证据是否完整、有效、无明显冗余且可引用”。**
+
+三个产物必须区分：
+
+| 产物 | 它回答什么问题 | 主要评价 |
+|---|---|---|
+| Retrieved Candidates | 哪些片段可能相关，是否找到了正确证据 | Candidate Evidence Recall@N |
+| Reranked Results | 正确证据能否被提升到较前位置 | MRR、nDCG@K |
+| Final Context | 模型输入中实际有哪些可用证据 | Final Context Fact Coverage、Token Cost、来源与引用 |
+
+候选里的某条正确事实可能在最终预算选择、截断、去重时消失，所以**候选已召回 ≠ 最终 LLM 真正获得了证据**。
+
+### 【一个具体案例：排名高不等于事实覆盖完整】
+
+用户 Query：“员工申请年假需要提前多久，由谁审批，试用期是否适用？”
+
+假定某份企业制度的人工标注 Ground Truth 包含：
+
+- F1：提前三个工作日；
+- F2：由直属主管审批；
+- F3：试用期员工不适用。
+
+此制度和后面候选 Token 数均为**教学假设**，不是项目真实生产资料。
+
+| Rerank 名次 | 片段 | 长度 | 覆盖事实 |
+|---|---|---:|---|
+| 1 | C1：年假申请说明 | 500 tokens | F1 |
+| 2 | C2：申请时限 FAQ | 350 tokens | F1 |
+| 3 | C3：审批流程 | 400 tokens | F2 |
+| 4 | C4：年假适用范围 | 250 tokens | F3 |
+| 5 | C5：其他休假说明 | 300 tokens | 无 |
+
+如果本次可用证据预算为 1050 tokens，直接从最高排名开始拼接 C1（500）+ C2（350），此时下一条 C3 放不下，结果只提供 F1，**虽然二者都很相关但 Final Context 事实覆盖只有 1/3**。
+
+假设 C2 已经足够权威、完整，且可替代 C1，选择 C2（350）+ C3（400）+ C4（250）总计 1000 tokens，则覆盖 3/3。这说明证据组合不应只按照单条 Rerank 排名进行；还要考虑新增事实覆盖、版本可信度、冗余及 Token 成本。
+
+关键限定：**线上程序不会天然知道人工 Ground Truth 的 F1/F2/F3 列表**。只有预先定义领域事实、利用模型分析 Query，或使用经验证的规则才能推断用户需要哪些事实，不能把离线人工标注直接当成线上可自动获得的信息。
+
+### 【Token Budget 的真实约束】
+
+简化表达：
+
+~~~text
+EvidenceBudget
+ = ModelContextWindow
+ - SystemPromptTokens
+ - ConversationHistoryTokens
+ - QueryTokens
+ - ReservedOutputTokens
+ - FormatOverheadAndSafetyMargin
+~~~
+
+例如模型可用上下文 8192 tokens，系统提示 900、历史 1400、Query 100、生成预留 1000、格式余量 500，则证据预算为 4292 tokens。这仅是预算教学数据；模型实际窗口、输出限制和模板由部署配置决定，输入 Token 应使用目标模型兼容的 Tokenizer 计量。
+
+**不能用单纯字符切片等价代替 Token 预算控制**：不同文本的 Token 消耗不同，而且直接在字节/字符位置截断可能删除后半句限定条件。例如：
+
+~~~text
+原文：
+员工提前三个工作日申请年假。
+但是试用期员工不适用这一制度。
+
+机械截断后：
+员工提前三个工作日申请年假。
+~~~
+
+被删去的适用条件会影响回答。优先按完整证据或句子/事实边界选择；如果确实截断则应明确标记，不要继续将截断证据视为无条件完整的事实支持。
+
+### 【Context Construction 的职责和运行链路】
+
+~~~text
+有序候选 Chunk
+    ↓
+① 检查合法性：权限 / 当前有效版本 / 原文来源
+    ↓
+② 去除精确重复、同源 Offset 重叠
+    ↓
+③ 依元数据补充章节路径、必要父节和明确引用条款
+    ↓
+④ 在 Token Budget 内选择证据并避免冗余
+    ↓
+⑤ 添加稳定引用 ID、来源标题、文档版本和章节
+    ↓
+⑥ 在最终 Prompt 构成后复核实际入模证据和 Token
+    ↓
+LLM
+~~~
+
+这些是逻辑职责，不是所有框架必须采用的固定物理执行顺序。权限在检索前后都可能需要验证；尤其注意**如果经过最终 Token 选择后丢掉关键证据，必须重新评价最终 Context，而非仅相信 Rerank 候选阶段的覆盖。**
+
+- **来源**：Rerank Score 不替代访问控制或文档生效条件；旧版/失效规则应遵守可信版本与废止关系。
+- **去重**：Chunk Overlap 的重复可按同一原文 Offset 合并；FAQ 与正文即使语义相似，也不能简单视为事实等价，因为可能有“通常”“除外”等限定。
+- **背景**：较小 Chunk 提高检索定位精度；必要时再从同文档的父节/相关条款恢复背景，不应每次一律附加整个章节。
+- **引用**：最终 Context 对每条证据分配来源 ID，保持 `evidenceId/chunkId/documentId/version` 与正文绑定；引用 ID 仍需检查是否真的支持对应断言。
+- **提示注入**：从知识库检索的正文属于外部资料，不能当作高优先级指令执行。
+
+研究 [Lost in the Middle: How Language Models Use Long Contexts](https://aclanthology.org/2024.tacl-1.9/) 在特定模型与任务下发现长上下文中间位置的证据可能更难被使用。故“在窗口内”并不保证“模型稳定用到”；但证据摆放顺序需依据具体模型与任务评测，而不是固定认定放在末尾最好。
+
+### 【妙码 AI Flow 当前怎么组织 Context：源码核对】
+
+代码：[KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts)、[LLMExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/llm-executor.ts)、[BaseExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/base-executor.ts)、[VariableResolver](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/core/variable-resolver.ts)。
+
+**当前实现**：
+
+1. `KnowledgeExecutor` 调用 `retriever.retrieve()` 后，文本模式将每条候选按序号和正文用两个换行连接，形如：
+
+   ~~~text
+   [1] <第一条 Chunk 正文>
+
+   [2] <第二条 Chunk 正文>
+   ~~~
+
+   JSON 模式序列化包括 `chunkId/content/score/chunkIndex/documentId/knowledgeBaseId` 的结果数组。文本模式并未自动加入完整版本化引用来源。
+2. `BaseExecutor` 解析节点配置字符串中的上游变量；`VariableResolver` 会将节点输出替换进入下游 Prompt。因此知识节点的 `output` 能被工作流的 LLM 节点引用，但这属于变量注入机制，并不是完整的 Context 质量管理。
+3. `LLMExecutor` 把系统/用户/助手 Prompt 组装为消息后调用 Ollama。`maxTokens` 映射到 `numPredict`（生成长度控制），而 `estimateTokens(content)` 是生成后按中英文字符粗估**输出文本**的 Token 计数；它不是调用前对所有输入 Context 的 Token 预算控制。
+
+**源码结论**：在上述已核对链路中，没有独立自动执行“权限/版本/背景/去重/Token Budget/最终证据核验”的 ContextBuilder。不能因为有 `topK` 或 `maxTokens` 就宣称实现了这套能力。
+
+### 【建议的第一版 ContextBuilder 数据协议】
+
+建议增加独立工程层，而非让 KnowledgeExecutor / LLMExecutor 各自夹杂复杂规则：
+
+~~~typescript
+interface ContextEvidence {
+  evidenceId: string;
+  chunkId: string;
+  documentId: string;
+  knowledgeBaseId: string;
+  content: string;
+  tokenCount: number;
+  source?: {
+    title: string;
+    version?: string;
+    section?: string;
+  };
+}
+
+interface ContextPackage {
+  text: string;
+  evidence: ContextEvidence[];
+  totalTokens: number;
+  dropped: Array<{
+    chunkId: string;
+    reason: "duplicate" | "token-budget" | "invalid-source" | "permission";
+  }>;
+}
+
+interface ContextBuilder {
+  build(options: {
+    query: string;
+    candidates: RetrievalResult[];
+    tokenBudget: number;
+  }): Promise<ContextPackage>;
+}
+~~~
+
+**以上仅是方案接口，不是已经编写的项目业务代码**。实现优先级：可信有效来源、明确重复去除、正确 Token 计数、稳定证据 ID 和调用前检查；复杂的多事实语义覆盖/冲突交给后续独立层评估。
+
+### 【评测：定位证据在哪个阶段消失】
+
+假设：
+
+~~~text
+Ground Truth：{F1,F2,F3}
+Retrieved Candidates：{F1,F2,F3}
+Rerank Candidates：{F1,F2,F3}
+Final Context：{F1,F2}    ← 预算/去重等造成 F3 丢失
+~~~
+
+可建立：
+
+- Candidate Evidence Recall@N：初始候选是否找到正确证据；
+- Final Context Fact Coverage：实际入模证据是否支持全部必要事实；
+- Context Token Cost 与冗余率；
+- Citation Support Accuracy、Faithfulness 和 Answer Correctness。
+
+尤其注意 Context Precision 一般描述检索结果中相关上下文的排序表现，不是 Token 使用效率。若使用 Ragas 之类的自动评估器，必须标记具体 Judge/模型/方法；离线模型评测指标不等于一个可线上执行的确定性 ContextBuilder。
+
+**面试标准回答**：Context Construction 是检索与生成之间的证据组织层，不能简单将 Rerank Top-K 视为最终 Prompt Context。应在可信来源、权限/时效、结构背景与 Token 预算约束下去重、选择、组织并标注可追溯证据；复杂问题要评价组合后的必要事实覆盖。项目当前是候选拼接与工作流变量注入，建议新增独立 ContextBuilder 并记录最终入模证据、Token 和丢弃原因。
+
+---
+
+## 【第八题追问一：不引入模型，哪些证据完整性和背景补充检查能用代码完成】
+
+### 【提问】
+
+Context Construction 提到事实对齐、条件覆盖、判断缺少背景、补充检索和证据冲突。如果不引入额外模型，能否全部用 TypeScript/脚本完成？代码需要依据什么信息作判断？
+
+### 【知识概述：结构检查和语义判断不是同一件事】
+
+| 判断 | 依赖的信息 | 不用模型是否可靠 |
+|---|---|---|
+| 权限 / 知识库隔离 | 可信用户身份和后端授权 | 可以 |
+| 来源文档当前有效版本 | 版本、生效/废止日期、可信状态 | 可以 |
+| 是否含章节标题、父节位置 | `headerPath/sectionId` | 有结构数据即可 |
+| Chunk 与原文位置是否一致 | 文档版本、`startOffset/endOffset`、原文 | 可核验，但 Offset 本身必须准确 |
+| 相邻 Chunk 是否重叠 | 同源 Offset 与文本边界 | 可以 |
+| 是否超 Token Budget | 目标模型兼容 Tokenizer | 可以 |
+| 显式引用“第 X 条”“上述规定” | 正则 + 条款索引 | 可识别可定位的一部分 |
+| 是否已覆盖任意 Query 的全部隐含事实 | Query 与自由文本的真实语义 | 无通用确定性保证 |
+| 两段自由文本是否真实互斥 | 主体/条件/时间/逻辑蕴含 | 无通用确定性保证 |
+| 审核过的固定业务字段是否缺项 | 结构化 `FactType` 和证据映射 | 可以 |
+| 审核过的规则是否冲突 | 事实属性、条件重叠、时间与版本 | 可以 |
+
+**原则**：能通过结构与可信规则证明的事实让代码处理；若仅能由模糊关键词推断，则保留 `unknown` 状态，而不是自动宣布“完整”。
+
+### 【无需模型的结构补齐：标题、邻接、显式引用】
+
+假设文档：
+
+~~~text
+# 员工休假制度
+## 年假申请
+员工应提前三个工作日提交申请。
+## 审批流程
+由直属主管审批。
+~~~
+
+如果只检索到“由直属主管审批”，但入库保存了 `headerPath:["员工休假制度","审批流程"]`，就可以在输出时附带可信标题：
+
+~~~text
+来源：员工休假制度
+章节：审批流程
+正文：由直属主管审批。
+~~~
+
+这是一种统一格式策略，不需要模型先判定“是不是缺少背景知识”。
+
+如果正文含：
+
+~~~text
+上述条件不适用于试用期员工。
+~~~
+
+可以通过可维护的显式关联规则检测潜在前文引用：
+
+~~~typescript
+const referencePatterns = [
+  /上述(条件|规定|要求)/,
+  /前述(条件|情形)/,
+  /以下(情况|条件)/,
+  /按照第[一二三四五六七八九十\d]+条/,
+  /依照本章规定/,
+];
+
+function hasExplicitReference(text: string) {
+  return referencePatterns.some(pattern => pattern.test(text));
+}
+~~~
+
+命中后，如果有条款编号、`sectionId`、`parentSectionId`、可靠原文 Offset，可以定位被引用条款或有限范围的同节背景。但**出现“上述条件”并不代表最近一个 Chunk 必然正确**；邻接关系只是候选关联，跨页/跨章节引用需要更明确的指向。
+
+### 【固定领域的事实覆盖可用集合差集】
+
+如果业务领域已经有审核过的数据模式：
+
+~~~typescript
+type LeaveFact =
+  | "advanceDays"
+  | "approverRole"
+  | "probationEligibility";
+
+const required = new Set<LeaveFact>([
+  "advanceDays",
+  "approverRole",
+  "probationEligibility",
+]);
+
+const covered = new Set<LeaveFact>([
+  "advanceDays",
+  "approverRole",
+]);
+
+const missing = [...required].filter(x => !covered.has(x));
+// ["probationEligibility"]
+~~~
+
+只要 `required` 是由可靠的需求识别得来，而 `covered` 是来自受审核的结构化事实记录，缺失检测就可重复、可解释。
+
+但这段代码本身**只完成集合差集**：没有证明模型之外的系统能够自动从任意中文 Query 得到 `required`，也没有证明含“试用期”的文档一定支持 `probationEligibility`。在固定业务领域可以用严格意图模板、表单或人工维护的知识字段建立可靠映射；自由问答无法只靠几条正则准确发现全部隐含需求。
+
+### 【如何进行可控补充与复检】
+
+~~~text
+初始候选
+  → 校验授权、版本、结构信息
+  → 去重、补充显式引用、控制预算
+  → 检查定义明确的 Required Facts
+  → 如果有明确 Missing Facts：
+       使用模板化 Query 在授权知识库中定向检索
+       校验新结果的权限与时效
+       合并并去重，再次检查缺项
+  → 生成 Context 或返回 incomplete/unknown
+~~~
+
+**必须有终止条件**：最多例如 1～2 轮，固定超时、不重复执行同一查询、没有新增有效 Chunk 即停止、超出 Token Budget 即停止。避免把验证循环变成无界探索。
+
+状态建议拆分为 `complete`、`incomplete`、`unknown`。**未知与缺失不同**：无可靠语义检查能力时，不能因为规则没有命中就认定全部事实已覆盖。
+
+### 【本题标准回答】
+
+规则和代码可以完成来源权限、版本时效、章节定位、Offset 重叠、Token Budget、显式交叉引用以及有预定义字段的覆盖检查与补检。它们的可靠性来自**入库阶段形成的结构与业务事实数据**，不是脚本天然具有自然语言理解能力。对于任意 PDF、Markdown 和非结构化文本，能识别结构不等于能判断语义充分；即使所有结构检查通过，也不能据此证明不存在遗漏事实或冲突，应保留 `unknown` 并在离线评测中验证实际效果。
+
+---
+
+## 【第八题追问二：究竟怎样判定结构完整、背景不足和证据冲突】
+
+### 【提问】
+
+不能只说“代码检查”。需要明确：**判断结构是否完整，实际比较什么？如何决定需不需要补充？两条证据是否存在冲突，又依据哪些维度？**
+
+### 【结构完整性的判定依据】
+
+建议离线记录明确的结构边界：
+
+~~~typescript
+interface ChunkStructure {
+  chunkId: string;
+  documentId: string;
+  documentVersion: string;
+  sectionId: string;
+  sectionStart: number;
+  sectionEnd: number;
+  headerPath: string[];
+  chunkStart: number;
+  chunkEnd: number;
+  parentSectionId?: string;
+}
+~~~
+
+若结构信息准确，可以确定一个 Chunk 是否覆盖整个原文 Section：
+
+~~~typescript
+const isCompleteSection =
+  chunk.chunkStart === chunk.sectionStart &&
+  chunk.chunkEnd === chunk.sectionEnd;
+~~~
+
+**这一判断只代表“与章节区间相同”，不代表“回答 Query 所需背景已充分”**。
+
+可执行的结构检查包括：文档 ID 和版本能否回源、Offset 是否落在真实原文范围、Chunk 正文与原文对应片段是否匹配、`headerPath` 是否与节标题一致、引用条款是否能被定位、同一版本的父子结构是否有效。
+
+切分后的 `trim()` 和 Markdown 标题/段落处理可能导致记录 Offset 与原文文本的精确对应关系需要特别测试。不能不经校验就在 ContextBuilder 中按 Offset 直接取回原文。
+
+### 【背景完整性：判断“是否存在依赖”和“依赖是否满足”】
+
+例如 C2：“由直属主管审批”，`headerPath` 已包含“员工休假制度 > 年假申请 > 审批流程”。可以始终追加轻量章节标题，这是确定性结构增强。
+
+例如 C8：“上述条件不适用于试用期员工”，包含显式前文指代。如果另有条款编号或 `parentSectionId`，可优先按结构引用定位；如果指代不明，只能将相邻 Chunk 作为候选补充，状态应为“可能依赖/待核验”，不能认定前一条 Chunk 一定就是正确背景。
+
+还有更难的情况：Query 问“哪些例外情形可以申请？”而片段只是讲一般规则，无显式代词也没有说明例外。**脚本无法仅凭“句子完整、标题完整”推出例外不存在或已经齐全**。若有预先定义的 `requiredFacts`，可针对字段检查；开放式自然语言需要额外语义判断或人工审核。
+
+### 【证据冲突：先检查同一主体、属性、适用范围与有效时间】
+
+举例：
+
+~~~text
+A：试用期员工可以申请年假。
+B：试用期员工不可以申请年假。
+~~~
+
+在同一时期、相同主体和适用条件下，二者可能冲突。但：
+
+~~~text
+A：2025 年制度允许试用期申请年假。
+B：2026 年制度不允许试用期申请年假。
+~~~
+
+如果旧制度已废止，这是制度变更而非“当前两个有效规则冲突”。
+
+另一例：
+
+~~~text
+A：入职满一年的员工可以申请年假。
+B：试用期员工不可以申请年假。
+~~~
+
+由于适用条件可能不重叠，也不能仅按“可以/不可以”认定冲突。
+
+可建立审核后的领域事实：
+
+~~~typescript
+interface PolicyFact {
+  subject: string;
+  property: string;
+  value: string | number | boolean;
+  conditions: Record<string, unknown>;
+  effectiveFrom: string;
+  effectiveTo?: string;
+  documentId: string;
+  chunkId: string;
+}
+~~~
+
+判断框架：
+
+~~~typescript
+// 伪代码：条件重叠、时间范围与规则优先级均需领域实现。
+function mayConflict(a: PolicyFact, b: PolicyFact) {
+  return a.subject === b.subject
+    && a.property === b.property
+    && conditionsOverlap(a.conditions, b.conditions)
+    && timeRangesOverlap(a, b)
+    && a.value !== b.value;
+}
+~~~
+
+这里 `mayConflict` 只表示潜在冲突，不代表已完成对制度层级、授权来源、例外条件、废止关系的裁决。自然语言事实未结构化时，简单关键词检测或向量相似度**不能可靠判断否定的作用范围和条件互斥性**。
+
+### 【多维状态，不要一个布尔值】
+
+~~~typescript
+type CheckStatus =
+  | "passed"
+  | "needs-expansion"
+  | "conflict"
+  | "unknown";
+
+interface EvidenceCheckResult {
+  structure: CheckStatus;
+  background: CheckStatus;
+  consistency: CheckStatus;
+  reasons: string[];
+  missingFields: string[];
+  requiredChunkIds: string[];
+}
+~~~
+
+例如：
+
+~~~text
+structure: passed
+background: unknown
+consistency: unknown
+~~~
+
+表示“文档结构符合已定义的规则，但语义是否充分与是否冲突尚未被可靠验证”。这比将所有未知静默转换为 `passed` 更符合工程安全边界。
+
+### 【妙码 AI Flow 已发现的实际数据缺口】
+
+已核对项目源码：
+
+1. [MarkdownSplitter](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/chunking/markdown-splitter.ts) 为 Chunk 生成 `metadata.headerPath`。
+2. [document-processor.ts](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts) 构建 `ChunkWithVector[]` 时传递 `content/index/startOffset/endOffset/documentId/knowledgeBaseId/vector`，**漏传 `metadata: chunk.metadata`**。
+3. [qdrant-store.ts](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 保存 `metadata: chunk.metadata || {}`，故上游漏传时 `headerPath` 在这条写入链路无法保存。
+4. `QdrantVectorStore.search()` 返回 `metadata` 等字段，但没有把已存 Payload 中的 `startOffset/endOffset` 显式映射到当前搜索结果接口，因此需要扩展查询结果或增加根据 `chunkId` 获取完整结构信息的能力。
+5. [KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts) 的 Text 输出是名次与正文直接拼接，没有系统地注入标题路径、文档生效版本和稳定引用 ID。
+
+**第一步不是立即新增模型，而是修复现有 Metadata 传递、验证 Offset，补齐 `sectionId/documentVersion/parentSectionId` 等来源结构，使后续确定性规则真正有可信数据可用。**
+
+### 【本题标准回答】
+
+代码能根据可靠的章节/原文结构判断 Chunk 是否覆盖完整章节、是否有显式引用依赖，并可以在业务字段已结构化时比较主体、属性、条件、时间和互斥结论，发现缺失或潜在冲突。但结构完整不等于语义完整，两个文本相似不等于内容一致，两个相反结论也可能只是适用条件或版本不同。对于无法判断的自然语言情况，应保留 `unknown`，不能把规则未命中等同于完成了语义核验。
+
+---
+
+## 【第八题追问三：实际工程需要 Evidence Verifier、专门模型还是 Agent】
+
+### 【提问与结论】
+
+在企业通用知识库中，如果要综合多个非结构化片段，判断“是否具备用户问题要求的全部事实、是否互相矛盾、是否需要补充缺失背景”，代码无法通用保证语义判断。是否应引入 LLM、专用模型，还是让 Agent 自主编排全部步骤？
+
+**推荐优先方案：确定性 ContextBuilder + 按需调用的 EvidenceVerifier（模型）+ 有界补检 Workflow。** 引入模型不等于必须训练新模型，更不等于需要完整 Agent 框架。
+
+| 层次 | 负责的内容 | 技术选择 |
+|---|---|---|
+| 确定性基础 | 权限、版本、结构来源、精确去重、Token、引用 | TypeScript + 业务 DB / Qdrant |
+| 语义验证 | 多事实要求、证据支持、语义冲突、缺失背景 | 现有 LLM / 专门 NLI 分类模型 |
+| 行动控制 | 依据验证结果是否继续检索、最多几轮、何时停止 | 先固定 Workflow，复杂时再考虑 Agent |
+
+### 【模型实际要判断什么】
+
+教学问题：
+
+~~~text
+2026 年试用期员工能否申请年假？
+如果适用，需要提前多久？由谁审批？
+
+C1：2026 年正式员工可申请年假，须提前三个工作日。
+C2：年假申请由直属主管审批。
+C3：2025 年试用期员工可以申请年假。
+C4：2026 年试用期员工不适用年假制度。
+~~~
+
+先通过代码过滤时效失效/越权文档；不能把 C3 与 C4 不同直接判为“2026 年当前有效制度冲突”。模型再尝试将 Query 分解：
+
+~~~text
+F1：2026 年试用期员工有无申请资格？
+F2：若适用，需提前多久？
+F3：若适用，由谁审批？
+~~~
+
+**条件依赖很重要**：C1 对正式员工的三天规则不能无条件推广给试用期员工。Verifier 应判断每个要求是 `supported/missing/uncertain`，并关联实际授权、有效的 `evidenceId`。如果存在复杂范围冲突，应输出“可能冲突”，并标明证据与冲突理由，而不是自行决定政策效力。
+
+可以借鉴 NLI（Natural Language Inference）的 `entailment/contradiction/neutral` 分类：某条证据对某个明确断言是支持、矛盾还是信息不足。但 NLI 文本对分类不等于自动完成整个多文档规则冲突判决，仍要先核对来源、时间、主体与条件。
+
+### 【为什么建议结构化 EvidenceVerifier，而不是自由文本总结】
+
+建议输出 JSON（设计草案，当前仓库未实现）：
+
+~~~typescript
+interface EvidenceVerification {
+  requirements: Array<{
+    requirement: string;
+    status: "supported" | "missing" | "uncertain";
+    evidenceIds: string[];
+    missingInformation?: string;
+  }>;
+  conflicts: Array<{
+    evidenceIds: [string, string];
+    reason: string;
+    status: "possible" | "confirmed" | "uncertain";
+  }>;
+  needMoreEvidence: boolean;
+  suggestedSearchQueries: string[];
+}
+~~~
+
+`confirmed` 只是模型给出的分类标签，不是可直接跳过验证的形式化证明。代码必须验证：
+
+- 使用 JSON Schema / Zod 等校验结构与字段范围；
+- 返回的 `evidenceIds` 必须来自本次输入的**有效且有权限**的候选，拒绝不存在/跨租户/失效的引用；
+- 缺失的事实描述与建议的 Query 不能授权模型访问额外知识库；
+- 补检后重新校验新增 Chunk 的权限、时效、来源；
+- 对仍然不足或冲突的证据返回 `uncertain/insufficient`，不把未知强行解释为“足够”；
+- 记录 Verifier 版本、模型、判定与可审计原因，敏感正文日志遵循脱敏和保留规则。
+
+**模型负责语义判断与提出补检建议；代码负责权限制约、执行、回退和停止。**
+
+### 【一个无需引入 Agent 的最小 Workflow】
+
+~~~text
+Query
+  ↓
+Retrieval（Dense / Fulltext/BM25）
+  ↓
+Fusion / [可选] Rerank
+  ↓
+ContextBuilder：版本权限、结构补全、去重、Token Budget
+  ↓
+EvidenceVerifier：是否支持各子问题、是否缺背景/存在可能冲突
+  ↓
+程序校验 Verifier 的结构化输出
+  ├─ sufficient → 最终 Context 重新核对 → Generation
+  ├─ missing → 生成受限补检请求
+  │             ↓
+  │          定向 Retrieval
+  │             ↓
+  │          重新校验与构建 Context
+  │             ↓
+  │          再次 EvidenceVerifier（最多 1～2 轮）
+  └─ conflict / uncertain → 标明证据不足、澄清或转人工
+~~~
+
+**重要执行顺序**：如果 Verifier 验证的是预算选择之前的一批候选，但最终 ContextBuilder 只保留了一部分，则应在**最终实际进入 LLM 的 Context**上复核验证；不能说“候选集合完整，所以模型输入完整”。
+
+设置硬停止条件：最大循环轮数、超时/Token/模型调用次数预算、同一 Query 去重、无新有效 Chunk、不可解决的证据冲突。这样即使有模型决定 `missing`，整个流程仍属于固定编排的受控 Workflow。
+
+### 【Workflow 与 Agentic RAG 的边界】
+
+普通受控 Workflow：
+
+~~~text
+Retriever → Verifier（模型输出结构化 status）
+                       ↓
+               程序固定路由
+       sufficient → 生成
+       missing    → 再检索一次
+       conflict   → 标记或人工确认
+                       ↓
+                     结束
+~~~
+
+存在模型决策节点，但不需要模型持续规划/执行任意工具。
+
+Agentic RAG 则更侧重：
+
+~~~text
+模型检查证据缺口
+    ↓
+动态选择检索工具、改写 Query 或转向其他来源
+    ↓
+执行工具并观察新证据
+    ↓
+判断是否继续检索或停止
+    ↓
+在预算和权限约束内重复推进
+~~~
+
+这才更接近“判断 → 行动 → 观察 → 再判断”的 Agent Loop。Agent Runtime/Harness 仍需执行工具白名单、权限、Context、Trace、预算与停止规则，不应由模型自由突破这些约束。
+
+**不是 Agent 越复杂就越好**。只有固定检索与最多几次补检无法解决的开放式、多跳、跨系统研究任务，才考虑 Agentic RAG。
+
+### 【需要从头训练专门模型吗】
+
+一般不必在第一版训练。
+
+| 方案 | 优点 | 局限 / 何时选择 |
+|---|---|---|
+| 现有 LLM + 固定提示和结构化输出 | 可一次判断多个事实、背景条件与可能冲突 | 调用成本、误判与延迟需量化；PoC 优先 |
+| 现成 NLI Cross-Encoder 分类器 | 适合对单个断言与一条证据做支持/矛盾/中立判定 | 多文档整体覆盖和版本关系仍需编排 |
+| 领域微调 Verifier | 可针对术语/限定条件优化 | 要先积累可靠标注并证明通用模型不足 |
+| Agentic RAG | 多轮自主选工具、改写 Query 更灵活 | 更难调试、成本高、需严格限制权限与停止 |
+
+**Reranker 不等于 NLI Verifier**：Reranker 主要输出 Query–Chunk 的排序相关性；NLI 输出针对明确断言的关系判断；多片段的事实完整性又需要综合每个问题要求、适用条件与来源。
+
+### 【分阶段落地到妙码 AI Flow】
+
+根据已核对源码，当前有 `HybridRetriever`、工作流知识库节点和 `LLMExecutor`，但在这些已检查模块中**没有独立 ContextBuilder、EvidenceVerifier 或用于主动补检的 Agent**。要区分设计建议与项目已交付功能。
+
+建议小步推进：
+
+1. **先补可靠的数据基础**：修复 `metadata: chunk.metadata` 传递问题，验证 Offset 和 `headerPath`、来源版本和文档权限，定义可复用的 ContextPackage。
+2. **先做纯规则 ContextBuilder**：权限、当前版本、标题/显式引用恢复、精确去重、Token Budget、引用映射；不承诺自由文本语义完整。
+3. **增加可选 EvidenceVerifier**：复用现有模型接入能力，固定 JSON Schema，按需在多事实/疑似冲突/显式依赖场景激活；不用先训练新模型。
+4. **增量引入有界补检**：如果结构化输出明确指出缺少事实，在可信知识库范围内执行至多 1～2 次定向搜索，最后复核模型实际使用的 Context。
+5. **依据评测决定是否升级**：当固定 Workflow 无法解决多跳场景时才考虑 Agent；验证器成为成本热点且有领域标注时再考虑小模型/微调。
+
+### 【评测：证明模型验证不是单纯增加成本】
+
+在同一语料版本、授权环境、Query、Ground Truth 下对照**规则 ContextBuilder**与**ContextBuilder + EvidenceVerifier + 有界补检**：
+
+| 测试集 | 目标 |
+|---|---|
+| 证据完整的 Query | 避免错误要求额外补检 |
+| 人工确定缺少必要事实 | 缺项识别 Precision / Recall |
+| 新旧版本表面相反 | 不误报真实冲突 |
+| 同主体、同时效、同条件下事实互斥 | 冲突发现 Precision / Recall |
+| 显式引用/隐含背景条件 | 背景补全是否正确、是否遗漏关键限制 |
+| 最终答案、引用与预算 | Final Context Fact Coverage、Faithfulness、Correctness、Citation Support、P95 延迟和成本 |
+
+特别记录 `unknown/abstain` 的比例和**误判“证据充分”**的比例。验证器本身也可能幻觉或漏看条件，因此模型判定不能取代人工标注、源文核对和生产安全边界。
+
+### 【本轮标准回答】
+
+对于企业通用非结构化知识库，ContextBuilder 应由确定性代码完成权限、版本、章节定位、文本重叠、Token Budget 和引用映射；多个自然语言片段是否覆盖用户所需的全部事实、是否存在隐含条件或语义冲突，通常需要独立语义判断，或者先建立可审核的结构化事实模型。可以优先复用现有 LLM 作为 EvidenceVerifier，输出事实要求、已支持的证据 ID、缺失信息和可能冲突，再由代码对来源和权限进行校验并在有限轮次内补检。
+
+这是一个受控 Workflow，不需要从开始就建独立 Agent 或训练专门模型。只有确实需要模型动态规划下一次搜索、选择工具并反复观察新结果时，才考虑 Agentic RAG。最后需要通过 Ground Truth 检验新增判断能力对事实完整性、冲突识别和最终回答质量是否真正有收益，以及额外的延迟、成本是否值得。
+
+### 【资料与源码衔接】
+
+1. [Lost in the Middle（ACL Anthology）](https://aclanthology.org/2024.tacl-1.9/)：长上下文位置对模型利用证据的影响。
+2. [Ragas：Context Recall](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/)：参考事实与上下文证据的覆盖评测。
+3. [Ragas：Context Precision](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/)：不同于 Token 成本的相关性排序评测。
+4. [Sentence Transformers：Cross-Encoder 应用](https://www.sbert.net/examples/cross_encoder/applications/README.html)：文本对评分及 NLI/Rerank 的边界。
+5. [LangGraph Agentic RAG](https://langchain-ai.github.io/langgraph/tutorials/rag/langgraph_agentic_rag/)：模型评估检索结果、改写 Query 与受控检索循环的工作流思想。
+6. 项目源码：[MarkdownSplitter](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/chunking/markdown-splitter.ts)、[Document Processor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)、[Qdrant Store](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)、[KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts)、[LLMExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/llm-executor.ts)、[VariableResolver](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/core/variable-resolver.ts)。
+
+---
+
+## 【下一题讨论方向：如何评价 RAG 最终生成答案的正确性、忠实性和引用准确性】
+
+下一题在 Retrieval → Fusion → Rerank → Context Construction → Generation 的闭环基础上区分：
+
+- Faithfulness：答案中的断言是否有实际提供给模型的 Context 支持；
+- Answer Correctness：最终结论是否符合外部 Ground Truth / Reference Answer；
+- Citation Accuracy：引用的具体来源是否真的支持对应断言。
+
+重点研究三类反例：“回答事实真实但当前证据不支持”“忠于提供的过期资料却与现行事实不符”“答案正确但引用了错误来源”。再分析如何结合确定性规则、人工标注和 LLM-as-Judge 构建可靠评测。**这里仅记录下轮提问方向，不提前写标准答案。**
