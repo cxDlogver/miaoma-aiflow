@@ -460,6 +460,174 @@ Hit@K 表示前 K 条是否至少命中一条正确证据；Recall@K 表示所�
 
 ---
 
-## 【下一题讨论方向：Context Construction 是否属于 RAG 评测体系】
+## 【第二题追问：Context Construction 是否也属于 RAG 评测】
 
-讨论初始检索结果与最终传入 LLM 的 Context 之间可能发生的证据裁剪、去重和截断，区分检索器输出的 Context Precision/Context Recall 与最终 Prompt 的证据覆盖。先理解评测对象，不立即扩展到完整 LLM 自动评测平台。
+### 【提问与结论】
+
+**是。Context（上下文）质量是完整 RAG 评测不可缺少的对象。**但需要先区分：
+
+- **Context Construction（上下文构建）**是系统实际执行的环节：它从检索候选中挑选、去重、补充、压缩、截断并组织 LLM 最终收到的证据文本。
+- **Context Evaluation（上下文评测）**是对检索所得材料或者最终模型输入的相关性、完整性和可用性进行评价。
+
+不同研究和评测框架对术语的归属不完全一致。Ragas 将 `Context Precision`、`Context Recall` 放在 RAG 相关评测指标中，通常用来衡量检索到的上下文是否有用；它们**不必然**意味着工程系统里有一个独立的名为 `ContextEvaluator` 的运行组件，也**不自动**覆盖最终 Prompt 组装导致的证据损失。必须先明确一个指标的输入数据来自哪个阶段。
+
+### 【知识概述：检索输出与最终 Context 是不同的数据对象】
+
+~~~text
+用户 Query
+  → 初始检索：返回一批候选 Chunk
+      │  评测：Evidence Recall@K（正确证据有没有进入候选）
+      ▼
+  → Fusion / Rerank：融合、重新排序
+      │  评测：MRR / nDCG（正确证据有没有排靠前）
+      ▼
+  → Context Construction：选择、去重、扩展、压缩、截断
+      │  评测：最终证据覆盖、引用可定位、Token 成本和冗余
+      ▼
+  → LLM Generation：依据最终 Context 生成回答
+         评测：Faithfulness（回答是否受 Context 支持）、
+               Answer Correctness（事实是否正确）
+~~~
+
+注意图中“初始检索返回候选”和“LLM 最终收到 Context”**不一定相同**。例如初始召回允许 50 条，而模型只接收重排后的 5 条；或者因 Token 预算只保留部分正文。Context 也可能添加来源标题、父章节说明或多个 Chunk 的合并文本，不能始终按原始 Chunk 个数衡量其内容。
+
+### 【同一问题：召回成功而上下文构建失败的完整过程】
+
+沿用前面的问题：“年假申请需要提前多久，由谁审批？”Ground Truth 仍是：
+
+~~~text
+C1：年假须提前三个工作日申请
+C2：年假由直属主管审批
+~~~
+
+假设：
+
+~~~text
+初始检索 Top-5：
+[C3, C1, C4, C2, C5]
+→ 包含 C1 与 C2；Evidence Recall@5 = 2/2 = 100%
+
+重排 Top-3：
+[C1, C2, C3]
+→ C1/C2 均在前两位；证据覆盖仍为 100%
+
+Context Construction：
+由于错误截断、错误去重或不当的 Token 预算策略，
+实际只组装了 C1 的正文
+→ 最终可用证据只支持“申请时限”
+→ 最终必要事实覆盖 = 1/2 = 50%
+
+LLM 收到的 Prompt：
+参考资料只有“年假须提前三个工作日申请”
+问题却同时询问“由谁审批”
+→ 无法从收到的资料确定审批人
+~~~
+
+这个例子只表示**人为构造的故障场景**。它证明检索器已经完成任务，不代表整个 RAG 链路能够完整回答。若此时仅调高 `hnsw_ef` 或增大初始 `topK`，并不会自动修正组装阶段丢弃 C2 的问题。
+
+| 阶段 | C1：时限 | C2：审批人 | 对两条必要事实的覆盖 |
+|---|---|---|---:|
+| 初始候选 Top-5 | 有 | 有 | 100% |
+| 重排后 Top-3 | 有 | 有 | 100% |
+| 最终送入 LLM 的 Context | 有 | 无 | 50% |
+
+需要把**能用于回答的证据是否保留**当成实际指标，而不是把 Query 相关主题的文本数量误当作覆盖度。
+
+### 【Context 的几种评价维度及边界】
+
+**第一类：相关性与排序质量。**最终组织的资料是否回答本次 Query？是否有大量“年假申请入口、病假证明”等与“时限+审批人”无关的片段？相关性通常可用二元或分级 Qrels 检验，检索排序可继续使用 Precision / nDCG 等指标。
+
+**第二类：必要证据覆盖。**最终 Context 能否支持问题中的每个必要事实？一种教学式的覆盖公式为：
+
+~~~text
+Final Context Fact Coverage
+  = （被最终 Context 支持的必要事实数）
+    / （该 Query 需要的必要事实总数）
+~~~
+
+例如两个事实只保留一个，则 `1/2=50%`。**这只是清晰定义后的工程自定义检查，不应冒充所有框架通用的 Context Recall 公式。**一条较大的父章节可能同时支持多个事实，不能直接用“保留了几个 Chunk”替代“支持几个事实”。
+
+**第三类：上下文预算与冗余。**片段即使都相关，重复段落、过长的父章节、无关 Metadata 也会占用 Token，导致重要证据被截断。应记录输入 Token 预算、实际上下文 Token 数、选择了哪些证据、因何丢弃哪些候选及是否发生截断。冗余与成本是工程观测项，不能仅凭某一条指标就推断模型答案质量。
+
+**第四类：引用与版本有效性。**最终 Context 中的每段事实能否回溯原 Document、版本、章节位置，以及调用者是否有权访问？版本失效和越权不能通过高相似度或相关性得分抵消。
+
+### 【Ragas 中 Context Precision 与 Context Recall 的含义】
+
+这里要区分**框架明确提供的指标**和**我们针对特定流水线自定义的验收指标**：
+
+| 评价名称 | 在 Ragas 中的典型含义 | 不能误解为 |
+|---|---|---|
+| Context Precision | 衡量检索结果中相关 Chunk 是否优先排在前面；其计算思想结合相关项出现位置的 `Precision@k` | 普通的 `相关条数 / 检索总条数` 就完全等同该指标 |
+| Context Recall | 参考答案中的必要断言是否能从所提供 Context 中找到支持；LLM-based 版本会分解参考答案的 Claims，再核对证据支持 | 任意场景下都只需对比 Chunk ID |
+| Final Context Coverage（本篇的检查） | 对齐固定的必要事实标注，检查最终实际输入 LLM 的材料是否覆盖这些事实 | 所有框架都有的统一标准化指标 |
+
+Ragas 官方 Context Recall 的基于断言计算思路是：
+
+~~~text
+Context Recall
+ = 参考答案中被检索上下文支持的断言数 / 参考答案中的断言总数
+~~~
+
+如果用户问题需要两个事实，最终 Context 只支持时限、不支持审批人，则该口径下可能是 1/2；但 LLM 评判器的断言抽取与支持判定可能发生错误，需要标注抽检和明确使用的评测版本。Ragas Context Precision 更接近强调排名的相关性评测，而**不是简单记录系统是否超出 Token 上限**。
+
+参考：[Ragas Context Precision](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/)、[Ragas Context Recall](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/)、[Ragas 指标列表](https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/)。
+
+### 【与答案生成评测的区别】
+
+Context 评测判断“模型**看到了什么**”；Faithfulness（答案忠实度）判断“模型**说出的断言有没有证据支持**”；Answer Correctness（答案正确性）进一步检查“回答是否符合真实事实和问题需求”。
+
+例如最终 Context 正确包含 C1/C2，模型却说“审批将在两小时内完成”，这个两小时的信息没有证据支持，属于生成阶段的 Faithfulness 问题。另一种情况是旧版政策被错误选入 Context，模型忠实引用旧版但结论过时，此时答案可能忠于 Context，却仍然不符合现行规则。**这两个问题需要追溯不同的失效阶段。**
+
+### 【项目实践：应该在哪里采集哪些数据】
+
+从已核对的妙码 AI Flow 源码，可以确认 [`VectorRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts) 和 [`HybridRetriever`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 返回有序 `RetrievalResult[]`，其中包含 `chunkId`、`documentId`、`content`、`score`。这能作为**检索器输出候选集**的观察点；仅凭这些文件，尚不能确认最终 Prompt 如何组装，也不能确认系统已把“实际发送给 LLM 的 Context”完整记录。
+
+因此以下属于**建议的可观测性设计，不是已完成的项目现状**：
+
+~~~typescript
+type RagEvaluationTrace = {
+  queryId: string
+  corpusVersion: string
+  retrieverMode: "vector" | "fulltext" | "hybrid"
+  retrievedChunkIds: string[]   // 初始召回的顺序与身份
+  rerankedChunkIds?: string[]   // 实际有重排时才记录
+  contextEvidenceIds: string[]  // 实际进入 LLM Context 的来源
+  contextTokenCount: number
+  droppedEvidence: Array<{
+    id: string
+    reason: "low-relevance" | "duplicate" | "token-budget" | "permission"
+  }>
+  promptVersion: string
+}
+~~~
+
+一次质量故障可以按顺序定位：
+
+1. **Retrieved Run 是否覆盖正确证据？**未覆盖时查解析、切分、Embedding、检索/ANN 与过滤。
+2. **重排后是否保留正确证据？**候选存在但被截断时查融合、Rerank、`topK` 策略。
+3. **最终 Context 中是否仍包含完整事实？**丢失时查去重、父子扩展、Token 预算与 Prompt 模板组装。
+4. **生成是否正确引用这些事实？**证据完整但答案错误时查模型生成及来源引用逻辑。
+
+项目实现上述 Trace 时，还应对敏感内容采取权限约束、采样与脱敏；测试并不要求把真实的全部私密文档原文都记录到日志中。
+
+### 【面试标准回答】
+
+Context 属于 RAG 的评测对象，但 Context Construction 是运行阶段，Context Evaluation 则评估这个阶段交付给 LLM 的资料是否相关、完整、可靠。检索器输出和最终 LLM 输入通常不相同：候选在融合、重排、去重、父章节扩展或 Token 截断过程中可能丢失证据。因此初始 Evidence Recall@K 很高，不代表最终 Context 一定能支持全部答案事实。
+
+应区分检索相关性与排序、最终 Context 的必要事实覆盖、Token 成本与冗余、来源版本和权限有效性。Ragas 的 Context Precision 通常衡量相关 Chunk 在检索列表中的排序质量，Context Recall 关注参考答案断言能否从提供的上下文找到支持；工程侧还可以单独记录最终 Context Fact Coverage、被丢弃证据及原因。
+
+最后，Context 完整也不保证生成正确，应继续区分 Faithfulness（生成是否受证据支持）与 Answer Correctness（事实与问题是否正确）。这样才能根据质量损失位置决定该优化检索、重排、上下文构建还是生成环节。
+
+### 【资料依据】
+
+1. Ragas：[Context Precision](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/)。
+2. Ragas：[Context Recall](https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/)。
+3. Ragas：[Available Metrics](https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/)。
+4. Qdrant：[Measuring Retrieval Relevance](https://qdrant.tech/documentation/search-evaluation/retrieval-relevance/) 与 [Evaluating Pipeline Output Quality](https://qdrant.tech/documentation/search-evaluation/pipeline-output-quality/)。
+5. 项目源码：[VectorRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/vector-retriever.ts)、[HybridRetriever](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)。
+
+---
+
+## 【下一题讨论方向：如何建立可靠的 RAG Ground Truth 评测数据集】
+
+围绕真实用户查询、人工标注和 LLM 辅助生成测试问题的角色分工，讨论 Qrels 的构建、相关性等级、标注不完整与数据偏差，以及语料、模型和评测数据版本如何统一。下一题先在对话中展开，讨论清楚后再整理写入，不提前将问题提纲当作标准答案。
