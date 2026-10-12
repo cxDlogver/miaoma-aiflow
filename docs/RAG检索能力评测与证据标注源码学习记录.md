@@ -3364,6 +3364,326 @@ Agentic RAG 则更侧重：
 
 ---
 
+## 【第八题追问四：RAG 的权限与有效性过滤应在离线建索引、检索中还是检索后执行】
+
+### 【提问】
+
+在 RAG 检索中，如果需要按照知识库/租户权限、文档状态、有效版本、生效时间等条件限制检索范围，这些条件通常在**离线入库时**处理，还是在**执行向量检索前/过程中**过滤，或应当先检索再由应用程序做**检索后过滤**？Qdrant 的 Payload Keyword Index 是如何发挥作用的？已有项目采取了什么机制？
+
+### 【结论与知识概述：离线建索引、在线定范围、检索时过滤、必要时检索后复核】
+
+这并非三个互斥方案，而是不同职责分层：
+
+| 阶段 | 目标 | 核心输入与操作 | 对最终证据的影响 |
+|---|---|---|---|
+| 离线文档入库/索引准备 | 提供可过滤的数据结构 | 将 `knowledgeBaseId`、`documentId`、`tenantId`、`status`、`effectiveFrom/To` 等适用字段写入 Payload，建立相应类型的 Payload Index | 为之后的高效过滤提供数据与索引，但不能替当前用户做授权决策 |
+| 在线查询发起前 | 计算本次合法访问范围 | 验证身份；读取后端的知识库/文档授权关系、当前有效版本与时间约束，构造查询 Filter | 得到当前调用者真正被允许访问的数据集合 |
+| Qdrant 检索执行期间 | 在 Filter 约束下求相关 Top-K | Query Vector 或 Sparse Query + Payload Filter，由 Qdrant 查询规划器选择执行策略 | 避免不合法候选先占据无过滤 Top-K，再被应用层删掉 |
+| 检索后、Rerank/Context 前 | 必要的二次校验 | 检查版本、文档是否失效、权限是否撤销、来源信息是否仍有效 | 增加一致性与安全保护，但不能取代检索期的范围约束 |
+
+**硬性授权和已知业务约束应尽量下推到检索请求中，而不是依赖“全库 Top-K → 后置删除”**。同时后置复核仍有意义，尤其用于处理动态授权与文档状态变更；如果复核失败，不能继续向 Reranker、LLM、前端或日志释放该证据。
+
+注意这里的“在线检索前”是指**先由业务层计算授权与过滤条件**；向量数据库内部并不一定按“先物化所有过滤后的 Point，再对它们启动 HNSW”的固定顺序执行。应从**逻辑约束**和**物理执行计划**两个层次理解。
+
+### 【概念边界：Payload、Payload Index、Filter 与向量索引分别做什么】
+
+假设 Point：
+
+~~~json
+{
+  "id": "point-001",
+  "vector": [0.12, 0.84, 0.23],
+  "payload": {
+    "chunkId": "doc-001_0",
+    "content": "员工应提前三个工作日申请年假。",
+    "knowledgeBaseId": "kb-A",
+    "documentId": "doc-001",
+    "tenantId": "tenant-01",
+    "status": "ACTIVE"
+  }
+}
+~~~
+
+上面的向量只是教学示例，实际维度与项目 Embedding 模型一致。
+
+- **Payload**：附在 Point 上的正文和业务属性，作为过滤表达式可访问的数据；存在 Payload **不自动等于**已为字段建立索引。
+- **Payload Index**：按字段类型为 Qdrant 的过滤和查询规划提供加速、基数估计及过滤式 HNSW 关联能力；例如 `keyword` 适合精确匹配的知识库 ID，不是对 `content` 做 BM25 倒排索引。
+- **Filter**：某次请求真正要执行的业务范围约束，例如当前用户仅可访问 `kb-A`；必须在在线 Query 中传入，**建立索引本身不代表自动启用该条件**。
+- **Dense HNSW / Sparse Index**：决定相似度/词项候选如何发现并排序；Payload Index 是与之协作的过滤机制，不是把过滤字段本身变成语义向量。
+
+重要澄清：将 `tenantId` 建立为 Payload Keyword Index，并不意味着给每位用户创建一个物理隔离的 Collection 或独立向量空间。共享 Collection 上的 Filter 首先提供**逻辑隔离**；是否采用 per-tenant 布局、`is_tenant` 优化、独立 Shard 或独立 Collection，是另一层有关隔离、性能与租户规模的架构决策。高隔离要求还应考虑服务端权限、密钥与数据部署边界。
+
+### 【Qdrant 如何把 Filter 与 HNSW 搜索结合起来】
+
+Qdrant 官方[Filtering in Vector Search](https://qdrant.tech/documentation/search-patterns/vector-search-filtering/)明确区分：
+
+- **纯后置过滤**：先执行无约束近邻搜索，截断 Top-K，再删除不满足条件的候选。它可能导致返回数量不足，且正确的合法候选根本未进入无约束 Top-K。
+- **朴素完全前置过滤**：先找到所有符合条件的 Point，再逐一精确计算向量距离。对匹配很少的情况可行，但过滤后集合较大时穷举开销可能很高。
+- **Qdrant 的检索中融合过滤**：结合 Payload Index、过滤条件及分段查询规划，可能直接评分少量过滤后的候选，也可能在 Filterable HNSW 上进行带约束的近邻搜索；具体执行路径与过滤基数、索引构建状态和配置有关。
+
+逻辑链路：
+
+~~~text
+查询者身份
+     ↓
+后端鉴权与权限计算
+     ↓
+授权的 KnowledgeBase/Document IDs、有效版本等
+     ↓
+[Query Embedding + Qdrant Payload Filter + topK]
+     ↓
+Qdrant Query Planner
+     ├─ 少量匹配候选：直接评分
+     └─ 大范围匹配：利用支持过滤的向量索引
+     ↓
+在过滤约束下返回相似候选 Top-K
+     ↓
+必要时进行失效/授权复核
+     ↓
+Fusion → Rerank → Context Construction → Generation
+~~~
+
+因此不能在面试中笼统回答“Qdrant 总是先过滤完所有文档，再去运行一次 HNSW”。正确表达是**在向量检索执行中施加 Filter 约束，并由 Qdrant 选择合适的搜索策略**。
+
+**过滤不意味着 ANN 一定变为精确搜索**：当采用近似 HNSW 时，严格 Filter、多个过滤条件的交集以及索引状态都可能影响 Recall 和延迟。可使用精确过滤向量搜索作为小样本基线，对比正常过滤式 HNSW 的 Recall@K 和 P95；部分 Qdrant 版本/部署支持 ACORN 等提高严格过滤场景召回的策略，应基于实际 Server 版本测试。
+
+### 【为什么不能先取全库 Top-K 再在应用端过滤：正确性与安全性】
+
+假设用户只允许访问知识库 A，查询返回上限为 `topK=3`，知识库 B 不可访问。全库原始相似度排序：
+
+| 全库名次 | Chunk | 知识库 | 当前用户是否有权 |
+|---:|---|---|---|
+| 1 | B1 | B | 否 |
+| 2 | B2 | B | 否 |
+| 3 | A1 | A | 是 |
+| 4 | B3 | B | 否 |
+| 5 | A2 | A | 是 |
+| 6 | A3 | A | 是 |
+
+错误方案：
+
+~~~text
+无过滤 Query → 全库 Top-3 = [B1, B2, A1]
+                         ↓
+                    应用层删除 B1/B2
+                         ↓
+                     最终仅 [A1]
+~~~
+
+虽然 A2/A3 合法且相关，但已在无过滤 Top-3 之外，被提前截断；返回仅一条而非请求的三条，损害**授权语料内的 Candidate Recall**。
+
+正确的查询约束：
+
+~~~text
+filter = { knowledgeBaseId in ["A"] }
+              ↓
+     在 A 范围内执行 Top-3
+              ↓
+          [A1, A2, A3]
+~~~
+
+这个例子是假设 A 中确实有三条候选的教学情况，实际 ANN Top-K 还受阈值和近似搜索影响。
+
+还有权限与信息流问题：无约束检索可能把 B 的 Payload 带回应用服务，并在调试日志、Reranker 或模型输入中产生不必要的越权处理风险。**所以应在服务端使用经过授权的 Filter 限制候选发现，不能仅在最后输出 HTML/JSON 前过滤**。
+
+后置验证仍然可以作为额外检查，例如检索执行期间某文档刚好被撤销或者文档发布状态变更；此时可丢弃失效候选并在合法范围内适度补检，但不能只依赖这种后续修复。
+
+### 【妙码 AI Flow 的源码现状：已建立两种 Keyword Index，在线只按知识库 ID 过滤】
+
+#### 【一、离线创建 Collection 与 Payload Index】
+
+[`packages/ai-engine/src/knowledge/store/qdrant-store.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts) 的 `ensureCollection()` 会在**新建 Collection** 后执行：
+
+~~~typescript
+await this.client.createPayloadIndex(
+  this.collectionName,
+  {
+    field_name: "knowledgeBaseId",
+    field_schema: "keyword",
+  },
+);
+
+await this.client.createPayloadIndex(
+  this.collectionName,
+  {
+    field_name: "documentId",
+    field_schema: "keyword",
+  },
+);
+~~~
+
+作用：
+
+- `knowledgeBaseId`：在 Dense Search 与 `textSearch()` 的 `scroll` 过滤中使用，限制检索范围；
+- `documentId`：在 `deleteByDocumentId()` 删除点数据的过滤等操作中使用，也方便后续文档级查询。**不能因为建立了该字段索引就声称当前 Dense Search 已经自动增加 `documentId` 查询过滤**。
+
+`upsertVectors()` 将 `chunkId/content/chunkIndex/documentId/knowledgeBaseId` 等作为 Point Payload 写入 Qdrant。这样离线将业务字段编码成可过滤的数据。
+
+**源码细节**：`ensureCollection()` 检查到 Collection 已存在时会提前返回。因此若对老 Collection 新增过滤字段索引或发现旧索引缺失，不能只调用此方法就假设索引已被自动补齐；应单独检查索引 Schema 并执行可重复的索引迁移/修复逻辑。
+
+Qdrant 官方建议在已知过滤字段时**优先在写入 Point 前建立 Payload Index**，让 Filterable HNSW 的过滤关联随着索引结构创建得更充分；如果先积累大规模数据、后来再补索引，可能需要重建 HNSW 相关结构才能得到相同的过滤性能。参见 [Production: Bulk Data Import](https://qdrant.tech/documentation/production-operations/bulk-data-import/)。
+
+#### 【二、业务 API 在线先判断知识库归属】
+
+[`apps/workflow/app/api/knowledge/[id]/search/route.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts) 首先：
+
+~~~typescript
+const userId = await getCurrentUserId();
+if (!userId) {
+  return apiError(ErrorCode.UNAUTHORIZED);
+}
+
+const knowledgeBase = await prisma.knowledgeBase.findFirst({
+  where: { id: knowledgeBaseId },
+});
+if (!knowledgeBase || knowledgeBase.userId !== userId) {
+  return apiError(ErrorCode.KNOWLEDGE_BASE_NOT_FOUND);
+}
+~~~
+
+即这条 API 在调用检索器之前，先核对用户身份及其对指定 Knowledge Base 的所有权，然后传入：
+
+~~~typescript
+const results = await retriever.retrieve({
+  query,
+  knowledgeBaseIds: [knowledgeBaseId],
+  mode,
+  topK,
+  threshold,
+  vectorWeight: knowledgeBase.vectorWeight,
+});
+~~~
+
+这说明 API 的权限边界并非依靠 Qdrant 自动识别当前用户，而是由**业务层核验之后，将合法的知识库 ID 作为检索过滤范围传入**。
+
+#### 【三、Qdrant 向量检索在 Query 内执行 Filter】
+
+同一个 `QdrantVectorStore.search()` 通过：
+
+~~~typescript
+const response = await this.client.search(
+  this.collectionName,
+  {
+    vector,
+    limit: topK,
+    score_threshold: threshold,
+    filter: {
+      must: [
+        {
+          key: "knowledgeBaseId",
+          match: { any: knowledgeBaseIds },
+        },
+      ],
+    },
+    with_payload: true,
+    with_vector: false,
+  },
+);
+~~~
+
+对结果施加 `knowledgeBaseId` 限制。当前的文本分支 `textSearch()` 虽然仍是 `scroll(limit:1000)` 后在 Node.js 进行字符串匹配，但 `scroll` 同样带有 `knowledgeBaseId` Filter；这不能被误写成真正 BM25 Sparse Search，也不能消除该分支只读第一页 1000 个 Point 的限制。
+
+**结论：此 API 的“业务侧所有权校验 + 向量库检索时字段过滤”是明确的现有机制**。但项目尚未实现 `tenantId`、文档有效时段、状态或复杂 ACL 字段的统一检索过滤体系，不能将建议架构描述为已交付。
+
+#### 【四、工作流知识节点的授权边界需要单独说明】
+
+[`packages/ai-engine/src/nodes/executors/knowledge-executor.ts`](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts) 使用工作流节点配置里的 `knowledgeBaseIds` 调用 Retriever，在该执行器自身的代码中检查了 ID 列表非空、Query 非空等，但**没有在该执行器内做与知识库搜索 API 相同的 `userId → knowledgeBase.userId` 所有权查询**。
+
+因此不能由“知识库搜索 API 安全”推断“所有工作流执行入口都已做同样授权”。应在所有运行入口/服务层统一保证传入执行器的是**按当前调用者授权确定的合法知识库集合**；更强的方案可把已验证的授权 Scope 当作不可由用户任意覆盖的运行时上下文，以避免节点配置绕过权限边界。
+
+### 【如果进一步增加生效时间、版本和细粒度 ACL，应怎样建模】
+
+可以将已知且稳定、需要用于高频查询过滤的字段放入 Payload；示例为未来改造结构：
+
+~~~typescript
+type KnowledgeChunkPayload = {
+  chunkId: string;
+  documentId: string;
+  knowledgeBaseId: string;
+  tenantId: string;
+  content: string;
+  status: "ACTIVE" | "ARCHIVED";
+  effectiveFrom?: string;
+  effectiveTo?: string;
+  version?: string;
+};
+~~~
+
+入库/维护阶段：
+
+- `keyword` 适于精确 ID、状态和版本匹配；
+- 日期或数值范围应使用适当的 `datetime`、`integer` 等字段索引及 `range` 条件；
+- 选择真正高频过滤字段建立索引，索引会增加存储/维护成本，且需匹配字段的值类型；
+- 文档发布、版本变动、权限撤销后应确保 Qdrant Payload 与业务权威数据源间的一致性，不应让旧 `ACTIVE` 状态无限期滞留。
+
+在线语义示意，**以下为新功能设计草案，不是当前代码**：
+
+~~~typescript
+const allowedKnowledgeBaseIds =
+  await authorizationService.getAllowedKnowledgeBaseIds(currentUser);
+
+const response = await client.query("knowledge_chunks", {
+  query: queryVector,
+  filter: {
+    must: [
+      {
+        key: "knowledgeBaseId",
+        match: { any: allowedKnowledgeBaseIds },
+      },
+      {
+        key: "status",
+        match: { value: "ACTIVE" },
+      },
+    ],
+  },
+  limit: topK,
+  with_payload: true,
+});
+~~~
+
+其中 `authorizationService` 是拟新增或复用的可信业务授权服务，而不是已有实现；若授权列表为空应直接拒绝/返回空，不可删除 Filter 退化为全库查询。
+
+对于生效日期，既要支持开始时间约束，也要考虑 `effectiveTo` 为空（长期有效）的语义；复杂范围条件必须根据具体的 Qdrant Filter Schema 显式表达，不要把日期字符串简单当成 Keyword 做字典序比较。
+
+**动态用户权限不宜全部当成静态 Payload**：例如用户加入/退出团队、权限变更、文档共享名单变动，真正的权限关系通常在业务数据库或授权服务中，以该权威数据源计算当前可见集合，再生成 Qdrant Filter。若 ACL 很复杂，可以考虑文档可见性物化或不同粒度的索引隔离设计，但必须平衡更新成本、查询选择性和安全性。
+
+### 【过滤与索引的工程验收】
+
+应同时衡量**访问控制正确性、授权语料中的检索质量以及性能**，而不只是响应是否有结果：
+
+| 检查 | 用例与方法 | 预期 |
+|---|---|---|
+| 用户隔离 | A/B 两个用户拥有不同 Knowledge Base，相同 Query | A 无法获取 B 的 Chunk 内容或来源 Metadata |
+| 文档状态 | ACTIVE/ARCHIVED 两个版本同时留在存储 | 本次请求只检索当前许可且生效的版本 |
+| 精确范围与后置过滤对照 | 教学情形：全库前 K 被大量越权数据占据 | 检索期 Filter 不会先让越权候选占据 Top-K |
+| ANN 近似误差 | 选取严格过滤 Query，对比精确评分与普通 Qdrant 搜索 | 检查过滤范围内的 Recall@K 与 P95，必要时调整索引/参数 |
+| 撤权/版本变更 | 查询期间修改权限或文档状态 | 不释放过期越权证据，必要时失败关闭、复核与补检 |
+| 多入口一致性 | 管理 API、工作流知识节点、批处理调用 | 相同调用者授权 Scope 可解释、一致且不会被任意扩大 |
+| 索引维护 | 新 Collection 创建、已有 Collection 迁移 | 检查字段索引存在、类型正确、索引构建状态可追踪 |
+
+注意：`Payload Index` 能改善过滤检索性能，但本身**不等于访问控制系统**；访问控制由受信任的服务端鉴权与 Filter 构造实现，并应避免将 Qdrant 无约束查询能力直接暴露给不可信调用者。
+
+### 【面试标准回答】
+
+在 RAG 系统中，权限与文档有效性过滤通常采用**离线建索引、在线检索时约束和检索后必要复核**的分层模式。离线入库时将知识库/租户 ID、文档状态、生效范围、版本等字段写入 Payload，并针对高频过滤字段创建 Payload Index；在线由服务端验证用户身份与授权，生成 Filter，与 Query Vector 一起提交给 Qdrant。
+
+Qdrant 可以结合 Payload Index 和 Filterable HNSW，把过滤约束纳入近邻搜索执行；查询规划器依据匹配量选择对少量候选直接评分或在过滤式 HNSW 上搜索，并非固定“先把所有文档过滤完，再启动一次 HNSW”。相比“全库 Top-K 后应用层删除”，检索时 Filter 可以避免不合法候选先挤占 Top-K，减少无效数据处理，也有利于保障授权语料下的召回质量。
+
+妙码 AI Flow 现已对 `knowledgeBaseId` 和 `documentId` 建立 Keyword Payload Index；知识库搜索 API 先核对知识库归属，再把合法 `knowledgeBaseId` 下推给向量检索及文本 `scroll` 分支。工作流 KnowledgeExecutor 本身未重复执行用户所有权校验，需要依赖受信任的运行入口统一保证其知识库 ID 范围。未来扩展有效版本和动态 ACL 时，应在可靠授权数据源上计算过滤约束，检索后对撤权、失效和来源进行必要复核，但不应把后置检查作为唯一控制。
+
+**一句话：离线准备索引，在线计算授权范围，向量检索中执行 Filter，使用证据前必要时复核；Payload Index 是加速与查询规划工具，不是自动授权或独立向量空间。**
+
+### 【参考资料与源码】
+
+1. [Qdrant：Filtering in Vector Search—Filter During the Search, Not Before or After](https://qdrant.tech/documentation/search-patterns/vector-search-filtering/)：过滤时机、Filterable HNSW 与基数感知策略。
+2. [Qdrant：Bulk Data Import—Create Payload Indexes Before Uploading](https://qdrant.tech/documentation/production-operations/bulk-data-import/)：先建索引和过滤式 HNSW 关联的性能影响。
+3. [Qdrant：Filtering and Exact String Matching](https://qdrant.tech/documentation/search/text-search/text-filtering/)：Keyword Index 的准确职责。
+4. [Qdrant：Production Checklist](https://qdrant.tech/documentation/production-checklist/)：过滤索引与查询优化建议。
+5. [Qdrant：FAQ（Logical Separation、Per-tenant Index、Sharding）](https://qdrant.tech/documentation/faq/)：共享 Collection 中的逻辑隔离与更强隔离设计的区别。
+6. 项目：[Qdrant Store](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/knowledge/store/qdrant-store.ts)、[知识库搜索 API](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts)、[KnowledgeExecutor](https://github.com/cxDlogver/miaoma-aiflow/blob/main/packages/ai-engine/src/nodes/executors/knowledge-executor.ts)、[document-processor.ts](https://github.com/cxDlogver/miaoma-aiflow/blob/main/apps/workflow/lib/services/document-processor.ts)。
+
+---
+
 ## 【下一题讨论方向：如何评价 RAG 最终生成答案的正确性、忠实性和引用准确性】
 
 下一题在 Retrieval → Fusion → Rerank → Context Construction → Generation 的闭环基础上区分：
