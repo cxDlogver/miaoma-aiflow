@@ -13,6 +13,7 @@ cd miaoma-aiflow
 
 ## 文档
 
+- [RAG 知识库构建与向量检索源码学习记录](docs/RAG知识库构建与向量检索源码学习记录.md)
 - [企业知识库 RAG 全链路使用与答辩手册](docs/妙码AI-Flow企业知识库RAG全链路使用与答辩手册.md)
 - [需求分析、项目架构与工作流编辑器](docs/1.需求分析、项目架构设计与工作流引擎编辑器核心剖析.md)
 - [大模型、LangChain.js 与 LangGraph.js](<docs/2.大模型基础、LangChainjs 与 Langgraphjs 框架进阶.md>)
