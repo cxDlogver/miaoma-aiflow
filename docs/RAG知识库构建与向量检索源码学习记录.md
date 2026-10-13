@@ -2110,4 +2110,4 @@ Qdrant 的多个 Segment 独立搜索并聚合为全局 Top-K。完整获取各�
 
 ## 【下一题：Hybrid Search、BM25 与 RRF】
 
-讨论关键词与语义检索为什么需要互补，BM25 的词频、逆文档频率和长度归一化机制，以及 RRF 如何融合不同检索通道的排序；结合妙码 AI Flow 的 textSearch() 判断当前实现与真正 BM25 的差别。
+讨论关键词与语义检索的互补、BM25 的词频/IDF/长度归一化以及 RRF 如何融合不同检索通道。**妙码 AI Flow 在 2026-10-13 的多空间改造中已使用 Qdrant 原生 BM25，旧版 textSearch() 的 scroll 扫描属于历史实现**。完整现行源码分析衔接：[多 Embedding 模型知识库构建与跨空间检索完整分析](./RAG多Embedding模型知识库隔离与跨模型检索设计分析.md)。
