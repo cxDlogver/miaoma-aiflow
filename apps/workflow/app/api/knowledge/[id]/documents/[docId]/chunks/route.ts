@@ -25,7 +25,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
 
         // 检查知识库是否存在且属于当前用户
         const knowledgeBase = await prisma.knowledgeBase.findFirst({
-            where: { id: knowledgeBaseId },
+            where: { id: knowledgeBaseId, deletedAt: null },
+            include: { activeIndex: { include: { embeddingSpace: true } } },
         })
 
         if (!knowledgeBase) {
@@ -40,6 +41,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         const document = await prisma.document.findFirst({
             where: {
                 id: docId,
+                deletedAt: null,
                 knowledgeBaseId,
             },
         })
@@ -48,14 +50,28 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
             return apiError(ErrorCode.DOCUMENT_NOT_FOUND)
         }
 
+        const index = knowledgeBase.activeIndex
+        if (!index || index.status !== 'READY') return apiError(ErrorCode.VALIDATION_ERROR, '索引尚未就绪，请重建索引')
+        const documentIndex = await prisma.documentIndex.findFirst({
+            where: { documentId: docId, knowledgeBaseIndexId: index.id, status: 'READY' },
+        })
+        if (!documentIndex) return apiError(ErrorCode.VALIDATION_ERROR, '文档索引尚未完成')
+        const cursor = request.nextUrl.searchParams.get('cursor')
+        if (cursor && !/^[0-9a-f-]{36}$/i.test(cursor)) return apiError(ErrorCode.VALIDATION_ERROR, '分页游标无效')
+
         // 从 Qdrant 获取切片（包含向量）
         const client = new QdrantClient({
             url: process.env.QDRANT_URL || 'http://localhost:6333',
         })
 
-        const response = await client.scroll('knowledge_chunks', {
+        const response = await client.scroll(index.embeddingSpace.collectionName, {
+            offset: cursor || undefined,
             filter: {
-                must: [{ key: 'documentId', match: { value: docId } }],
+                must: [
+                    { key: 'documentIndexId', match: { value: documentIndex.id } },
+                    { key: 'indexId', match: { value: index.id } },
+                    { key: 'knowledgeBaseId', match: { value: knowledgeBaseId } },
+                ],
             },
             limit: 100,
             with_payload: true,
@@ -65,7 +81,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         // 格式化切片数据，包含 embedding 统计信息
         const chunks = response.points
             .map(point => {
-                const vector = point.vector as number[] | undefined
+                const vector = (point.vector && !Array.isArray(point.vector) ? point.vector.dense : point.vector) as number[] | undefined
                 let embeddingStats = null
 
                 if (vector && Array.isArray(vector)) {
@@ -107,13 +123,14 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         return apiSuccess({
             documentId: docId,
             documentName: document.name,
-            total: chunks.length,
+            total: documentIndex.chunkCount,
+            nextCursor: response.next_page_offset == null ? null : String(response.next_page_offset),
             // 文档级别的统计
             documentStats: {
                 totalChars: chunks.reduce((sum, c) => sum + c.charCount, 0),
                 totalWords: chunks.reduce((sum, c) => sum + c.wordCount, 0),
-                embeddingModel: knowledgeBase.embeddingModel,
-                embeddingDimensions: knowledgeBase.dimensions,
+                embeddingModel: index.embeddingSpace.model,
+                embeddingDimensions: index.embeddingSpace.dimensions,
             },
             chunks,
         })

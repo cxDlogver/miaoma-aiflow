@@ -3,13 +3,13 @@
  *   All rights reserved.
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
  */
-
 import { NextRequest } from 'next/server'
 import { z } from 'zod'
 
 import { apiError, apiSuccess, ErrorCode, handleApiError } from '@/lib/api-response'
 import { getCurrentUserId } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
+import { rebuildKnowledgeBase, scheduleKnowledgeDeletion } from '@/lib/services/knowledge-index-service'
 
 /**
  * GET /api/knowledge/[id] - 获取知识库详情
@@ -24,7 +24,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         const { id } = await params
 
         const knowledgeBase = await prisma.knowledgeBase.findFirst({
-            where: { id },
+            where: { id, deletedAt: null },
         })
 
         if (!knowledgeBase) {
@@ -73,6 +73,9 @@ const updateKnowledgeBaseSchema = z.object({
     name: z.string().min(1).max(50).optional(),
     description: z.string().max(200).optional(),
     icon: z.string().optional(),
+    embeddingProvider: z.literal('ollama').optional(),
+    embeddingModel: z.string().min(1).max(120).optional(),
+    dimensions: z.number().int().min(1).max(32768).optional(),
     // 切分配置
     chunkSize: z.number().min(100).max(2000).optional(),
     chunkOverlap: z.number().min(0).max(500).optional(),
@@ -100,7 +103,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 
         // 检查知识库是否存在且属于当前用户
         const existingKb = await prisma.knowledgeBase.findFirst({
-            where: { id },
+            where: { id, deletedAt: null },
         })
 
         if (!existingKb) {
@@ -109,6 +112,12 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 
         if (existingKb.userId !== userId) {
             return apiError(ErrorCode.KNOWLEDGE_BASE_NOT_FOUND, '无权修改此知识库')
+        }
+
+        const indexFields = ['embeddingModel', 'embeddingProvider', 'dimensions', 'chunkSize', 'chunkOverlap'] as const
+        if (indexFields.some(field => result.data[field] !== undefined && result.data[field] !== existingKb[field])) {
+            const kb = await rebuildKnowledgeBase(id, userId, result.data)
+            return apiSuccess(kb, '配置已更新，索引正在重建')
         }
 
         // 构建更新数据
@@ -128,7 +137,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 
         // 更新知识库
         const knowledgeBase = await prisma.knowledgeBase.update({
-            where: { id },
+            where: { id, deletedAt: null },
             data: updateData,
         })
 
@@ -138,6 +147,9 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
                 name: knowledgeBase.name,
                 description: knowledgeBase.description,
                 icon: knowledgeBase.icon,
+                embeddingModel: knowledgeBase.embeddingModel,
+                embeddingProvider: knowledgeBase.embeddingProvider,
+                dimensions: knowledgeBase.dimensions,
                 retrievalMode: knowledgeBase.retrievalMode,
                 vectorWeight: knowledgeBase.vectorWeight,
                 topK: knowledgeBase.topK,
@@ -170,7 +182,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
 
         // 检查知识库是否存在且属于当前用户
         const existingKb = await prisma.knowledgeBase.findFirst({
-            where: { id },
+            where: { id, deletedAt: null },
         })
 
         if (!existingKb) {
@@ -181,14 +193,8 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
             return apiError(ErrorCode.KNOWLEDGE_BASE_NOT_FOUND, '无权删除此知识库')
         }
 
-        // 删除知识库（级联删除文档）
-        await prisma.knowledgeBase.delete({
-            where: { id },
-        })
-
-        // TODO: 同时删除 Qdrant 中的向量数据
-
-        return apiSuccess({ id }, '知识库删除成功')
+        const deleted = await scheduleKnowledgeDeletion(id, userId)
+        return apiSuccess(deleted, '知识库已删除，向量清理已排队')
     } catch (error) {
         return handleApiError(error)
     }

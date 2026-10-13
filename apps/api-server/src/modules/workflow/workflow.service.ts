@@ -3,13 +3,13 @@
  *   All rights reserved.
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
  */
-
 import { createWorkflowEngine, type ExecutionLogEntry, type WorkflowDefinition } from '@miaoma-aiflow/ai-engine'
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { randomUUID } from 'crypto'
 
 import { PrismaService } from '../../prisma/prisma.service'
 import type { RunWorkflowDto, WorkflowExecutionResultDto } from './dto/run-workflow.dto'
+import { createKnowledgeRetrievalService } from './knowledge-retrieval'
 
 // SSE 事件类型
 export interface SSEEvent {
@@ -50,7 +50,7 @@ export class WorkflowService {
 
         // 获取发布的应用版本
         const publishedApp = await this.prisma.publishedApp.findUnique({
-            where: { id: activePublishedId },
+            where: { id: activePublishedId, appId },
         })
 
         if (!publishedApp) {
@@ -80,6 +80,11 @@ export class WorkflowService {
 
             // 创建工作流引擎
             const engine = createWorkflowEngine({
+                knowledgeRetrieval: createKnowledgeRetrievalService(this.prisma, {
+                    kind: 'published',
+                    appId,
+                    publishedAppId: publishedApp.id,
+                }),
                 ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
                 verbose: process.env.NODE_ENV === 'development',
             })
@@ -162,7 +167,7 @@ export class WorkflowService {
 
         // 获取发布的应用版本
         const publishedApp = await this.prisma.publishedApp.findUnique({
-            where: { id: activePublishedId },
+            where: { id: activePublishedId, appId },
         })
 
         if (!publishedApp) {
@@ -193,6 +198,11 @@ export class WorkflowService {
 
             // 创建工作流引擎
             const engine = createWorkflowEngine({
+                knowledgeRetrieval: createKnowledgeRetrievalService(this.prisma, {
+                    kind: 'published',
+                    appId,
+                    publishedAppId: publishedApp.id,
+                }),
                 ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
                 verbose: true,
             })

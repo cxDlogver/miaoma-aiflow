@@ -1,3 +1,4 @@
+import type { KnowledgeRetrievalService } from '../knowledge/types'
 /*
  *   Copyright (c) 2026 妙码学院 @Heyi
  *   All rights reserved.
@@ -24,7 +25,7 @@ import { NodeRegistry } from './registry'
 /**
  * 创建默认注册中心（包含所有内置节点）
  */
-export function createDefaultRegistry(): NodeRegistry {
+export function createDefaultRegistry(options?: { knowledgeRetrieval?: KnowledgeRetrievalService }): NodeRegistry {
     const registry = new NodeRegistry()
 
     // 注册内置节点执行器
@@ -33,7 +34,7 @@ export function createDefaultRegistry(): NodeRegistry {
     registry.register('http', new HTTPExecutor())
     registry.register('condition', new ConditionExecutor())
     registry.register('end', new EndExecutor())
-    registry.register('knowledge', new KnowledgeExecutor())
+    registry.register('knowledge', new KnowledgeExecutor(options?.knowledgeRetrieval))
 
     return registry
 }

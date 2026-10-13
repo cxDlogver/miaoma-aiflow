@@ -4,7 +4,7 @@
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
  */
 
-import { createHybridRetriever, createOllamaEmbeddingService, createQdrantVectorStore } from '../../knowledge'
+import type { KnowledgeRetrievalService } from '../../knowledge'
 import type { ExecutionContext, ExecutionLogger, KnowledgeNodeConfig, NodeExecutionResult, OutputVariableSchema } from '../../types'
 import { BaseNodeExecutor } from '../base-executor'
 
@@ -27,16 +27,8 @@ interface RetrievalResultItem {
 export class KnowledgeExecutor extends BaseNodeExecutor<KnowledgeNodeConfig> {
     readonly type = 'knowledge' as const
 
-    // 知识库配置（可通过环境变量或配置注入）
-    private qdrantUrl: string
-    private embeddingModel: string
-    private embeddingDimensions: number
-
-    constructor(options?: { qdrantUrl?: string; embeddingModel?: string; embeddingDimensions?: number }) {
+    constructor(private readonly retrievalService?: KnowledgeRetrievalService) {
         super()
-        this.qdrantUrl = options?.qdrantUrl || process.env.QDRANT_URL || 'http://localhost:6333'
-        this.embeddingModel = options?.embeddingModel || 'mxbai-embed-large:latest'
-        this.embeddingDimensions = options?.embeddingDimensions || 1024
     }
 
     protected async doExecute(
@@ -64,33 +56,8 @@ export class KnowledgeExecutor extends BaseNodeExecutor<KnowledgeNodeConfig> {
 
         const startTime = Date.now()
 
-        // 初始化服务
-        const embeddingService = createOllamaEmbeddingService({
-            model: this.embeddingModel,
-            dimensions: this.embeddingDimensions,
-        })
-
-        const vectorStore = createQdrantVectorStore({
-            url: this.qdrantUrl,
-            collectionName: 'knowledge_chunks',
-        })
-
-        // 创建全文检索提供者
-        const fulltextProvider = {
-            async search(options: { query: string; knowledgeBaseIds: string[]; topK: number }) {
-                const results = await (vectorStore as any).textSearch({
-                    query: options.query,
-                    knowledgeBaseIds: options.knowledgeBaseIds,
-                    topK: options.topK,
-                })
-                return results
-            },
-        }
-
-        const retriever = createHybridRetriever(embeddingService, vectorStore, fulltextProvider)
-
-        // 执行检索
-        const results = await retriever.retrieve({
+        if (!this.retrievalService) throw new Error('Authorized knowledge retrieval service is not configured')
+        const results = await this.retrievalService.retrieve({
             query: query.trim(),
             knowledgeBaseIds,
             mode: retrievalMode,
@@ -105,14 +72,7 @@ export class KnowledgeExecutor extends BaseNodeExecutor<KnowledgeNodeConfig> {
         let resultsData: RetrievalResultItem[]
 
         // eslint-disable-next-line prefer-const
-        resultsData = results.map(r => ({
-            chunkId: r.chunkId,
-            content: r.content,
-            score: r.score,
-            chunkIndex: r.chunkIndex,
-            documentId: r.documentId,
-            knowledgeBaseId: r.knowledgeBaseId,
-        }))
+        resultsData = results.map(r => ({ ...r }))
 
         if (outputFormat === 'text') {
             // 文本格式：将所有内容拼接

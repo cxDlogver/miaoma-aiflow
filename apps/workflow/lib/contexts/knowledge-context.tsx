@@ -5,9 +5,9 @@
  */
 'use client'
 
-import { createContext, useCallback, useContext, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useState } from 'react'
 
-import type { KnowledgeBaseDetail } from '@/lib/services/knowledge-service'
+import { type KnowledgeBaseDetail, knowledgeService } from '@/lib/services/knowledge-service'
 
 interface KnowledgeContextType {
     knowledgeBase: KnowledgeBaseDetail | null
@@ -21,14 +21,41 @@ const KnowledgeContext = createContext<KnowledgeContextType | undefined>(undefin
 export function KnowledgeProvider({ children }: { children: React.ReactNode }) {
     const [knowledgeBase, setKnowledgeBase] = useState<KnowledgeBaseDetail | null>(null)
     const [isRefreshing, setIsRefreshing] = useState(false)
-    const [refreshCount, setRefreshCount] = useState(0)
 
     const refreshKnowledgeBase = useCallback(() => {
         setIsRefreshing(true)
-        setRefreshCount(c => c + 1)
         // isRefreshing will be set to false by the consumer after fetching
         setTimeout(() => setIsRefreshing(false), 100)
     }, [])
+
+    useEffect(() => {
+        const id = knowledgeBase?.id
+        if (!id || !['INDEXING', 'ERROR'].includes(knowledgeBase.status)) return
+        let cancelled = false
+        const timer = setInterval(() => {
+            void knowledgeService
+                .getById(id)
+                .then(updated => {
+                    if (!cancelled)
+                        setKnowledgeBase(current =>
+                            current?.id === id
+                                ? {
+                                      ...current,
+                                      status: updated.status,
+                                      documentCount: updated.documentCount,
+                                      chunkCount: updated.chunkCount,
+                                      updatedAt: updated.updatedAt,
+                                  }
+                                : current
+                        )
+                })
+                .catch(() => {})
+        }, 5000)
+        return () => {
+            cancelled = true
+            clearInterval(timer)
+        }
+    }, [knowledgeBase?.id, knowledgeBase?.status])
 
     return (
         <KnowledgeContext.Provider

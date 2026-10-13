@@ -117,10 +117,17 @@ export function SearchTest() {
                 {/* 相似度阈值 */}
                 <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                        <Label>相似度阈值</Label>
+                        <Label>Dense 相似度阈值</Label>
                         <span className="text-sm text-muted-foreground">{threshold.toFixed(2)}</span>
                     </div>
-                    <Slider value={[threshold]} onValueChange={([v]: number[]) => setThreshold(v)} min={0} max={1} step={0.05} />
+                    <Slider
+                        value={[threshold]}
+                        onValueChange={([v]: number[]) => setThreshold(v)}
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        disabled={mode === 'fulltext'}
+                    />
                 </div>
 
                 {/* 搜索按钮 */}
@@ -183,7 +190,11 @@ export function SearchTest() {
                                             <div className="flex items-center gap-2 text-sm">
                                                 <span className="text-muted-foreground">切片 #{item.chunkIndex + 1}</span>
                                                 <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-600">
-                                                    {(item.score * 100).toFixed(1)}%
+                                                    {item.scoreType === 'bm25'
+                                                        ? 'BM25 ' + item.score.toFixed(3)
+                                                        : item.scoreType === 'rrf'
+                                                          ? 'RRF ' + item.score.toFixed(5)
+                                                          : 'Cosine ' + item.score.toFixed(3)}
                                                 </span>
                                             </div>
                                         </div>

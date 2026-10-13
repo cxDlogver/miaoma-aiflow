@@ -12,133 +12,110 @@ import {
     createTextSplitter,
 } from '@miaoma-aiflow/ai-engine'
 
+import type { Prisma } from '@/app/generated/prisma/client'
 import { prisma } from '@/lib/prisma'
 
-interface ProcessDocumentParams {
-    documentId: string
-    knowledgeBaseId: string
-    content: string
-    fileName: string
-    chunkSize: number
-    chunkOverlap: number
-    embeddingModel: string
-    dimensions: number
-}
+import { lockKnowledgeBase, refreshKnowledgeCounts } from './knowledge-index-service'
 
-/**
- * 处理文档：切分、嵌入、存储到 Qdrant
- */
-export async function processDocument(params: ProcessDocumentParams): Promise<void> {
-    const { documentId, knowledgeBaseId, content, fileName, chunkSize, chunkOverlap, embeddingModel, dimensions } = params
-
-    try {
-        // 更新状态为处理中
-        await prisma.document.update({
-            where: { id: documentId },
-            data: { status: 'PROCESSING' },
-        })
-
-        // 1. 切分文档
-        const isMarkdown = fileName.endsWith('.md') || fileName.endsWith('.markdown')
-        const splitter = isMarkdown ? createMarkdownSplitter({ chunkSize, chunkOverlap }) : createTextSplitter({ chunkSize, chunkOverlap })
-
-        const chunks = splitter.split(content)
-
-        if (chunks.length === 0) {
-            throw new Error('文档内容为空或无法切分')
-        }
-
-        // 2. 生成嵌入向量
-        const embeddingService = createOllamaEmbeddingService({
-            model: embeddingModel,
-            dimensions,
-        })
-
-        const chunkTexts = chunks.map(c => c.content)
-        const embeddings = await embeddingService.embedTexts(chunkTexts)
-
-        // 入库前校验：Chunk 与 Embedding 必须一一对应，避免下标错配或无效向量入库。
-        if (embeddings.length !== chunks.length) {
-            throw new Error(`Embedding 数量不匹配：预期 ${chunks.length}，实际 ${embeddings.length}`)
-        }
-
-        embeddings.forEach((vector, index) => {
-            if (!Array.isArray(vector) || vector.length !== dimensions) {
-                throw new Error(`第 ${index} 个 Chunk 的向量维度无效：预期 ${dimensions}，实际 ${vector?.length ?? 0}`)
-            }
-
-            if (vector.some(value => !Number.isFinite(value))) {
-                throw new Error(`第 ${index} 个 Chunk 的向量包含非有限数值`)
-            }
-
-            if (vector.every(value => value === 0)) {
-                throw new Error(`第 ${index} 个 Chunk 的向量为全零向量，无法用于余弦相似度检索`)
-            }
-        })
-
-        // 3. 存储到 Qdrant
-        const vectorStore = createQdrantVectorStore({
-            url: process.env.QDRANT_URL || 'http://localhost:6333',
-            collectionName: 'knowledge_chunks',
-        })
-
-        // 确保 collection 存在
-        await vectorStore.ensureCollection(dimensions)
-
-        // 准备向量数据 - 使用正确的 ChunkWithVector 格式
-        const vectorChunks: ChunkWithVector[] = chunks.map((chunk, idx) => ({
-            id: `${documentId}_${idx}`,
-            content: chunk.content,
-            index: chunk.index,
-            startOffset: chunk.startOffset,
-            endOffset: chunk.endOffset,
-            documentId,
-            knowledgeBaseId,
-            vector: embeddings[idx],
-            metadata: chunk.metadata,
-        }))
-
-        // 存储向量
-        await vectorStore.upsertVectors(vectorChunks)
-
-        // 4. 更新文档状态
-        await prisma.document.update({
-            where: { id: documentId },
-            data: {
-                status: 'COMPLETED',
-                chunkCount: chunks.length,
-                processedAt: new Date(),
-            },
-        })
-
-        // 5. 更新知识库切片计数
-        await prisma.knowledgeBase.update({
+export async function maybeActivateIndex(tx: Prisma.TransactionClient, knowledgeBaseId: string) {
+    const kb = await tx.knowledgeBase.findUnique({ where: { id: knowledgeBaseId }, include: { activeIndex: true } })
+    if (!kb || kb.deletedAt || !kb.activeIndex) return
+    const index = kb.activeIndex
+    const count = await tx.document.count({ where: { knowledgeBaseId, deletedAt: null } })
+    const ready = await tx.documentIndex.count({
+        where: { knowledgeBaseIndexId: index.id, status: 'READY', document: { deletedAt: null } },
+    })
+    if (ready === count && (index.status === 'BUILDING' || index.status === 'FAILED')) {
+        await tx.knowledgeBaseIndex.update({ where: { id: index.id }, data: { status: 'READY', activatedAt: new Date() } })
+        await tx.knowledgeBase.update({ where: { id: knowledgeBaseId }, data: { status: 'READY' } })
+    } else if (index.status === 'READY') {
+        const failed = await tx.document.count({ where: { knowledgeBaseId, deletedAt: null, status: 'ERROR' } })
+        const pending = await tx.document.count({ where: { knowledgeBaseId, deletedAt: null, status: { in: ['PENDING', 'PROCESSING'] } } })
+        await tx.knowledgeBase.update({
             where: { id: knowledgeBaseId },
-            data: {
-                chunkCount: { increment: chunks.length },
-            },
+            data: { status: failed ? 'ERROR' : pending ? 'INDEXING' : 'READY' },
         })
-    } catch (error) {
-        // 更新状态为失败
-        await prisma.document.update({
-            where: { id: documentId },
-            data: {
-                status: 'ERROR',
-                errorMessage: error instanceof Error ? error.message : '处理失败',
-            },
-        })
-        throw error
     }
 }
 
-/**
- * 删除文档的向量数据
- */
-export async function deleteDocumentVectors(documentId: string): Promise<void> {
-    const vectorStore = createQdrantVectorStore({
-        url: process.env.QDRANT_URL || 'http://localhost:6333',
-        collectionName: 'knowledge_chunks',
+/** 任务固定 DocumentIndex；重试与配置变更不会改写其他索引的 Point。 */
+export async function processDocument(
+    documentIndexId: string,
+    assertLease: (tx?: Prisma.TransactionClient) => Promise<void> = async () => {}
+) {
+    const entry = await prisma.documentIndex.findUnique({
+        where: { id: documentIndexId },
+        include: {
+            document: true,
+            knowledgeBaseIndex: { include: { embeddingSpace: true, knowledgeBase: true } },
+        },
     })
-
-    await vectorStore.deleteByDocumentId(documentId)
+    if (!entry) return
+    const { document, knowledgeBaseIndex: index } = entry
+    const kb = index.knowledgeBase
+    const space = index.embeddingSpace
+    const store = createQdrantVectorStore({ url: process.env.QDRANT_URL ?? 'http://localhost:6333', collectionName: space.collectionName })
+    if (document.deletedAt || kb.deletedAt || kb.activeIndexId !== index.id || index.status === 'RETIRED') {
+        await store.deleteByDocumentIndexId(entry.id)
+        return
+    }
+    await assertLease()
+    await prisma.$transaction(async tx => {
+        await lockKnowledgeBase(tx, kb.id)
+        await assertLease(tx)
+        const current = await tx.knowledgeBase.findUnique({ where: { id: kb.id } })
+        if (!current || current.deletedAt || current.activeIndexId !== index.id) throw new Error('Index changed before processing')
+        await tx.documentIndex.update({ where: { id: entry.id }, data: { status: 'RUNNING', errorMessage: null } })
+        await tx.document.updateMany({ where: { id: document.id, deletedAt: null }, data: { status: 'PROCESSING', errorMessage: null } })
+    })
+    if (!document.content?.trim()) throw new Error('文档没有可重建的文本内容')
+    const config = { chunkSize: index.chunkSize, chunkOverlap: index.chunkOverlap }
+    const splitter = /\.(md|markdown)$/i.test(document.originalName) ? createMarkdownSplitter(config) : createTextSplitter(config)
+    const chunks = splitter.split(document.content)
+    if (!chunks.length) throw new Error('文档无法切分')
+    const embedding = createOllamaEmbeddingService({
+        model: space.model,
+        modelRevision: space.modelRevision,
+        dimensions: space.dimensions,
+        baseUrl: process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434',
+    })
+    const vectors: number[][] = []
+    for (let offset = 0; offset < chunks.length; offset += 16) {
+        await assertLease()
+        vectors.push(...(await embedding.embedTexts(chunks.slice(offset, offset + 16).map(c => c.content))))
+    }
+    if (vectors.length !== chunks.length) throw new Error('Embedding count mismatch')
+    await assertLease()
+    await store.ensureCollection(space.dimensions)
+    await store.deleteByDocumentIndexId(entry.id)
+    const points: ChunkWithVector[] = chunks.map((chunk, ordinal) => ({
+        ...chunk,
+        id: entry.id + '_' + ordinal,
+        documentId: document.id,
+        knowledgeBaseId: kb.id,
+        indexId: index.id,
+        documentIndexId: entry.id,
+        vector: vectors[ordinal]!,
+    }))
+    await store.upsertVectors(points)
+    await assertLease()
+    let discarded = false
+    await prisma.$transaction(async tx => {
+        await lockKnowledgeBase(tx, kb.id)
+        await assertLease(tx)
+        const currentKb = await tx.knowledgeBase.findUnique({ where: { id: kb.id } })
+        const currentDoc = await tx.document.findUnique({ where: { id: document.id } })
+        if (!currentKb || currentKb.deletedAt || currentKb.activeIndexId !== index.id || !currentDoc || currentDoc.deletedAt) {
+            discarded = true
+            return
+        }
+        await tx.documentIndex.update({ where: { id: entry.id }, data: { status: 'READY', chunkCount: chunks.length, errorMessage: null } })
+        await tx.document.update({
+            where: { id: document.id },
+            data: { status: 'COMPLETED', chunkCount: chunks.length, processedAt: new Date(), errorMessage: null },
+        })
+        await refreshKnowledgeCounts(tx, kb.id)
+        await maybeActivateIndex(tx, kb.id)
+    })
+    if (discarded) await store.deleteByDocumentIndexId(entry.id)
 }

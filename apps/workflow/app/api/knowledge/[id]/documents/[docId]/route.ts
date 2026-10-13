@@ -9,7 +9,7 @@ import { NextRequest } from 'next/server'
 import { apiError, apiSuccess, ErrorCode, handleApiError } from '@/lib/api-response'
 import { getCurrentUserId } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
-import { deleteDocumentVectors } from '@/lib/services/document-processor'
+import { scheduleDocumentDeletion } from '@/lib/services/knowledge-index-service'
 
 /**
  * GET /api/knowledge/[id]/documents/[docId] - 获取文档详情
@@ -25,7 +25,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
 
         // 检查知识库是否存在且属于当前用户
         const knowledgeBase = await prisma.knowledgeBase.findFirst({
-            where: { id: knowledgeBaseId },
+            where: { id: knowledgeBaseId, deletedAt: null },
         })
 
         if (!knowledgeBase) {
@@ -40,6 +40,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         const document = await prisma.document.findFirst({
             where: {
                 id: docId,
+                deletedAt: null,
                 knowledgeBaseId,
             },
         })
@@ -81,7 +82,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
 
         // 检查知识库是否存在且属于当前用户
         const knowledgeBase = await prisma.knowledgeBase.findFirst({
-            where: { id: knowledgeBaseId },
+            where: { id: knowledgeBaseId, deletedAt: null },
         })
 
         if (!knowledgeBase) {
@@ -96,6 +97,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
         const document = await prisma.document.findFirst({
             where: {
                 id: docId,
+                deletedAt: null,
                 knowledgeBaseId,
             },
         })
@@ -104,24 +106,8 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
             return apiError(ErrorCode.DOCUMENT_NOT_FOUND)
         }
 
-        // 删除文档
-        await prisma.document.delete({
-            where: { id: docId },
-        })
-
-        // 更新知识库统计
-        await prisma.knowledgeBase.update({
-            where: { id: knowledgeBaseId },
-            data: {
-                documentCount: { decrement: 1 },
-                chunkCount: { decrement: document.chunkCount },
-            },
-        })
-
-        // 删除 Qdrant 中的向量数据
-        await deleteDocumentVectors(docId)
-
-        return apiSuccess({ id: docId }, '文档删除成功')
+        const deleted = await scheduleDocumentDeletion(knowledgeBaseId, docId, userId)
+        return apiSuccess(deleted, '文档已删除，向量清理已排队')
     } catch (error) {
         return handleApiError(error)
     }

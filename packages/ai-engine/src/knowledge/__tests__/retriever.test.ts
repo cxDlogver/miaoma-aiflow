@@ -114,7 +114,6 @@ describe('VectorRetriever', () => {
                 documentId: 'doc-1',
                 knowledgeBaseId: 'kb-1',
                 score: 0.9,
-                metadata: undefined,
             })
         })
     })
@@ -210,7 +209,7 @@ describe('HybridRetriever', () => {
                     mode: 'fulltext',
                     topK: 5,
                 })
-            ).rejects.toThrow('Fulltext search provider is not configured')
+            ).rejects.toThrow('BM25 search provider is not configured')
         })
 
         it('应该调用全文检索提供者', async () => {
@@ -299,7 +298,7 @@ describe('HybridRetriever', () => {
             expect(results[0].chunkId).toBe('chunk-1')
         })
 
-        it('没有全文提供者时应该只返回向量结果', async () => {
+        it('没有 BM25 提供者时混合检索应该失败', async () => {
             const embedding = createMockEmbeddingService()
             const store = createMockVectorStore([
                 {
@@ -313,15 +312,14 @@ describe('HybridRetriever', () => {
             ])
             const retriever = new HybridRetriever(embedding, store)
 
-            const results = await retriever.retrieve({
-                query: '测试',
-                knowledgeBaseIds: ['kb-1'],
-                mode: 'hybrid',
-                topK: 5,
-            })
-
-            expect(results).toHaveLength(1)
-            expect(results[0].chunkId).toBe('chunk-1')
+            await expect(
+                retriever.retrieve({
+                    query: '测试',
+                    knowledgeBaseIds: ['kb-1'],
+                    mode: 'hybrid',
+                    topK: 5,
+                })
+            ).rejects.toThrow('BM25')
         })
     })
 

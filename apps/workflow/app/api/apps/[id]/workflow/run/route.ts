@@ -3,7 +3,6 @@
  *   All rights reserved.
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，���可开源。
  */
-
 import { createWorkflowEngine, NodeKind, WorkflowDefinition } from '@miaoma-aiflow/ai-engine'
 import { NextRequest } from 'next/server'
 
@@ -11,6 +10,7 @@ import { ExecutionStatus } from '@/app/generated/prisma/enums'
 import { apiError, ErrorCode } from '@/lib/api-response'
 import { getCurrentUserId } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
+import { createKnowledgeRetrievalService } from '@/lib/services/knowledge-retrieval'
 import type {
     ErrorEventData,
     NodeEndEventData,
@@ -151,7 +151,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
                 })
 
                 try {
-                    const engine = createWorkflowEngine({ verbose: true })
+                    const engine = createWorkflowEngine({
+                        verbose: true,
+                        knowledgeRetrieval: createKnowledgeRetrievalService({ kind: 'user', userId }),
+                    })
 
                     // Send workflow start event
                     send<WorkflowStartEventData>({

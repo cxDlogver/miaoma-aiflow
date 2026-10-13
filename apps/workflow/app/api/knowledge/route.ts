@@ -3,13 +3,13 @@
  *   All rights reserved.
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
  */
-
 import { NextRequest } from 'next/server'
 import { z } from 'zod'
 
 import { apiError, apiPaginated, apiSuccess, ErrorCode, handleApiError } from '@/lib/api-response'
 import { getCurrentUserId } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
+import { ensureEmbeddingSpace } from '@/lib/services/embedding-space-service'
 
 /**
  * GET /api/knowledge - 获取知识库列表
@@ -29,9 +29,11 @@ export async function GET(request: NextRequest) {
         // 构建查询条件
         const where: {
             userId: string
+            deletedAt: null
             name?: { contains: string; mode: 'insensitive' }
         } = {
             userId,
+            deletedAt: null,
         }
 
         // 搜索条件
@@ -79,6 +81,9 @@ const createKnowledgeBaseSchema = z.object({
     name: z.string().min(1, '知识库名称不能为空').max(50, '知识库名称最多50个字符'),
     description: z.string().max(200, '知识库描述最多200个字符').optional(),
     icon: z.string().default('📚'),
+    embeddingProvider: z.literal('ollama').default('ollama'),
+    embeddingModel: z.string().min(1).max(120).default('mxbai-embed-large:latest'),
+    dimensions: z.number().int().min(1).max(32768).default(1024),
 })
 
 export async function POST(request: NextRequest) {
@@ -95,16 +100,24 @@ export async function POST(request: NextRequest) {
             return apiError(ErrorCode.KNOWLEDGE_BASE_NAME_INVALID, result.error.issues[0]?.message)
         }
 
-        const { name, description, icon } = result.data
+        const { name, description, icon, embeddingModel, embeddingProvider, dimensions } = result.data
+        const space = await ensureEmbeddingSpace({ embeddingModel, embeddingProvider, dimensions })
 
-        // 创建知识库
-        const knowledgeBase = await prisma.knowledgeBase.create({
-            data: {
-                name,
-                description: description || null,
-                icon,
-                userId,
-            },
+        const knowledgeBase = await prisma.$transaction(async tx => {
+            const kb = await tx.knowledgeBase.create({
+                data: { name, description: description || null, icon, userId, embeddingModel, embeddingProvider, dimensions },
+            })
+            const index = await tx.knowledgeBaseIndex.create({
+                data: {
+                    knowledgeBaseId: kb.id,
+                    embeddingSpaceId: space.id,
+                    status: 'READY',
+                    chunkSize: kb.chunkSize,
+                    chunkOverlap: kb.chunkOverlap,
+                    activatedAt: new Date(),
+                },
+            })
+            return tx.knowledgeBase.update({ where: { id: kb.id }, data: { activeIndexId: index.id } })
         })
 
         return apiSuccess(

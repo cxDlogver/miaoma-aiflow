@@ -38,6 +38,7 @@ interface KnowledgeCardProps {
 }
 
 const statusLabels: Record<KnowledgeBase['status'], { label: string; color: string }> = {
+    NEEDS_REBUILD: { label: '需重建', color: 'bg-amber-100 text-amber-600' },
     READY: { label: '就绪', color: 'bg-green-100 text-green-600' },
     INDEXING: { label: '索引中', color: 'bg-blue-100 text-blue-600' },
     ERROR: { label: '异常', color: 'bg-red-100 text-red-600' },
@@ -93,6 +94,9 @@ export function KnowledgeCard({ knowledge, onDelete }: KnowledgeCardProps) {
                             {/* 知识库信息 */}
                             <div className="min-w-0 flex-1">
                                 <h3 className="truncate text-base font-semibold">{knowledge.name}</h3>
+                                <span className={'rounded-full px-2 py-0.5 text-xs ' + statusLabels[knowledge.status].color}>
+                                    {statusLabels[knowledge.status].label}
+                                </span>
                                 <p className="mt-0.5 text-xs text-muted-foreground">更新于 {formatDate(knowledge.updatedAt)}</p>
                             </div>
                         </div>

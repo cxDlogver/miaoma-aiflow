@@ -20,7 +20,9 @@
         "spellcheck": "cspell lint --dot --gitignore --color --cache --show-suggestions \"(packages|apps)/**/*.@(html|js|cjs|mjs|ts|tsx|css|scss|md)\"",
         "typecheck": "turbo typecheck",
         "commit": "git-cz",
-        "prepare": "husky"
+        "prepare": "husky",
+        "schema:sync": "node scripts/sync-prisma-schemas.mjs",
+        "schema:check": "node scripts/sync-prisma-schemas.mjs --check"
     },
     "keywords": [],
     "author": "Heyi",

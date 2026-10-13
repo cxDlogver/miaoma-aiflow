@@ -1,9 +1,9 @@
+import { collectPublishedKnowledgeBaseIds } from '@miaoma-aiflow/ai-engine'
 /*
  *   Copyright (c) 2026 妙码学院 @Heyi
  *   All rights reserved.
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
  */
-
 import { NextRequest, NextResponse } from 'next/server'
 
 import { Prisma } from '@/app/generated/prisma/client'
@@ -123,6 +123,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         if (!nodeTypes.includes('end')) {
             return apiError(ErrorCode.INVALID_WORKFLOW, '工作流缺少结束节点，无法发布')
         }
+
+        const knowledgeIds = collectPublishedKnowledgeBaseIds(workflow.nodes)
+        const authorizedCount = await prisma.knowledgeBase.count({
+            where: { id: { in: knowledgeIds }, userId, deletedAt: null, activeIndex: { status: 'READY' } },
+        })
+        if (authorizedCount !== knowledgeIds.length) return apiError(ErrorCode.INVALID_WORKFLOW, '知识库无权访问或索引尚未就绪')
 
         // 5. 检查是否是更新发布
         const isUpdate = app.isPublished

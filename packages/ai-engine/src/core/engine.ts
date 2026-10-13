@@ -1,9 +1,9 @@
+import type { KnowledgeRetrievalService } from '../knowledge/types'
 /*
  *   Copyright (c) 2026 妙码学院 @Heyi
  *   All rights reserved.
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
  */
-
 import { createExecutionLogger } from '../logger'
 import { createDefaultRegistry, NodeRegistry } from '../nodes'
 import type {
@@ -23,6 +23,7 @@ import { GraphBuilder } from './graph-builder'
  * 工作流引擎配置
  */
 export interface WorkflowEngineConfig {
+    knowledgeRetrieval?: KnowledgeRetrievalService
     /** Ollama 服务地址 */
     ollamaBaseUrl?: string
     /** 默认超时时间（毫秒） */
@@ -59,7 +60,7 @@ export interface IWorkflowEngine {
  */
 export class WorkflowEngine implements IWorkflowEngine {
     private registry: NodeRegistry
-    private config: Required<WorkflowEngineConfig>
+    private config: Required<Omit<WorkflowEngineConfig, 'knowledgeRetrieval'>>
     private workflowValidator: DefaultWorkflowValidator
 
     constructor(config: WorkflowEngineConfig = {}) {
@@ -69,7 +70,7 @@ export class WorkflowEngine implements IWorkflowEngine {
             verbose: config.verbose ?? false,
         }
 
-        this.registry = createDefaultRegistry()
+        this.registry = createDefaultRegistry({ knowledgeRetrieval: config.knowledgeRetrieval })
         this.workflowValidator = createDefaultWorkflowValidator()
     }
 

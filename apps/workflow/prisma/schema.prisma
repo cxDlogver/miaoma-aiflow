@@ -278,6 +278,11 @@ model KnowledgeBase {
   userId          String
   user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  deletedAt       DateTime?
+  activeIndexId   String? @unique
+  activeIndex     KnowledgeBaseIndex? @relation("ActiveKnowledgeIndex", fields: [activeIndexId], references: [id], onDelete: SetNull)
+  indexes         KnowledgeBaseIndex[] @relation("KnowledgeIndexes")
+
   // 关联文档
   documents       Document[]
 
@@ -297,6 +302,9 @@ model Document {
   mimeType        String              // 文件类型
   size            Int                 // 文件大小（字节）
   content         String?             // 文本内容（提取后）
+
+  deletedAt       DateTime?
+  indexes         DocumentIndex[]
 
   // 处理状态
   status          DocumentStatus      @default(PENDING)
@@ -329,6 +337,7 @@ enum RetrievalMode {
 
 // 知识库状态
 enum KnowledgeBaseStatus {
+  NEEDS_REBUILD
   READY
   INDEXING
   ERROR
@@ -340,4 +349,96 @@ enum DocumentStatus {
   PROCESSING
   COMPLETED
   ERROR
+}
+
+model EmbeddingSpace {
+  id                      String   @id
+  provider                String
+  model                   String
+  modelRevision           String
+  dimensions              Int
+  distance                String   @default("Cosine")
+  queryEncodingVersion    String   @default("ollama-raw-v1")
+  documentEncodingVersion String   @default("ollama-raw-v1")
+  bm25ConfigId            String
+  collectionName          String   @unique
+  indexes                 KnowledgeBaseIndex[]
+  createdAt               DateTime @default(now())
+  @@map("embedding_spaces")
+}
+model KnowledgeBaseIndex {
+  id               String @id @default(cuid())
+  knowledgeBaseId  String
+  knowledgeBase    KnowledgeBase @relation("KnowledgeIndexes", fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  embeddingSpaceId String
+  embeddingSpace   EmbeddingSpace @relation(fields: [embeddingSpaceId], references: [id])
+  status           KnowledgeIndexStatus @default(BUILDING)
+  chunkSize        Int
+  chunkOverlap     Int
+  activeFor        KnowledgeBase? @relation("ActiveKnowledgeIndex")
+  documents        DocumentIndex[]
+  createdAt        DateTime @default(now())
+  activatedAt      DateTime?
+  @@index([knowledgeBaseId, status])
+  @@map("knowledge_base_indexes")
+}
+model DocumentIndex {
+  id                   String @id @default(cuid())
+  documentId           String
+  document             Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  knowledgeBaseIndexId String
+  knowledgeBaseIndex   KnowledgeBaseIndex @relation(fields: [knowledgeBaseIndexId], references: [id], onDelete: Cascade)
+  status               DocumentIndexStatus @default(PENDING)
+  chunkCount           Int @default(0)
+  errorMessage         String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  @@unique([documentId, knowledgeBaseIndexId])
+  @@index([knowledgeBaseIndexId, status])
+  @@map("document_indexes")
+}
+// 不级联删除任务：任务携带冻结的定位信息，删除实体后仍可恢复清理。
+model KnowledgeIndexJob {
+  id             String @id @default(cuid())
+  kind           KnowledgeJobKind
+  knowledgeBaseId String
+  documentId     String?
+  indexId        String?
+  payload        Json
+  status         KnowledgeJobStatus @default(PENDING)
+  attempts       Int @default(0)
+  availableAt    DateTime @default(now())
+  lockedAt       DateTime?
+  leaseToken     String?
+  errorMessage   String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  @@index([status, availableAt])
+  @@index([knowledgeBaseId, status])
+  @@map("knowledge_index_jobs")
+}
+enum KnowledgeIndexStatus {
+  BUILDING
+  READY
+  FAILED
+  RETIRED
+}
+enum DocumentIndexStatus {
+  PENDING
+  RUNNING
+  READY
+  FAILED
+}
+enum KnowledgeJobKind {
+  PROCESS_DOCUMENT
+  DELETE_DOCUMENT
+  DELETE_KNOWLEDGE_BASE
+  DELETE_INDEX
+}
+enum KnowledgeJobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
 }

@@ -19,3 +19,10 @@ export { QdrantVectorStore, createQdrantVectorStore } from './store'
 // 检索器
 export { VectorRetriever, createVectorRetriever, HybridRetriever, createHybridRetriever } from './retriever'
 export type { FulltextSearchProvider } from './retriever'
+
+export * from './bm25'
+export * from './validation'
+export { MultiKnowledgeRetriever } from './retriever/multi-knowledge-retriever'
+export type { MultiKnowledgeDependencies } from './retriever/multi-knowledge-retriever'
+export { collectPublishedKnowledgeBaseIds } from './published-knowledge'
+export { getOllamaModelRevision } from './embeddings/model-revision'

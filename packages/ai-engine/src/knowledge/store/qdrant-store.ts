@@ -6,256 +6,178 @@
 
 import { QdrantClient } from '@qdrant/js-client-rest'
 
-import type { ChunkWithVector, VectorSearchOptions, VectorSearchResult, VectorStoreConfig, VectorStoreService } from '../types'
+import { BM25_VECTOR_NAME, bm25Document, DENSE_VECTOR_NAME } from '../bm25'
+import type {
+    BM25SearchOptions,
+    ChunkWithVector,
+    IndexScope,
+    VectorSearchOptions,
+    VectorSearchResult,
+    VectorStoreConfig,
+    VectorStoreService,
+} from '../types'
 import { DEFAULT_VECTOR_STORE_CONFIG } from '../types'
-
-/**
- * Qdrant 向量存储服务
- * 使用 Qdrant 存储和检索向量
- */
+import { validateDenseVector } from '../validation'
+type Filter = NonNullable<Parameters<QdrantClient['search']>[1]['filter']>
 export class QdrantVectorStore implements VectorStoreService {
-    private client: QdrantClient
-    private collectionName: string
-
+    private readonly client: QdrantClient
+    private readonly collectionName: string
     constructor(config?: Partial<VectorStoreConfig>) {
-        const { url, collectionName } = { ...DEFAULT_VECTOR_STORE_CONFIG, ...config }
-
-        this.client = new QdrantClient({ url })
-        this.collectionName = collectionName
+        this.client = new QdrantClient({ url: config?.url ?? DEFAULT_VECTOR_STORE_CONFIG.url, timeout: 30000 })
+        this.collectionName = config?.collectionName ?? DEFAULT_VECTOR_STORE_CONFIG.collectionName
     }
-
-    /**
-     * 确保集合存在
-     */
+    private schema(info: Awaited<ReturnType<QdrantClient['getCollection']>>, dimensions?: number): number {
+        const vectors = info.config.params.vectors
+        const dense = vectors && typeof vectors === 'object' && DENSE_VECTOR_NAME in vectors ? vectors[DENSE_VECTOR_NAME] : undefined
+        if (!dense || typeof dense !== 'object' || !('size' in dense) || !('distance' in dense) || dense.distance !== 'Cosine')
+            throw new Error('Collection requires named dense Cosine vector')
+        if (dimensions !== undefined && dense.size !== dimensions) throw new Error('Collection vector dimension mismatch')
+        if (info.config.params.sparse_vectors?.[BM25_VECTOR_NAME]?.modifier !== 'idf')
+            throw new Error('Collection requires bm25 sparse vector with IDF')
+        return dense.size as number
+    }
     async ensureCollection(dimensions: number): Promise<void> {
-        try {
-            if (!Number.isInteger(dimensions) || dimensions <= 0) {
-                throw new Error(`Invalid vector dimensions: ${dimensions}`)
-            }
-
-            const collections = await this.client.getCollections()
-            const exists = collections.collections.some(c => c.name === this.collectionName)
-
-            if (!exists) {
-                try {
-                    await this.client.createCollection(this.collectionName, {
-                        vectors: {
-                            size: dimensions,
-                            distance: 'Cosine',
-                        },
-                        optimizers_config: {
-                            indexing_threshold: 10000,
-                        },
-                    })
-                } catch (createError) {
-                    // 并发文档处理可能同时创建集合；只有集合确实已创建时才继续验证。
-                    const latest = await this.client.getCollections()
-                    if (!latest.collections.some(c => c.name === this.collectionName)) {
-                        throw createError
-                    }
-                }
-            }
-
-            // 已有集合也必须验证实际配置，不能仅凭集合名称存在就允许写入。
-            const info = await this.client.getCollection(this.collectionName)
-            const vectors = info.config.params.vectors
-
-            // 当前业务写入匿名 Dense Vector，不兼容仅包含 Named Vectors 的集合。
-            if (!vectors || typeof vectors !== 'object' || !('size' in vectors) || !('distance' in vectors)) {
-                throw new Error(`Collection ${this.collectionName} does not use a single unnamed dense vector`)
-            }
-
-            if (vectors.size !== dimensions) {
-                throw new Error(
-                    `Collection ${this.collectionName} vector dimension mismatch: expected ${dimensions}, actual ${String(vectors.size)}`
-                )
-            }
-
-            if (vectors.distance !== 'Cosine') {
-                throw new Error(
-                    `Collection ${this.collectionName} distance mismatch: expected Cosine, actual ${String(vectors.distance)}`
-                )
-            }
-
-            // 无论集合是新建还是已存在，都检查过滤索引，补建未完成的索引。
-            for (const fieldName of ['knowledgeBaseId', 'documentId']) {
-                const schema = info.payload_schema?.[fieldName]
-
-                if (schema) {
-                    if (schema.data_type !== 'keyword') {
-                        throw new Error(
-                            `Collection ${this.collectionName} payload index ${fieldName} must be keyword, actual ${schema.data_type}`
-                        )
-                    }
-                    continue
-                }
-
-                try {
-                    await this.client.createPayloadIndex(this.collectionName, {
-                        field_name: fieldName,
-                        field_schema: 'keyword',
-                        wait: true,
-                    })
-                } catch (indexError) {
-                    // 并发初始化可能已创建该索引；重新读取，仅对确认为 keyword 的结果放行。
-                    const latest = await this.client.getCollection(this.collectionName)
-                    if (latest.payload_schema?.[fieldName]?.data_type !== 'keyword') {
-                        throw indexError
-                    }
-                }
-            }
-        } catch (error) {
-            throw new Error(`Failed to ensure collection: ${error instanceof Error ? error.message : String(error)}`)
-        }
-    }
-
-    /**
-     * 插入或更新向量
-     */
-    async upsertVectors(chunks: ChunkWithVector[]): Promise<void> {
-        if (chunks.length === 0) {
-            return
-        }
-
-        try {
-            // 转换为 Qdrant 格式
-            const points = chunks.map(chunk => ({
-                id: this.stringToUuid(chunk.id),
-                vector: chunk.vector,
-                payload: {
-                    chunkId: chunk.id,
-                    content: chunk.content,
-                    chunkIndex: chunk.index,
-                    startOffset: chunk.startOffset,
-                    endOffset: chunk.endOffset,
-                    documentId: chunk.documentId,
-                    knowledgeBaseId: chunk.knowledgeBaseId,
-                    metadata: chunk.metadata || {},
-                },
-            }))
-
-            // 批量插入（每批最多 100 个）
-            const BATCH_SIZE = 100
-            for (let i = 0; i < points.length; i += BATCH_SIZE) {
-                const batch = points.slice(i, i + BATCH_SIZE)
-                await this.client.upsert(this.collectionName, {
-                    points: batch,
-                    wait: true,
+        if (!Number.isInteger(dimensions) || dimensions < 1) throw new Error('Invalid vector dimensions')
+        if (!(await this.client.collectionExists(this.collectionName)).exists) {
+            try {
+                await this.client.createCollection(this.collectionName, {
+                    vectors: { [DENSE_VECTOR_NAME]: { size: dimensions, distance: 'Cosine' } },
+                    sparse_vectors: { [BM25_VECTOR_NAME]: { modifier: 'idf' } },
                 })
+            } catch (error) {
+                if (!(await this.client.collectionExists(this.collectionName)).exists) throw error
             }
-        } catch (error) {
-            throw new Error(`Failed to upsert vectors: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        const info = await this.client.getCollection(this.collectionName)
+        this.schema(info, dimensions)
+        for (const field of ['knowledgeBaseId', 'documentId', 'indexId', 'documentIndexId']) {
+            if (info.payload_schema?.[field] && info.payload_schema[field]?.data_type !== 'keyword')
+                throw new Error('Payload index must be keyword: ' + field)
+            if (!info.payload_schema?.[field]) {
+                try {
+                    await this.client.createPayloadIndex(this.collectionName, { field_name: field, field_schema: 'keyword', wait: true })
+                } catch (error) {
+                    if ((await this.client.getCollection(this.collectionName)).payload_schema?.[field]?.data_type !== 'keyword') throw error
+                }
+            }
         }
     }
-
-    /**
-     * 按文档 ID 删除向量
-     */
+    private filter(ids: string[], scopes?: IndexScope[]): Filter {
+        if (
+            !ids.length ||
+            !scopes?.length ||
+            scopes.some(s => !s.indexId || !ids.includes(s.knowledgeBaseId)) ||
+            ids.some(id => !scopes.some(s => s.knowledgeBaseId === id))
+        )
+            throw new Error('Authorized knowledge base and active index scopes are required')
+        return {
+            should: scopes.map(s => ({
+                must: [
+                    { key: 'knowledgeBaseId', match: { value: s.knowledgeBaseId } },
+                    { key: 'indexId', match: { value: s.indexId } },
+                ],
+            })),
+        }
+    }
+    async upsertVectors(chunks: ChunkWithVector[]): Promise<void> {
+        if (!chunks.length) return
+        const dimensions = this.schema(await this.client.getCollection(this.collectionName))
+        const points = await Promise.all(
+            chunks.map(async c => {
+                validateDenseVector(c.vector, dimensions)
+                if (!c.indexId || !c.documentIndexId) throw new Error('Index identity is required when writing chunks')
+                const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(c.indexId + ':' + c.id)))
+                const hex = [...hash.slice(0, 16)].map(v => v.toString(16).padStart(2, '0')).join('')
+                return {
+                    id: hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20),
+                    vector: { [DENSE_VECTOR_NAME]: c.vector, [BM25_VECTOR_NAME]: bm25Document(c.content) },
+                    payload: {
+                        chunkId: c.id,
+                        content: c.content,
+                        chunkIndex: c.index,
+                        startOffset: c.startOffset,
+                        endOffset: c.endOffset,
+                        documentId: c.documentId,
+                        knowledgeBaseId: c.knowledgeBaseId,
+                        indexId: c.indexId,
+                        documentIndexId: c.documentIndexId,
+                        metadata: c.metadata ?? {},
+                    },
+                }
+            })
+        )
+        for (let i = 0; i < points.length; i += 100)
+            await this.client.upsert(this.collectionName, { points: points.slice(i, i + 100), wait: true })
+    }
     async deleteByDocumentId(documentId: string): Promise<void> {
-        try {
-            await this.client.delete(this.collectionName, {
-                filter: {
-                    must: [
-                        {
-                            key: 'documentId',
-                            match: { value: documentId },
-                        },
-                    ],
-                },
-                wait: true,
-            })
-        } catch (error) {
-            throw new Error(`Failed to delete by document ID: ${error instanceof Error ? error.message : String(error)}`)
-        }
+        await this.client.delete(this.collectionName, {
+            filter: { must: [{ key: 'documentId', match: { value: documentId } }] },
+            wait: true,
+        })
     }
-
-    /**
-     * 按知识库 ID 删除所有向量
-     */
     async deleteByKnowledgeBaseId(knowledgeBaseId: string): Promise<void> {
-        try {
-            await this.client.delete(this.collectionName, {
-                filter: {
-                    must: [
-                        {
-                            key: 'knowledgeBaseId',
-                            match: { value: knowledgeBaseId },
-                        },
-                    ],
-                },
-                wait: true,
-            })
-        } catch (error) {
-            throw new Error(`Failed to delete by knowledge base ID: ${error instanceof Error ? error.message : String(error)}`)
+        await this.client.delete(this.collectionName, {
+            filter: { must: [{ key: 'knowledgeBaseId', match: { value: knowledgeBaseId } }] },
+            wait: true,
+        })
+    }
+    async deleteByDocumentIndexId(id: string): Promise<void> {
+        await this.client.delete(this.collectionName, { filter: { must: [{ key: 'documentIndexId', match: { value: id } }] }, wait: true })
+    }
+    async deleteByIndexId(indexId: string): Promise<void> {
+        await this.client.delete(this.collectionName, { filter: { must: [{ key: 'indexId', match: { value: indexId } }] }, wait: true })
+    }
+    private result(point: { payload?: Record<string, unknown> | null; score: number }, scoreType: 'cosine' | 'bm25'): VectorSearchResult {
+        const p = point.payload ?? {}
+        return {
+            chunkId: String(p.chunkId ?? ''),
+            content: String(p.content ?? ''),
+            chunkIndex: Number(p.chunkIndex ?? 0),
+            documentId: String(p.documentId ?? ''),
+            knowledgeBaseId: String(p.knowledgeBaseId ?? ''),
+            indexId: String(p.indexId ?? ''),
+            documentIndexId: String(p.documentIndexId ?? ''),
+            score: point.score,
+            scoreType,
+            metadata: p.metadata as Record<string, unknown> | undefined,
         }
     }
-
-    /**
-     * 向量搜索
-     */
     async search(options: VectorSearchOptions): Promise<VectorSearchResult[]> {
-        const { vector, knowledgeBaseIds, topK, threshold = 0 } = options
-
-        if (!vector || vector.length === 0) {
-            throw new Error('Query vector cannot be empty')
-        }
-
-        if (!knowledgeBaseIds || knowledgeBaseIds.length === 0) {
-            throw new Error('Knowledge base IDs cannot be empty')
-        }
-
-        try {
-            const response = await this.client.search(this.collectionName, {
-                vector,
-                limit: topK,
-                score_threshold: threshold,
-                filter: {
-                    must: [
-                        {
-                            key: 'knowledgeBaseId',
-                            match: { any: knowledgeBaseIds },
-                        },
-                    ],
-                },
-                with_payload: true,
-                with_vector: false,
-            })
-
-            return response.map(point => ({
-                chunkId: (point.payload?.chunkId as string) || '',
-                content: (point.payload?.content as string) || '',
-                chunkIndex: (point.payload?.chunkIndex as number) || 0,
-                documentId: (point.payload?.documentId as string) || '',
-                knowledgeBaseId: (point.payload?.knowledgeBaseId as string) || '',
-                score: point.score,
-                metadata: (point.payload?.metadata as Record<string, unknown>) || undefined,
-            }))
-        } catch (error) {
-            throw new Error(`Failed to search vectors: ${error instanceof Error ? error.message : String(error)}`)
-        }
+        const filter = this.filter(options.knowledgeBaseIds, options.indexScopes)
+        validateDenseVector(options.vector, this.schema(await this.client.getCollection(this.collectionName)))
+        const response = await this.client.query(this.collectionName, {
+            query: options.vector,
+            using: DENSE_VECTOR_NAME,
+            filter,
+            limit: options.topK,
+            score_threshold: options.threshold ?? 0,
+            with_payload: true,
+            with_vector: false,
+        })
+        return response.points.map(p => this.result(p, 'cosine'))
     }
-
-    /**
-     * 获取集合信息
-     */
-    async getCollectionInfo(): Promise<{
-        pointsCount: number
-        status: string
-    } | null> {
+    async textSearch(options: BM25SearchOptions): Promise<VectorSearchResult[]> {
+        if (!options.query.trim()) throw new Error('Query cannot be empty')
+        const filter = this.filter(options.knowledgeBaseIds, options.indexScopes)
+        this.schema(await this.client.getCollection(this.collectionName))
+        const response = await this.client.query(this.collectionName, {
+            query: bm25Document(options.query.trim()),
+            using: BM25_VECTOR_NAME,
+            filter,
+            limit: options.topK,
+            with_payload: true,
+            with_vector: false,
+        })
+        return response.points.map(p => this.result(p, 'bm25'))
+    }
+    async getCollectionInfo(): Promise<{ pointsCount: number; status: string } | null> {
         try {
             const info = await this.client.getCollection(this.collectionName)
-            return {
-                pointsCount: info.points_count || 0,
-                status: info.status,
-            }
+            return { pointsCount: info.points_count ?? 0, status: info.status }
         } catch {
             return null
         }
     }
-
-    /**
-     * 检查健康状态
-     */
     async healthCheck(): Promise<boolean> {
         try {
             await this.client.getCollections()
@@ -264,134 +186,7 @@ export class QdrantVectorStore implements VectorStoreService {
             return false
         }
     }
-
-    /**
-     * 文本搜索（基于 payload 内容匹配）
-     * 支持分词匹配和相关性评分
-     */
-    async textSearch(options: { query: string; knowledgeBaseIds: string[]; topK: number }): Promise<VectorSearchResult[]> {
-        const { query, knowledgeBaseIds, topK } = options
-
-        if (!query || query.trim().length === 0) {
-            throw new Error('Query cannot be empty')
-        }
-
-        if (!knowledgeBaseIds || knowledgeBaseIds.length === 0) {
-            throw new Error('Knowledge base IDs cannot be empty')
-        }
-
-        try {
-            // 使用 scroll 获取所有匹配知识库的切片
-            const response = await this.client.scroll(this.collectionName, {
-                filter: {
-                    must: [
-                        {
-                            key: 'knowledgeBaseId',
-                            match: { any: knowledgeBaseIds },
-                        },
-                    ],
-                },
-                limit: 1000,
-                with_payload: true,
-                with_vector: false,
-            })
-
-            // 分词（支持中英文）
-            const queryLower = query.toLowerCase()
-            const queryTerms = queryLower.split(/[\s,，。.!！?？;；:：、]+/).filter(term => term.length > 0)
-
-            const matchedResults: Array<{ result: VectorSearchResult; matchScore: number }> = []
-
-            for (const point of response.points) {
-                const content = (point.payload?.content as string) || ''
-                const contentLower = content.toLowerCase()
-
-                // 计算匹配分数
-                let matchScore = 0
-                let matchedTerms = 0
-
-                // 完整查询匹配（权重更高）
-                if (contentLower.includes(queryLower)) {
-                    matchScore += 2
-                }
-
-                // 分词匹配
-                for (const term of queryTerms) {
-                    if (contentLower.includes(term)) {
-                        matchedTerms++
-                        // 根据词频增加分数
-                        const regex = new RegExp(term, 'gi')
-                        const matches = content.match(regex)
-                        matchScore += matches ? matches.length * 0.5 : 0
-                    }
-                }
-
-                // 至少匹配一个词才计入结果
-                if (matchScore > 0 || matchedTerms > 0) {
-                    matchScore += (matchedTerms / Math.max(queryTerms.length, 1)) * 1.5
-
-                    matchedResults.push({
-                        result: {
-                            chunkId: (point.payload?.chunkId as string) || '',
-                            content,
-                            chunkIndex: (point.payload?.chunkIndex as number) || 0,
-                            documentId: (point.payload?.documentId as string) || '',
-                            knowledgeBaseId: (point.payload?.knowledgeBaseId as string) || '',
-                            score: matchScore,
-                            metadata: (point.payload?.metadata as Record<string, unknown>) || undefined,
-                        },
-                        matchScore,
-                    })
-                }
-            }
-
-            // 按匹配分数排序
-            matchedResults.sort((a, b) => b.matchScore - a.matchScore)
-
-            // 归一化分数到 0-1 范围
-            const maxScore = matchedResults[0]?.matchScore || 1
-            return matchedResults.slice(0, topK).map(({ result, matchScore }) => ({
-                ...result,
-                score: matchScore / maxScore,
-            }))
-        } catch (error) {
-            throw new Error(`Failed to perform text search: ${error instanceof Error ? error.message : String(error)}`)
-        }
-    }
-
-    /**
-     * 将字符串 ID 转换为 UUID 格式
-     * Qdrant 需要 UUID 或整数作为点 ID
-     * UUID 格式: 8-4-4-4-12 (共 36 字符)
-     */
-    private stringToUuid(str: string): string {
-        // 使用简单的哈希生成确定性 UUID
-        let h1 = 0xdeadbeef
-        let h2 = 0x41c6ce57
-
-        for (let i = 0; i < str.length; i++) {
-            const ch = str.charCodeAt(i)
-            h1 = Math.imul(h1 ^ ch, 2654435761)
-            h2 = Math.imul(h2 ^ ch, 1597334677)
-        }
-
-        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
-        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
-
-        // 生成 32 个十六进制字符 (4 个 8 位块)
-        const hex1 = (h1 >>> 0).toString(16).padStart(8, '0')
-        const hex2 = (h2 >>> 0).toString(16).padStart(8, '0')
-        const hex3 = ((h1 ^ h2) >>> 0).toString(16).padStart(8, '0')
-        const hex4 = ((h1 + h2) >>> 0).toString(16).padStart(8, '0')
-
-        // 组成 UUID 格式: 8-4-4-4-12
-        return `${hex1}-${hex2.slice(0, 4)}-4${hex2.slice(5, 8)}-a${hex3.slice(1, 4)}-${hex3.slice(4, 8)}${hex4}`
-    }
 }
-
-/**
- * 创建 Qdrant 向量存储实例
- */
-export function createQdrantVectorStore(config?: Partial<VectorStoreConfig>): VectorStoreService {
+export function createQdrantVectorStore(config?: Partial<VectorStoreConfig>): QdrantVectorStore {
     return new QdrantVectorStore(config)
 }

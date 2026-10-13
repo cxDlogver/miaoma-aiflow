@@ -14,7 +14,7 @@ export interface KnowledgeBase {
     icon: string
     documentCount: number
     chunkCount: number
-    status: 'READY' | 'INDEXING' | 'ERROR'
+    status: 'NEEDS_REBUILD' | 'READY' | 'INDEXING' | 'ERROR'
     retrievalMode: 'VECTOR' | 'FULLTEXT' | 'HYBRID'
     createdAt: string
     updatedAt: string
@@ -51,6 +51,9 @@ export interface SearchResult {
     chunkId: string
     content: string
     score: number
+    scoreType?: 'cosine' | 'bm25' | 'rrf'
+    indexId?: string
+    embeddingSpaceId?: string
     chunkIndex: number
     documentId: string
     documentName: string
@@ -99,6 +102,7 @@ export interface DocumentStats {
 }
 
 export interface DocumentChunksResponse {
+    nextCursor?: string | null
     documentId: string
     documentName: string
     total: number
@@ -132,7 +136,13 @@ class KnowledgeService {
     }
 
     // 创建知识库
-    async create(params: { name: string; description?: string; icon?: string }): Promise<KnowledgeBase> {
+    async create(params: {
+        name: string
+        description?: string
+        icon?: string
+        embeddingModel?: string
+        dimensions?: number
+    }): Promise<KnowledgeBase> {
         const res = await fetch(this.baseUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -257,9 +267,23 @@ class KnowledgeService {
         return data.data
     }
 
+    async reindex(id: string): Promise<KnowledgeBaseDetail> {
+        const response = await fetch(this.baseUrl + '/' + id + '/reindex', { method: 'POST' })
+        const body = await response.json()
+        if (!response.ok) throw new Error(body.message || '重建失败')
+        return body.data
+    }
+    async retryJobs(id: string): Promise<void> {
+        const response = await fetch(this.baseUrl + '/' + id + '/jobs', { method: 'POST' })
+        const body = await response.json()
+        if (!response.ok) throw new Error(body.message || '重试失败')
+    }
+
     // 获取文档切片
-    async getDocumentChunks(knowledgeBaseId: string, documentId: string): Promise<DocumentChunksResponse> {
-        const res = await fetch(`${this.baseUrl}/${knowledgeBaseId}/documents/${documentId}/chunks`)
+    async getDocumentChunks(knowledgeBaseId: string, documentId: string, cursor?: string): Promise<DocumentChunksResponse> {
+        const res = await fetch(
+            `${this.baseUrl}/${knowledgeBaseId}/documents/${documentId}/chunks${cursor ? '?cursor=' + encodeURIComponent(cursor) : ''}`
+        )
         const data: ApiSuccessData<DocumentChunksResponse> = await res.json()
 
         if (!res.ok) {

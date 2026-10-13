@@ -9,7 +9,7 @@ import { NextRequest } from 'next/server'
 import { apiError, apiPaginated, apiSuccess, ErrorCode, handleApiError } from '@/lib/api-response'
 import { getCurrentUserId } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
-import { processDocument } from '@/lib/services/document-processor'
+import { enqueueDocument } from '@/lib/services/knowledge-index-service'
 
 /**
  * GET /api/knowledge/[id]/documents - 获取文档列表
@@ -25,7 +25,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
 
         // 检查知识库是否存在且属于当前用户
         const knowledgeBase = await prisma.knowledgeBase.findFirst({
-            where: { id: knowledgeBaseId },
+            where: { id: knowledgeBaseId, deletedAt: null },
         })
 
         if (!knowledgeBase) {
@@ -44,9 +44,11 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         // 构建查询条件
         const where: {
             knowledgeBaseId: string
+            deletedAt: null
             status?: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'ERROR'
         } = {
             knowledgeBaseId,
+            deletedAt: null,
         }
 
         if (status && ['PENDING', 'PROCESSING', 'COMPLETED', 'ERROR'].includes(status)) {
@@ -101,7 +103,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
         // 检查知识库是否存在且属于当前用户
         const knowledgeBase = await prisma.knowledgeBase.findFirst({
-            where: { id: knowledgeBaseId },
+            where: { id: knowledgeBaseId, deletedAt: null },
         })
 
         if (!knowledgeBase) {
@@ -135,41 +137,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // 读取文件内容
         const content = await file.text()
 
-        // 创建文档记录
-        const document = await prisma.document.create({
-            data: {
-                name: file.name.replace(/\.[^/.]+$/, ''), // 去掉扩展名作为名称
-                originalName: file.name,
-                mimeType: file.type || 'text/plain',
-                size: file.size,
-                content,
-                status: 'PENDING',
-                knowledgeBaseId,
-            },
-        })
-
-        // 更新知识库文档计数
-        await prisma.knowledgeBase.update({
-            where: { id: knowledgeBaseId },
-            data: {
-                documentCount: { increment: 1 },
-            },
-        })
-
-        // 异步处理文档（切分、嵌入、存储到 Qdrant）
-        // 使用 Promise 不等待，让处理在后台进行
-        processDocument({
-            documentId: document.id,
-            knowledgeBaseId,
+        if (!content.trim()) return apiError(ErrorCode.VALIDATION_ERROR, '文档内容不能为空')
+        const document = await enqueueDocument(knowledgeBaseId, userId, {
+            name: file.name,
+            mimeType: file.type || 'text/plain',
+            size: file.size,
             content,
-            fileName: file.name,
-            chunkSize: knowledgeBase.chunkSize,
-            chunkOverlap: knowledgeBase.chunkOverlap,
-            embeddingModel: knowledgeBase.embeddingModel,
-            dimensions: knowledgeBase.dimensions,
-        }).catch(error => {
-            // eslint-disable-next-line no-console
-            console.error('Document processing failed:', error)
         })
 
         return apiSuccess(

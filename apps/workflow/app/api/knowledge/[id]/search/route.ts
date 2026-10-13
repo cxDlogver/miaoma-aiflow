@@ -4,23 +4,17 @@
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
  */
 
-import {
-    createHybridRetriever,
-    createOllamaEmbeddingService,
-    createQdrantVectorStore,
-    type FulltextSearchProvider,
-    type RetrievalResult,
-} from '@miaoma-aiflow/ai-engine'
 import { NextRequest } from 'next/server'
 import { z } from 'zod'
 
 import { apiError, apiSuccess, ErrorCode, handleApiError } from '@/lib/api-response'
 import { getCurrentUserId } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
+import { createKnowledgeRetrievalService } from '@/lib/services/knowledge-retrieval'
 
 const searchSchema = z.object({
     query: z.string().min(1, '查询内容不能为空').max(500, '查询内容最多500个字符'),
-    topK: z.number().min(1).max(20).optional(),
+    topK: z.number().int().min(1).max(20).optional(),
     threshold: z.number().min(0).max(1).optional(),
     mode: z.enum(['vector', 'fulltext', 'hybrid']).optional(),
 })
@@ -39,7 +33,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
         // 检查知识库是否存在且属于当前用户
         const knowledgeBase = await prisma.knowledgeBase.findFirst({
-            where: { id: knowledgeBaseId },
+            where: { id: knowledgeBaseId, deletedAt: null },
         })
 
         if (!knowledgeBase) {
@@ -64,39 +58,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             mode = knowledgeBase.retrievalMode.toLowerCase() as 'vector' | 'fulltext' | 'hybrid',
         } = result.data
 
-        // 初始化服务
-        const embeddingService = createOllamaEmbeddingService({
-            model: knowledgeBase.embeddingModel,
-            dimensions: knowledgeBase.dimensions,
-        })
-
-        const vectorStore = createQdrantVectorStore({
-            url: process.env.QDRANT_URL || 'http://localhost:6333',
-            collectionName: 'knowledge_chunks',
-        })
-
-        // 创建全文检索提供者（使用 Qdrant 的简单文本匹配）
-        const fulltextProvider: FulltextSearchProvider = {
-            async search(options): Promise<RetrievalResult[]> {
-                // 使用 QdrantVectorStore 的 textSearch 方法
-                const results = await (vectorStore as any).textSearch({
-                    query: options.query,
-                    knowledgeBaseIds: options.knowledgeBaseIds,
-                    topK: options.topK,
-                })
-                return results.map((r: any) => ({
-                    chunkId: r.chunkId,
-                    content: r.content,
-                    chunkIndex: r.chunkIndex,
-                    documentId: r.documentId,
-                    knowledgeBaseId: r.knowledgeBaseId,
-                    score: r.score,
-                    metadata: r.metadata,
-                }))
-            },
-        }
-
-        const retriever = createHybridRetriever(embeddingService, vectorStore, fulltextProvider)
+        const retriever = createKnowledgeRetrievalService({ kind: 'user', userId })
 
         // 执行检索
         const startTime = Date.now()
@@ -113,30 +75,15 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // 获取文档信息
         const documentIds = [...new Set(results.map(r => r.documentId))] as string[]
         const documents = await prisma.document.findMany({
-            where: { id: { in: documentIds } },
+            where: { id: { in: documentIds }, knowledgeBaseId, deletedAt: null },
             select: { id: true, name: true, originalName: true },
         })
         const documentMap = new Map(documents.map(d => [d.id, d]))
 
         // 格式化结果
-        const formattedResults = results.map(
-            (r: {
-                chunkId: string
-                content: string
-                score: number
-                chunkIndex: number
-                documentId: string
-                metadata?: Record<string, unknown>
-            }) => ({
-                chunkId: r.chunkId,
-                content: r.content,
-                score: r.score,
-                chunkIndex: r.chunkIndex,
-                documentId: r.documentId,
-                documentName: documentMap.get(r.documentId)?.name || '未知文档',
-                metadata: r.metadata,
-            })
-        )
+        const formattedResults = results
+            .filter(r => documentMap.has(r.documentId))
+            .map(r => ({ ...r, documentName: documentMap.get(r.documentId)?.name || '未知文档' }))
 
         return apiSuccess({
             query,

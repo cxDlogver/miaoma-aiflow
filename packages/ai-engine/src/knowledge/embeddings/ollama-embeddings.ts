@@ -4,92 +4,58 @@
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
  */
 
-import { OllamaEmbeddings } from '@langchain/ollama'
-
 import type { EmbeddingConfig, EmbeddingService } from '../types'
 import { DEFAULT_EMBEDDING_CONFIG } from '../types'
-
-/**
- * Ollama 嵌入服务
- * 使用 Ollama 本地模型生成文本嵌入向量
- */
+import { validateDenseVector } from '../validation'
+import { getOllamaModelRevision } from './model-revision'
+/** Query/Document 使用相同 raw 协议；网络请求有超时且禁止静默截断正文。 */
 export class OllamaEmbeddingService implements EmbeddingService {
-    private embeddings: OllamaEmbeddings
-    private config: EmbeddingConfig
-
+    private readonly config: EmbeddingConfig
     constructor(config?: Partial<EmbeddingConfig>) {
-        this.config = { ...DEFAULT_EMBEDDING_CONFIG, ...config }
-
-        this.embeddings = new OllamaEmbeddings({
-            model: this.config.model,
-            baseUrl: this.config.baseUrl,
-        })
+        this.config = {
+            model: config?.model ?? DEFAULT_EMBEDDING_CONFIG.model,
+            baseUrl: config?.baseUrl ?? DEFAULT_EMBEDDING_CONFIG.baseUrl,
+            dimensions: config?.dimensions ?? DEFAULT_EMBEDDING_CONFIG.dimensions,
+            modelRevision: config?.modelRevision,
+        }
     }
-
-    /**
-     * 获取单个文本的嵌入向量
-     */
+    private async assertRevision() {
+        if (
+            this.config.modelRevision &&
+            (await getOllamaModelRevision(this.config.model, this.config.baseUrl)) !== this.config.modelRevision
+        )
+            throw new Error('Ollama model revision changed; rebuild the index')
+    }
     async embedText(text: string): Promise<number[]> {
-        if (!text || text.trim().length === 0) {
-            throw new Error('Text cannot be empty')
-        }
-
-        try {
-            const vector = await this.embeddings.embedQuery(text.trim())
-            return vector
-        } catch (error) {
-            throw new Error(`Failed to embed text: ${error instanceof Error ? error.message : String(error)}`)
-        }
+        return (await this.embedTexts([text]))[0]!
     }
-
-    /**
-     * 批量获取文本的嵌入向量
-     */
     async embedTexts(texts: string[]): Promise<number[][]> {
-        if (!texts || texts.length === 0) {
-            return []
-        }
-
-        // 过滤空文本
-        const validTexts = texts.map(t => t.trim()).filter(t => t.length > 0)
-
-        if (validTexts.length === 0) {
-            return []
-        }
-
-        try {
-            const vectors = await this.embeddings.embedDocuments(validTexts)
-            return vectors
-        } catch (error) {
-            throw new Error(`Failed to embed texts: ${error instanceof Error ? error.message : String(error)}`)
-        }
+        if (!texts.length) return []
+        if (texts.some(t => typeof t !== 'string' || !t.trim())) throw new Error('Embedding batch contains empty text')
+        await this.assertRevision()
+        const response = await fetch(this.config.baseUrl.replace(/\/$/, '') + '/api/embed', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: AbortSignal.timeout(30000),
+            body: JSON.stringify({ model: this.config.model, input: texts.map(t => t.trim()), truncate: false }),
+        })
+        if (!response.ok) throw new Error('Ollama embedding request failed: HTTP ' + response.status)
+        const data = (await response.json()) as { embeddings?: number[][] }
+        if (!Array.isArray(data.embeddings) || data.embeddings.length !== texts.length) throw new Error('Embedding count mismatch')
+        data.embeddings.forEach(vector => validateDenseVector(vector, this.config.dimensions))
+        await this.assertRevision()
+        return data.embeddings
     }
-
-    /**
-     * 获取向量维度
-     */
-    getDimensions(): number {
+    getDimensions() {
         return this.config.dimensions
     }
-
-    /**
-     * 获取模型名称
-     */
-    getModel(): string {
+    getModel() {
         return this.config.model
     }
-
-    /**
-     * 获取服务地址
-     */
-    getBaseUrl(): string {
+    getBaseUrl() {
         return this.config.baseUrl
     }
 }
-
-/**
- * 创建 Ollama 嵌入服务实例
- */
 export function createOllamaEmbeddingService(config?: Partial<EmbeddingConfig>): EmbeddingService {
     return new OllamaEmbeddingService(config)
 }

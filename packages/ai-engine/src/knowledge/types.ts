@@ -58,6 +58,8 @@ export interface EmbeddingConfig {
     baseUrl: string
     /** 向量维度 */
     dimensions: number
+    /** 已冻结的 Ollama 权重 digest */
+    modelRevision?: string
 }
 
 /**
@@ -96,6 +98,8 @@ export interface ChunkWithVector extends TextChunk {
     knowledgeBaseId: string
     /** 嵌入向量 */
     vector: number[]
+    indexId?: string
+    documentIndexId?: string
 }
 
 /**
@@ -136,6 +140,7 @@ export interface VectorStoreService {
      * 向量搜索
      */
     search(options: VectorSearchOptions): Promise<VectorSearchResult[]>
+    textSearch?(options: BM25SearchOptions): Promise<VectorSearchResult[]>
 }
 
 /**
@@ -148,7 +153,8 @@ export interface VectorSearchOptions {
     knowledgeBaseIds: string[]
     /** 返回数量 */
     topK: number
-    /** 相似度阈值 (0-1) */
+    indexScopes?: IndexScope[]
+    /** Dense 相似度阈值 (0-1) */
     threshold?: number
 }
 
@@ -168,6 +174,11 @@ export interface VectorSearchResult {
     knowledgeBaseId: string
     /** 相似度分数 (0-1) */
     score: number
+    indexId?: string
+    documentIndexId?: string
+    embeddingSpaceId?: string
+    scoreType?: 'cosine' | 'bm25' | 'rrf'
+    sources?: RetrievalOrigin[]
     /** 元数据 */
     metadata?: Record<string, unknown>
 }
@@ -195,6 +206,7 @@ export interface RetrievalOptions {
     topK: number
     /** 相似度阈值 */
     threshold?: number
+    indexScopes?: IndexScope[]
     /** 混合模式下向量权重 (0-1) */
     vectorWeight?: number
 }
@@ -217,6 +229,11 @@ export interface RetrievalResult {
     knowledgeBaseId: string
     /** 相似度/相关性分数 */
     score: number
+    indexId?: string
+    documentIndexId?: string
+    embeddingSpaceId?: string
+    scoreType?: 'cosine' | 'bm25' | 'rrf'
+    sources?: RetrievalOrigin[]
     /** 元数据 */
     metadata?: Record<string, unknown>
 }
@@ -249,4 +266,37 @@ export const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = {
 export const DEFAULT_VECTOR_STORE_CONFIG: VectorStoreConfig = {
     url: 'http://localhost:6333',
     collectionName: 'knowledge_chunks',
+}
+
+export interface IndexScope {
+    knowledgeBaseId: string
+    indexId: string
+}
+export interface BM25SearchOptions {
+    query: string
+    knowledgeBaseIds: string[]
+    topK: number
+    indexScopes?: IndexScope[]
+}
+export interface RetrievalOrigin {
+    source: 'dense' | 'bm25' | 'hybrid'
+    score: number
+    rank: number
+    indexId?: string
+    embeddingSpaceId?: string
+}
+export interface KnowledgeIndexDescriptor extends IndexScope {
+    embeddingSpaceId: string
+    collectionName: string
+    provider: 'ollama'
+    model: string
+    modelRevision: string
+    dimensions: number
+    bm25ConfigId: string
+    queryEncodingVersion: string
+    documentEncodingVersion: string
+    status: 'READY'
+}
+export interface KnowledgeRetrievalService {
+    retrieve(options: RetrievalOptions): Promise<RetrievalResult[]>
 }

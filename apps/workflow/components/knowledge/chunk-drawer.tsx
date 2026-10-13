@@ -6,10 +6,11 @@
 'use client'
 
 import { BrainIcon, ChevronDownIcon, FileTextIcon, Loader2Icon } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
@@ -25,34 +26,54 @@ interface ChunkDrawerProps {
 }
 
 export function ChunkDrawer({ open, onOpenChange, document, knowledgeBaseId }: ChunkDrawerProps) {
+    const [nextCursor, setNextCursor] = useState<string | null>(null)
+    const [totalChunks, setTotalChunks] = useState(0)
+    const [loadingMore, setLoadingMore] = useState(false)
     const [loading, setLoading] = useState(false)
     const [chunks, setChunks] = useState<DocumentChunk[]>([])
     const [documentStats, setDocumentStats] = useState<DocumentStats | null>(null)
     const [expandedChunks, setExpandedChunks] = useState<Set<string>>(new Set())
 
+    const loadChunks = useCallback(
+        async (cursor?: string) => {
+            if (!document) return
+            try {
+                if (cursor) setLoadingMore(true)
+                else setLoading(true)
+                const response = await knowledgeService.getDocumentChunks(knowledgeBaseId, document.id, cursor)
+                setNextCursor(response.nextCursor ?? null)
+                setTotalChunks(response.total)
+                setChunks(prev => (cursor ? [...prev, ...response.chunks] : response.chunks).sort((a, b) => a.chunkIndex - b.chunkIndex))
+                setDocumentStats(prev =>
+                    cursor && prev
+                        ? {
+                              ...response.documentStats,
+                              totalChars: prev.totalChars + response.documentStats.totalChars,
+                              totalWords: prev.totalWords + response.documentStats.totalWords,
+                          }
+                        : response.documentStats
+                )
+            } catch (error) {
+                toast.error(error instanceof Error ? error.message : '加载切片失败')
+            } finally {
+                setLoadingMore(false)
+                setLoading(false)
+            }
+        },
+        [document, knowledgeBaseId]
+    )
+
     useEffect(() => {
         if (open && document) {
             loadChunks()
         } else {
+            setNextCursor(null)
+            setTotalChunks(0)
             setChunks([])
             setDocumentStats(null)
             setExpandedChunks(new Set())
         }
-    }, [open, document])
-
-    const loadChunks = async () => {
-        if (!document) return
-        try {
-            setLoading(true)
-            const response = await knowledgeService.getDocumentChunks(knowledgeBaseId, document.id)
-            setChunks(response.chunks)
-            setDocumentStats(response.documentStats)
-        } catch (error) {
-            toast.error(error instanceof Error ? error.message : '加载切片失败')
-        } finally {
-            setLoading(false)
-        }
-    }
+    }, [open, document, loadChunks])
 
     const toggleChunk = (chunkId: string) => {
         setExpandedChunks(prev => {
@@ -88,10 +109,12 @@ export function ChunkDrawer({ open, onOpenChange, document, knowledgeBaseId }: C
                                 <div className="grid grid-cols-4 gap-4 text-sm">
                                     <div>
                                         <p className="text-muted-foreground text-xs">切片数</p>
-                                        <p className="font-medium">{chunks.length}</p>
+                                        <p className="font-medium">
+                                            {chunks.length} / {totalChunks}
+                                        </p>
                                     </div>
                                     <div>
-                                        <p className="text-muted-foreground text-xs">总字符</p>
+                                        <p className="text-muted-foreground text-xs">已加载字符</p>
                                         <p className="font-medium">{documentStats.totalChars.toLocaleString()}</p>
                                     </div>
                                     <div>
@@ -122,7 +145,7 @@ export function ChunkDrawer({ open, onOpenChange, document, knowledgeBaseId }: C
                                             <CollapsibleTrigger asChild>
                                                 <button className="w-full p-3 flex items-start gap-3 hover:bg-muted/30 transition-colors text-left">
                                                     <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-blue-100 text-xs font-medium text-blue-600">
-                                                        {index + 1}
+                                                        {chunk.chunkIndex + 1}
                                                     </span>
                                                     <div className="flex-1 min-w-0">
                                                         <p className="text-sm leading-relaxed line-clamp-3">{chunk.content}</p>
@@ -239,6 +262,11 @@ export function ChunkDrawer({ open, onOpenChange, document, knowledgeBaseId }: C
                                     </Collapsible>
                                 ))}
                             </div>
+                            {nextCursor && (
+                                <Button className="m-4" variant="outline" disabled={loadingMore} onClick={() => loadChunks(nextCursor)}>
+                                    {loadingMore ? '加载中…' : '加载更多切片'}
+                                </Button>
+                            )}
                         </ScrollArea>
                     </div>
                 )}

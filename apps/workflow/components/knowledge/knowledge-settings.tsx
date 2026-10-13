@@ -20,6 +20,8 @@ import { useKnowledge } from '@/lib/contexts/knowledge-context'
 import { knowledgeService } from '@/lib/services/knowledge-service'
 
 interface SettingsFormData {
+    embeddingModel: string
+    dimensions: number
     name: string
     description: string
     icon: string
@@ -35,6 +37,8 @@ export function KnowledgeSettings() {
     const { knowledgeBase, setKnowledgeBase } = useKnowledge()
     const [saving, setSaving] = useState(false)
     const [formData, setFormData] = useState<SettingsFormData>({
+        embeddingModel: 'mxbai-embed-large:latest',
+        dimensions: 1024,
         name: '',
         description: '',
         icon: '📚',
@@ -46,21 +50,24 @@ export function KnowledgeSettings() {
         chunkOverlap: 50,
     })
 
+    const configuration = knowledgeBase
+        ? JSON.stringify({
+              embeddingModel: knowledgeBase.embeddingModel,
+              dimensions: knowledgeBase.dimensions,
+              name: knowledgeBase.name,
+              description: knowledgeBase.description || '',
+              icon: knowledgeBase.icon,
+              retrievalMode: knowledgeBase.retrievalMode,
+              vectorWeight: knowledgeBase.vectorWeight,
+              topK: knowledgeBase.topK,
+              threshold: knowledgeBase.threshold,
+              chunkSize: knowledgeBase.chunkSize,
+              chunkOverlap: knowledgeBase.chunkOverlap,
+          })
+        : null
     useEffect(() => {
-        if (knowledgeBase) {
-            setFormData({
-                name: knowledgeBase.name,
-                description: knowledgeBase.description || '',
-                icon: knowledgeBase.icon,
-                retrievalMode: knowledgeBase.retrievalMode,
-                vectorWeight: knowledgeBase.vectorWeight,
-                topK: knowledgeBase.topK,
-                threshold: knowledgeBase.threshold,
-                chunkSize: knowledgeBase.chunkSize,
-                chunkOverlap: knowledgeBase.chunkOverlap,
-            })
-        }
-    }, [knowledgeBase])
+        if (configuration) setFormData(JSON.parse(configuration) as SettingsFormData)
+    }, [configuration])
 
     const handleSave = async () => {
         if (!knowledgeBase) return
@@ -83,6 +90,58 @@ export function KnowledgeSettings() {
 
     return (
         <div className="max-w-2xl space-y-8">
+            {knowledgeBase && (
+                <div className="rounded-lg border p-4 space-y-3">
+                    <p className="text-sm">
+                        索引状态：
+                        {knowledgeBase.status === 'NEEDS_REBUILD'
+                            ? '需要重建'
+                            : knowledgeBase.status === 'INDEXING'
+                              ? '索引中'
+                              : knowledgeBase.status === 'ERROR'
+                                ? '任务异常'
+                                : '就绪'}
+                    </p>
+                    <p className="text-xs text-muted-foreground">修改模型或切分参数后会重建全部文档。重建期间暂停上传和检索。</p>
+                    <div className="flex gap-2">
+                        <Button
+                            variant="outline"
+                            disabled={saving || knowledgeBase.status === 'INDEXING'}
+                            onClick={async () => {
+                                try {
+                                    setSaving(true)
+                                    setKnowledgeBase(await knowledgeService.reindex(knowledgeBase.id))
+                                    toast.success('索引重建已排队')
+                                } catch (error) {
+                                    toast.error(error instanceof Error ? error.message : '重建失败')
+                                } finally {
+                                    setSaving(false)
+                                }
+                            }}
+                        >
+                            重建索引
+                        </Button>
+                        <Button
+                            variant="outline"
+                            disabled={saving}
+                            onClick={async () => {
+                                try {
+                                    setSaving(true)
+                                    await knowledgeService.retryJobs(knowledgeBase.id)
+                                    setKnowledgeBase(await knowledgeService.getById(knowledgeBase.id))
+                                    toast.success('失败任务已重新排队')
+                                } catch (error) {
+                                    toast.error(error instanceof Error ? error.message : '重试失败')
+                                } finally {
+                                    setSaving(false)
+                                }
+                            }}
+                        >
+                            重试失败任务
+                        </Button>
+                    </div>
+                </div>
+            )}
             <div>
                 <h2 className="text-lg font-semibold">设置</h2>
                 <p className="text-sm text-muted-foreground">配置知识库的基本信息和检索参数</p>
@@ -134,7 +193,9 @@ export function KnowledgeSettings() {
                             <SelectItem value="HYBRID">混合检索</SelectItem>
                         </SelectContent>
                     </Select>
-                    <p className="text-xs text-muted-foreground">向量检索基于语义相似度，全文检索基于关键词匹配，混合检索结合两者优势</p>
+                    <p className="text-xs text-muted-foreground">
+                        向量检索基于语义相似度，全文检索使用 BM25 词项排序，混合检索结合两者优势
+                    </p>
                 </div>
 
                 {formData.retrievalMode === 'HYBRID' && (
@@ -175,7 +236,7 @@ export function KnowledgeSettings() {
                         max={1}
                         step={0.05}
                     />
-                    <p className="text-xs text-muted-foreground">仅返回相似度高于此阈值的结果</p>
+                    <p className="text-xs text-muted-foreground">仅过滤向量召回；全文检索和融合排名使用各自的分数尺度</p>
                 </div>
             </div>
 
@@ -215,29 +276,29 @@ export function KnowledgeSettings() {
 
             <Separator />
 
-            {/* 嵌入模型信息（只读） */}
-            {knowledgeBase && (
-                <div className="space-y-4">
-                    <h3 className="font-medium">嵌入模型</h3>
-                    <div className="rounded-lg bg-muted/50 p-4">
-                        <div className="grid grid-cols-2 gap-4 text-sm">
-                            <div>
-                                <p className="text-muted-foreground">模型</p>
-                                <p className="font-medium">{knowledgeBase.embeddingModel}</p>
-                            </div>
-                            <div>
-                                <p className="text-muted-foreground">提供商</p>
-                                <p className="font-medium">{knowledgeBase.embeddingProvider}</p>
-                            </div>
-                            <div>
-                                <p className="text-muted-foreground">维度</p>
-                                <p className="font-medium">{knowledgeBase.dimensions}</p>
-                            </div>
-                        </div>
+            <div className="space-y-4">
+                <h3 className="font-medium">嵌入模型</h3>
+                <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                        <Label htmlFor="embedding-model">Ollama 模型</Label>
+                        <Input
+                            id="embedding-model"
+                            value={formData.embeddingModel}
+                            onChange={e => updateField('embeddingModel', e.target.value)}
+                        />
                     </div>
-                    <p className="text-xs text-muted-foreground">嵌入模型在创建知识库时确定，暂不支持修改</p>
+                    <div className="space-y-2">
+                        <Label htmlFor="embedding-dimensions">向量维度</Label>
+                        <Input
+                            id="embedding-dimensions"
+                            type="number"
+                            min={1}
+                            value={formData.dimensions}
+                            onChange={e => updateField('dimensions', Number(e.target.value))}
+                        />
+                    </div>
                 </div>
-            )}
+            </div>
 
             {/* 保存按钮 */}
             <div className="flex justify-end">

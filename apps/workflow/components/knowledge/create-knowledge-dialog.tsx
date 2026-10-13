@@ -28,6 +28,8 @@ const defaultIcons = ['📚', '📖', '📄', '📑', '📃', '📝', '🗂️',
 
 export function CreateKnowledgeDialog({ open, onOpenChange, onCreated }: CreateKnowledgeDialogProps) {
     const router = useRouter()
+    const [embeddingModel, setEmbeddingModel] = useState('mxbai-embed-large:latest')
+    const [dimensions, setDimensions] = useState(1024)
     const [name, setName] = useState('')
     const [description, setDescription] = useState('')
     const [icon, setIcon] = useState('📚')
@@ -39,6 +41,8 @@ export function CreateKnowledgeDialog({ open, onOpenChange, onCreated }: CreateK
         setIsCreating(true)
         try {
             const newKb = await knowledgeService.create({
+                embeddingModel: embeddingModel.trim(),
+                dimensions,
                 name: name.trim(),
                 description: description.trim() || undefined,
                 icon,
@@ -61,6 +65,8 @@ export function CreateKnowledgeDialog({ open, onOpenChange, onCreated }: CreateK
     }
 
     const resetForm = () => {
+        setEmbeddingModel('mxbai-embed-large:latest')
+        setDimensions(1024)
         setName('')
         setDescription('')
         setIcon('📚')
@@ -119,6 +125,23 @@ export function CreateKnowledgeDialog({ open, onOpenChange, onCreated }: CreateK
                         <p className="text-right text-xs text-muted-foreground">{name.length}/50</p>
                     </div>
 
+                    <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                            <Label htmlFor="kb-model">Ollama 模型</Label>
+                            <Input id="kb-model" value={embeddingModel} onChange={e => setEmbeddingModel(e.target.value)} />
+                        </div>
+                        <div className="space-y-2">
+                            <Label htmlFor="kb-dimensions">向量维度</Label>
+                            <Input
+                                id="kb-dimensions"
+                                type="number"
+                                min={1}
+                                value={dimensions}
+                                onChange={e => setDimensions(Number(e.target.value))}
+                            />
+                        </div>
+                    </div>
+                    <p className="text-xs text-muted-foreground">请选择服务端已安装的模型，创建时会验证实际输出维度。</p>
                     {/* 知识库描述 */}
                     <div className="space-y-2">
                         <Label htmlFor="kb-description">知识库描述</Label>
