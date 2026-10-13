@@ -625,6 +625,8 @@ const chunks = splitter.split(content);
 
 这证明项目根据文档类型选择切分器，但**仅凭名称不能证明 Markdown 切分器使用了 AST、标题层级元数据继承、LangChain 的两阶段方案或语义识别**。下一轮需要进一步读取具体实现，并沿输入、处理、输出及下游使用核实。
 
+**多格式输入的进一步工程分析：**上述示例只涉及已得到 `string` 的文档，无法解决 PDF/DOCX 的二进制解析、HTML/CSV/JSON 结构保存和代码文件的 AST/符号切分。最新项目仍以 `file.text()` 接收文本，尚无统一多格式 Parser。有关 **ParserRouter → ParsedDocument → ChunkerRouter** 的分层、PDF/Word/代码源码实例、原文件版本与重建、Dense/BM25 复用及验收边界，参见[多 Embedding 知识库构建与跨空间检索及补充召回源码分析——多格式文档接入](./RAG多Embedding知识库构建与跨空间检索及补充召回源码分析.md#多格式文档接入统一解析协议与结构感知切分)。该架构是后续设计，不是已落地源码。
+
 ### 【本轮结论与面试掌握标准】
 
 - 固定长度切分解决“多大”；递归字符切分改善“在哪里切”；Markdown 结构切分解决“内容属于哪一章”。
