@@ -28,9 +28,11 @@
         "@langchain/langgraph": "^1.0.0",
         "@langchain/ollama": "^1.0.0",
         "@qdrant/js-client-rest": "^1.16.2",
+        "markdown-it": "14.1.0",
         "zod": "^3.25.76"
     },
     "devDependencies": {
+        "@types/markdown-it": "14.1.2",
         "tsx": "^4.19.2",
         "vitest": "^4.0.16"
     }
