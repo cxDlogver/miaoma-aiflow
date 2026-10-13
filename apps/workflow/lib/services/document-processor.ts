@@ -57,6 +57,25 @@ export async function processDocument(params: ProcessDocumentParams): Promise<vo
         const chunkTexts = chunks.map(c => c.content)
         const embeddings = await embeddingService.embedTexts(chunkTexts)
 
+        // 入库前校验：Chunk 与 Embedding 必须一一对应，避免下标错配或无效向量入库。
+        if (embeddings.length !== chunks.length) {
+            throw new Error(`Embedding 数量不匹配：预期 ${chunks.length}，实际 ${embeddings.length}`)
+        }
+
+        embeddings.forEach((vector, index) => {
+            if (!Array.isArray(vector) || vector.length !== dimensions) {
+                throw new Error(`第 ${index} 个 Chunk 的向量维度无效：预期 ${dimensions}，实际 ${vector?.length ?? 0}`)
+            }
+
+            if (vector.some(value => !Number.isFinite(value))) {
+                throw new Error(`第 ${index} 个 Chunk 的向量包含非有限数值`)
+            }
+
+            if (vector.every(value => value === 0)) {
+                throw new Error(`第 ${index} 个 Chunk 的向量为全零向量，无法用于余弦相似度检索`)
+            }
+        })
+
         // 3. 存储到 Qdrant
         const vectorStore = createQdrantVectorStore({
             url: process.env.QDRANT_URL || 'http://localhost:6333',
