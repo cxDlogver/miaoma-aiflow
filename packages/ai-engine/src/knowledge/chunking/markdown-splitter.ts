@@ -4,8 +4,13 @@
  *   妙码学院官方出品，作者 @Heyi，供学员学习使用，可用作练习，可用作美化简历，不可开源。
  */
 
+import MarkdownIt from 'markdown-it'
+
 import type { ChunkingConfig, TextChunk, TextSplitterService } from '../types'
 import { DEFAULT_CHUNKING_CONFIG } from '../types'
+
+// 通过 Markdown 块级语法识别真实标题，避免把代码块中的 # 误识别为标题。
+const markdownParser = new MarkdownIt()
 
 /**
  * Markdown 文本切分器
@@ -75,67 +80,86 @@ export class MarkdownSplitter implements TextSplitterService {
             headerPath: string[]
         }> = []
 
-        // 匹配 Markdown 标题 (# ## ### 等)
-        const headerRegex = /^(#{1,6})\s+(.+)$/gm
+        // MarkdownIt 的 heading_open Token 含有原始行号；
+        // 预先建立行号到原始字符串偏移量的映射，兼容 LF、CRLF 和 CR 换行符。
+        const lineOffsets = [0]
+        for (let i = 0; i < text.length; i++) {
+            if (text[i] === '\r') {
+                if (text[i + 1] === '\n') i++
+                lineOffsets.push(i + 1)
+            } else if (text[i] === '\n') {
+                lineOffsets.push(i + 1)
+            }
+        }
+
+        // Markdown Token 可以区分标题与 fenced/indented code 等块级结构。
+        const tokens = markdownParser.parse(text, {})
         const headers: Array<{ level: number; title: string; index: number }> = []
 
-        let match
-        while ((match = headerRegex.exec(text)) !== null) {
-            headers.push({
-                level: match[1].length,
-                title: match[2].trim(),
-                index: match.index,
+        for (let i = 0; i < tokens.length; i++) {
+            const token = tokens[i]
+            if (token.type !== 'heading_open' || !token.map) continue
+
+            const level = Number(token.tag.slice(1))
+            const startOffset = lineOffsets[token.map[0]]
+            const inlineToken = tokens[i + 1]
+            if (!Number.isInteger(level) || level < 1 || level > 6 || startOffset === undefined || inlineToken?.type !== 'inline') {
+                continue
+            }
+
+            // 从 inline 子 Token 提取可读标题，避免把强调、链接等 Markdown 标记写进 headerPath。
+            const title = (inlineToken.children ?? [])
+                .map(child => {
+                    if (child.type === 'text' || child.type === 'code_inline' || child.type === 'image') return child.content
+                    if (child.type === 'softbreak' || child.type === 'hardbreak') return ' '
+                    return ''
+                })
+                .join('')
+                .trim() || inlineToken.content.trim()
+
+            headers.push({ level, title, index: startOffset })
+        }
+
+        // 裁剪空白时同步调整起始偏移，确保 Section 仍能定位回原文。
+        const appendSection = (start: number, end: number, headerPath: string[]) => {
+            const raw = text.slice(start, end)
+            const content = raw.trim()
+            if (content.length === 0) return
+
+            const removedPrefix = raw.length - raw.trimStart().length
+            sections.push({
+                content,
+                startOffset: start + removedPrefix,
+                headerPath: [...headerPath],
             })
         }
 
         if (headers.length === 0) {
-            // 没有标题，整个文档作为一个段落
-            return [
-                {
-                    content: text,
-                    startOffset: 0,
-                    headerPath: [],
-                },
-            ]
+            appendSection(0, text.length, [])
+            return sections
         }
 
-        // 构建标题路径并切分
-        const headerStack: string[] = []
+        // 标题栈必须保存真实 level，不能以数组长度代表标题级别（Markdown 允许跳级）。
+        const headerStack: Array<{ level: number; title: string }> = []
+
+        if (headers[0].index > 0) {
+            appendSection(0, headers[0].index, [])
+        }
 
         for (let i = 0; i < headers.length; i++) {
             const header = headers[i]
             const nextHeader = headers[i + 1]
 
-            // 更新标题栈
-            while (headerStack.length >= header.level) {
+            while (headerStack.length > 0 && headerStack[headerStack.length - 1].level >= header.level) {
                 headerStack.pop()
             }
-            headerStack.push(header.title)
+            headerStack.push({ level: header.level, title: header.title })
 
-            // 提取段落内容
-            const startOffset = header.index
-            const endOffset = nextHeader ? nextHeader.index : text.length
-            const content = text.slice(startOffset, endOffset).trim()
-
-            if (content.length > 0) {
-                sections.push({
-                    content,
-                    startOffset,
-                    headerPath: [...headerStack],
-                })
-            }
-        }
-
-        // 处理第一个标题之前的内容
-        if (headers[0].index > 0) {
-            const preContent = text.slice(0, headers[0].index).trim()
-            if (preContent.length > 0) {
-                sections.unshift({
-                    content: preContent,
-                    startOffset: 0,
-                    headerPath: [],
-                })
-            }
+            appendSection(
+                header.index,
+                nextHeader ? nextHeader.index : text.length,
+                headerStack.map(item => item.title)
+            )
         }
 
         return sections
@@ -181,14 +205,18 @@ export class MarkdownSplitter implements TextSplitterService {
                 endOffset = bestSplit
             }
 
-            const chunkContent = content.slice(startOffset, endOffset).trim()
+            const rawChunk = content.slice(startOffset, endOffset)
+            const chunkContent = rawChunk.trim()
 
             if (chunkContent.length > 0) {
+                const removedPrefix = rawChunk.length - rawChunk.trimStart().length
+                const chunkStart = baseOffset + startOffset + removedPrefix
+
                 chunks.push({
                     content: chunkContent,
                     index,
-                    startOffset: baseOffset + startOffset,
-                    endOffset: baseOffset + endOffset,
+                    startOffset: chunkStart,
+                    endOffset: chunkStart + chunkContent.length,
                 })
                 index++
             }
@@ -197,8 +225,9 @@ export class MarkdownSplitter implements TextSplitterService {
                 break
             }
 
+            const previousStart = startOffset
             startOffset = endOffset - chunkOverlap
-            if (startOffset <= chunks[chunks.length - 1]?.startOffset - baseOffset) {
+            if (startOffset <= previousStart) {
                 startOffset = endOffset
             }
         }
