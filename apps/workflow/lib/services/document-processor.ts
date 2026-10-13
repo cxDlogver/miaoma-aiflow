@@ -76,6 +76,7 @@ export async function processDocument(params: ProcessDocumentParams): Promise<vo
             documentId,
             knowledgeBaseId,
             vector: embeddings[idx],
+            metadata: chunk.metadata,
         }))
 
         // 存储向量
