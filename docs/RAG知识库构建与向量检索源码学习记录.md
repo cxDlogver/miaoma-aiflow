@@ -418,6 +418,317 @@ LLM Wiki 与**知识图谱**也不是同一概念。Wiki 可通过页面链接�
 
 
 
+## 【第一节追问：GraphRAG 如何从自然语言定位实体、扩展关系并读取原始 Chunk】
+
+### 【问题：GraphRAG 的图索引是否代替向量检索？实体到底是什么】
+
+GraphRAG（Graph Retrieval-Augmented Generation）在传统 RAG 之外引入实体关系图和社区级知识表示。**实体（Entity）通常不是原始 Document，也不是 Chunk，而是从 Chunk 中识别出来、经过必要归一化的对象或概念。** 例如 `WebSocket`、`Access Token`、`Refresh Token`、`认证服务` 可以成为不同的实体；它们之间的“鉴权使用”“换取凭证”等联系是 Relationship（关系/图的边）。
+
+- **Document**：原始文件及版本，例如《WebSocket 鉴权.md》。
+- **TextUnit / Chunk**：从 Document 中解析、切分的文本片段；保留 `documentId` 和原文位置。
+- **Entity**：从一处或多处 TextUnit 提取的同一对象/概念；具有 `entityId、name、description、textUnitIds`。
+- **Relationship**：`sourceEntityId、targetEntityId、description、textUnitIds`，用实体 ID 表示关系端点，同时记录支撑这条关系的来源片段。
+- **Community**：对实体关系图做社区发现后得到的关联较紧密的实体群；不是某个 Document、文件夹或单个 Chunk。
+- **Community Report**：对一个社区中实体、关系等信息预先进行 LLM 总结的内容，通常对应一个社区及层级。
+
+**“图索引”和“向量索引”是两种不同用途的数据结构**：图索引把实体和关系组织为可按 ID、边、社区查询的数据；向量索引通过语义相似度把自然语言 Query 映射到候选实体或 Chunk。图遍历、按 `textUnitId` 读取原文不必调用 Embedding；但无法准确确定实体入口时，语义检索往往仍有价值。
+
+微软 GraphRAG 的官方 [数据模型与索引流程](https://github.com/microsoft/graphrag/blob/main/docs/index/default_dataflow.md)、[导出数据结构](https://github.com/microsoft/graphrag/blob/main/docs/index/outputs.md) 将它们区分为不同对象，不能把“实体=Chunk”或“社区=一篇文档”理解成项目事实。
+
+### 【离线阶段：原文怎样变成实体、关系、社区和多种索引】
+
+示例原始文本：
+
+~~~text
+Document D1《WebSocket 鉴权》
+  Chunk C1：WebSocket 连接使用 Access Token 验证身份。
+Document D2《凭证刷新》
+  Chunk C2：Refresh Token 用于换取新的 Access Token。
+Document D3《连接恢复》
+  Chunk C3：WebSocket 断线并重连时需要重新鉴权。
+~~~
+
+在微软标准 GraphRAG 的离线索引流程中，LLM 先分析每个 TextUnit，抽取实体及关系，跨 TextUnit 合并实体描述和关系描述，再进行社区发现、生成社区报告；如果要使用向量搜索，还可以对实体描述、原始 TextUnit 和社区报告分别生成 Embedding。关系不应仅因为两个词出现在同一段文字就视为已证实的因果关系，必须保存来源。示意结构：
+
+~~~typescript
+// 教学记录，不是微软 SDK 或当前 AI Flow 的真实数据库模型
+const entities = [
+  { id: 'E1', name: 'WebSocket', description: '双向持续通信协议', textUnitIds: ['C1', 'C3'] },
+  { id: 'E2', name: 'Access Token', description: '连接身份验证使用的访问凭证', textUnitIds: ['C1', 'C2'] },
+  { id: 'E3', name: 'Refresh Token', description: '用于申请新 Access Token 的刷新凭证', textUnitIds: ['C2'] },
+  { id: 'E4', name: '重新鉴权', description: '连接重建后重新验证访问主体', textUnitIds: ['C3'] },
+];
+const relationships = [
+  { id: 'R1', source: 'E1', target: 'E2', description: '连接鉴权使用访问凭证', textUnitIds: ['C1'] },
+  { id: 'R2', source: 'E3', target: 'E2', description: '刷新凭证可用于换取访问凭证', textUnitIds: ['C2'] },
+  { id: 'R3', source: 'E1', target: 'E4', description: '连接重建需要重新鉴权', textUnitIds: ['C3'] },
+];
+~~~
+
+这些字段各有明确含义：`E1/E2` 是**实体身份**，`R1` 是**关系身份**，`C1` 是**原文证据身份**。一个 Chunk 可能提取多个实体，同一 Entity 也可能来自多篇文档。`Relationship.textUnitIds` 可以从关系回查抽取时所依据的片段；`Entity.textUnitIds` 说明哪些片段提及实体，但不意味着每篇片段都支持当前问题的结论。实际实现还要处理同名实体消歧、关系冲突和语义重复。
+
+~~~text
+原始 Document
+      ↓ Parser / Chunking（离线）
+TextUnit C1/C2/C3（保留 documentId、version）
+      ↓ LLM 抽取 Entity 和 Relationship
+实体表 + 关系表 + Entity/Relationship ↔ TextUnit 来源映射
+      ├───────────────────────────────────┐
+      ↓                                   ↓
+构建实体图、分层社区发现                  若需要语义定位，生成向量
+      ↓                                   ↓
+Community、Community Report            Embedding(Entity.description)
+      ↓                                   ↓
+按 communityId/level 持久化             Entity Vector Index（保留 entityId）
+      │                                   │
+      ↓                                   ↓
+Global Search 的预计算内容            Local Search 的入口实体检索
+~~~
+
+在微软的标准配置中，还可能产生 `Embedding(TextUnit.text)` 和 `Embedding(CommunityReport)`，用于其他检索模式；**这些并不是生成社区关系图所必需的先决条件**。默认图及社区产物可以保存在 Parquet/普通数据库，专用图数据库不是强制依赖。详见 [索引数据流](https://github.com/microsoft/graphrag/blob/main/docs/index/default_dataflow.md) 和 [Bring Your Own Graph](https://github.com/microsoft/graphrag/blob/main/docs/index/byog.md)。
+
+### 【Local Search 第一步：Query Embedding 怎样定位 Entity】
+
+问题：“连接失效之后，怎样恢复认证？”
+
+此时用户没有直接提供准确的实体 ID；图中也可能没有一个名称恰好是“连接失效之后怎样恢复认证”的实体。因此在线 Local Search 可以通过语义索引定位入口：
+
+~~~text
+【提前离线计算】
+E1.description：“双向持续通信协议” ── Embedding ── V1
+E2.description：“连接身份验证的访问凭证” ── Embedding ── V2
+E4.description：“连接重建后重新验证主体” ── Embedding ── V4
+                                                 ↓
+             Entity Description Vector Index
+                 每条向量关联 entityId
+
+【每次在线查询】
+用户问题：“连接失效之后，怎样恢复认证？”
+      ↓
+embedding.embedText(query) → Query Vector
+      ↓
+entityVectorIndex.search(QueryVector, topK, authorizedScope)
+      ↓
+命中 E4（重新鉴权）、E1（WebSocket）及相似度分数
+      ↓
+GraphRepository.getEntities(['E4', 'E1'])
+      ↓
+获得入口实体完整描述与来源映射
+~~~
+
+**这里做相似度检索的是 Entity Description 的向量，不是 Chunk 的向量。** 实体描述可能综合多份文本对同一实体的说明。语义命中返回 `entityId`；查询得到 `entityId` 后，后续访问图结构和原文不必继续用向量相似度逐条寻找。
+
+`Query Vector` 与 `Entity Description Vector` 必须使用兼容的 Embedding 编码模型及协议；“都为 1024 维”并不证明模型语义空间一致。实现可以使用 Qdrant、LanceDB 或其他向量检索服务，但**微软 GraphRAG 并不规定必须使用 Qdrant**。如果用户已经提供准确实体名，也可以先尝试别名、精确检索或 BM25 来定位入口实体，Embedding 不是数学意义上的必需条件。
+
+官方 [Local Search](https://microsoft.github.io/graphrag/query/local_search/) 的数据流明确将 `User Query → Entity Description Embedding → Extracted Entities` 作为典型入口。
+
+### 【Local Search 第二步：查到实体后，怎样利用 Relationship 找更多知识】
+
+获得 `E4=重新鉴权`、`E1=WebSocket` 后，执行关系查询：
+
+~~~text
+入口：E4、E1
+      ↓ GraphRepository.getRelatedRelationships([E4, E1])
+R3：WebSocket (E1) → 重新鉴权 (E4)
+R1：WebSocket (E1) → Access Token (E2)
+      ↓ 获取相关边的另一端
+E2：Access Token
+      ↓ 按策略选取进一步关联的边（示意第二跳）
+R2：Refresh Token (E3) → Access Token (E2)
+      ↓
+候选实体：E1、E2、E3、E4
+候选关系：R1、R2、R3
+~~~
+
+这一阶段读的是 `Relationship.source/target` 构成的邻接关系。查询可以使用普通数据库的索引与关联查询，也可以使用图数据库的边遍历；**这里的索引是数据库实体 ID/边连接索引，不是 Dense Vector Index**，不需要每查一个邻居重新生成 Embedding。
+
+但不能误以为微软 Local Search 默认“无条件 BFS 两跳”：其真实方法按入口实体得到相关关系、关联实体、社区报告、TextUnit 等候选，执行排序与 Token 预算过滤。**上面的第二跳是便于说明原理的可选扩展策略，不是固定源码行为**。图上能从 `Refresh Token` 走到 `WebSocket`，也不意味着“WebSocket 握手直接使用 Refresh Token”；实体路径只是提供需要核实的关系线索。
+
+### 【Local Search 第三步：怎样通过 textUnitIds 获取 Chunk】
+
+到这里有三个关系记录，每条关系在离线抽取时都保存了原文 ID：
+
+~~~text
+R1.textUnitIds = ['C1']
+R2.textUnitIds = ['C2']
+R3.textUnitIds = ['C3']
+       ↓ 合并、去重，得到 candidateChunkIds
+['C1','C2','C3']
+       ↓
+textUnitRepository.findByIds(candidateChunkIds, authorizedScope)
+       ↓
+C1：“WebSocket 连接使用 Access Token 验证身份。”
+C2：“Refresh Token 用于换取新的 Access Token。”
+C3：“WebSocket 断线并重连时需要重新鉴权。”
+       ↓
+按知识库、索引版本、文档 READY/未删除、用户权限校验
+       ↓
+排序与过滤 Chunk + 关联实体描述 + 关系描述 + 可选 Community Report
+       ↓
+Token 预算内组装 Context → LLM 回答并引用来源
+~~~
+
+**`findByIds(['C1','C2','C3'])` 是普通按 ID 读取，不是重新调用 Qdrant Dense/BM25 搜索。** 因为原文 Chunk ID 已在图关系中确定。如果需要发现图中未覆盖的其他证据，才可以另外调用现有 Chunk Dense/BM25 Retriever；那是一种**可选混合检索设计**，并非读取 `textUnitIds` 的前提。
+
+官方 Local Search 的 [Dataflow](https://microsoft.github.io/graphrag/query/local_search/) 同时包含 Entity ↔ TextUnit、Entity ↔ Relationship、Entity ↔ Community Report、可选 Covariate 等路径，因此它并不是简单“向量检索实体→全量遍历邻居→取所有 Chunk”。应设置候选数、关系质量、原文相关性、Chunk 去重、权限和上下文 Token 预算。LLM 最终引述的事实还需要与原文核对：图关系自身也可能由 LLM 错误抽取。
+
+### 【Local Search 的工具与代码级链路】
+
+下面是建议在已有 AI Flow 架构上实现的**教学伪代码**，不是项目当前已有的 `GraphRepository`、`EntityVectorIndex` 或官方 Python SDK：
+
+~~~typescript
+interface EntityVectorIndex {
+  search(vector: number[], scope: AuthorizedScope, topK: number):
+    Promise<Array<{ entityId: string; score: number }>>;
+}
+interface GraphRepository {
+  findEntities(ids: string[], scope: AuthorizedScope): Promise<Entity[]>;
+  findRelatedRelationships(entityIds: string[], scope: AuthorizedScope):
+    Promise<Relationship[]>;
+  findCommunityReports(entityIds: string[], scope: AuthorizedScope):
+    Promise<CommunityReport[]>;
+}
+interface TextUnitRepository {
+  findByIds(textUnitIds: string[], scope: AuthorizedScope): Promise<TextUnit[]>;
+}
+
+async function localGraphSearch(query: string, scope: AuthorizedScope) {
+  // A：语义定位入口实体，Qdrant 可存 entityId + Entity Description Vector
+  const vector = await entityEmbedding.embedText(query);
+  const hits = await entityVectorIndex.search(vector, scope, 10);
+  const seeds = await graphRepository.findEntities(hits.map(x => x.entityId), scope);
+
+  // B：按 ID/边连接查图，不需要重新生成 Query Vector
+  const rawRelations = await graphRepository.findRelatedRelationships(
+    seeds.map(x => x.id), scope
+  );
+  const relations = rankAndLimitRelationships(rawRelations, seeds, 20);
+  const entities = await graphRepository.findEntities(
+    collectRelatedEntityIds(seeds, relations), scope
+  );
+
+  // C：用离线保存的来源映射按 ID 查询原文，不进行 Chunk 相似度召回
+  const ids = collectSourceTextUnitIds(entities, relations);
+  const chunks = await textUnitRepository.findByIds(ids, scope);
+  const reports = await graphRepository.findCommunityReports(
+    entities.map(x => x.id), scope
+  );
+
+  // D：按相关性、来源可靠性和 Token 预算选证据，再交给模型
+  const context = buildLocalGraphContext({
+    query, seeds, entities, relations, chunks, reports
+  });
+  return llm.generate({ query, context });
+}
+~~~
+
+`AuthorizedScope`、`rankAndLimitRelationships` 等是设计契约，示例不可不加实现就直接运行。它把调用职责明确拆开：
+
+| 执行顺序 | 组件调用 | 输入与返回 | 是否需要向量/LLM |
+| --- | --- | --- | --- |
+| 1 | `entityEmbedding.embedText` | Query → Query Vector | Embedding |
+| 2 | `entityVectorIndex.search` | 向量 + 已授权范围 → `entityId` 候选 | 向量近邻索引 |
+| 3 | `graphRepository.findEntities` | 实体 ID → 实体及描述 | 普通 ID 查询 |
+| 4 | `findRelatedRelationships` | 实体 ID → 边及邻居 ID | 图/数据库索引，不是向量 |
+| 5 | `textUnitRepository.findByIds` | `textUnitIds` → 原文 Chunk、来源 | 普通 ID 查询 |
+| 6 | `findCommunityReports` | 关联实体/社区 → 报告 | 普通关联查询 |
+| 7 | `buildLocalGraphContext` | 选出的原文/图数据 → Prompt Context | 可纯代码完成 |
+| 8 | `llm.generate` | Query + Context → 答案与引用 | 生成式 LLM |
+
+安全边界是：**不仅 Chunk，要对 Entity、Relationship、Community Report 也应用来源范围与权限控制。** 一个混合多份受限文档的实体描述或社区摘要，可能在回查 Chunk 前就泄露无权访问的知识。文档删除、撤权、`DocumentIndex` 替换必须同步失效或重新构建关联图及缓存。
+
+### 【Global Search：社区报告与 Chunk 的关系发生在什么时候】
+
+Local Search 先找到实体，再沿关系和来源映射获取原始 Chunk；Global Search 主要解决“整个知识库有哪些主要安全风险”一类整体性问题：
+
+~~~text
+【离线】
+Chunk → 实体/关系 → 社区发现 → 按社区 LLM 生成 Community Report
+                                        ↓
+                          社区报告持久化（communityId、level、内容）
+
+【在线】
+用户 Query + 可信范围
+        ↓
+从报告库读取指定层级 Community Report（而不是全部原始 Chunk）
+        ↓
+GlobalContextBuilder 按 Token 预算把报告组织成多个 Batch
+        ↓
+Map LLM：每批社区报告 + 同一个 Query → 问题相关要点及重要性评分
+        ↓
+Reduce：合并要点、按评分筛选、控制 Token → 再调用 LLM 输出整体回答
+~~~
+
+例如离线生成三份报告：A“认证安全”、B“实时通信”、C“页面性能”。Query 为“项目有哪些可靠性设计”时，Map 可能把 A+B 放进第一批、C 放进第二批；两批分别调用 LLM，得到 `[{description:'Token 失效与权限校验',score:9}, ...]` 等结果。**评分是 Map 模型为当前问题给出的重要性评价，不是 Qdrant 的 Cosine/BM25，也不是实体中心性分数。** Reduce 才把多批发现合成为回答。
+
+这解释了为什么标准静态 Global Search **不需要在 Map 阶段重新阅读所有原始 Document，也不要求针对每个 Batch 再运行 Chunk Dense/BM25 相似度检索**：报告在离线已根据图生成。Map/Reduce 主要是 LLM 调用与普通报告读取。Map 的执行批次数取决于报告数量与 Token 预算，不是“一个 Document 一次 LLM”。
+
+~~~typescript
+// Global Search 教学伪代码，不是当前 AI Flow 的业务实现
+async function globalGraphSearch(query: string, scope: AuthorizedScope) {
+  const reports = await communityReportRepository.findByLevel(scope, 1);
+  const batches = splitReportsByTokenBudget(reports, 8000);
+  const mapped = await mapWithConcurrencyLimit(
+    batches, 4,
+    batch => mapLLM.analyze({ query, communityReports: batch })
+  );
+  const ranked = mapped.flatMap(result => result.points)
+    .filter(point => point.score > 0)
+    .sort((a, b) => b.score - a.score);
+  return reduceLLM.generate({
+    query, points: fitWithinTokenBudget(ranked)
+  });
+}
+~~~
+
+如果要求精确说明某一规范条款、文档页码或代码路径，社区摘要可能丢失细节。**回查证据是另外一个可选步骤**：有 `communityId/Entity/Relationship → textUnitIds` 时，可按 ID 读取；没有足够支持时，可再次用 Dense/BM25 检索原文。不能把这一扩展误认为微软 Global Search 默认每次 Map 都会进行。
+
+微软官方明确区分 [Local Search](https://microsoft.github.io/graphrag/query/local_search/) 的实体/原文混合上下文和 [Global Search](https://microsoft.github.io/graphrag/query/global_search/) 的 Community Report Map-Reduce。
+
+### 【GraphRAG 究竟还需不需要 Embedding 和向量数据库】
+
+| 检索对象 / 操作 | 如何查找 | 是否需要向量索引 |
+| --- | --- | --- |
+| Entity/Relationship/Community 记录 | 主键、关系端点、社区 ID | 不需要 |
+| 已有 `textUnitIds` 找原始 Chunk | `findByIds` | 不需要 |
+| 标准静态 Global Search | 按层级读取报告 → Map → Reduce | 不需要 |
+| Local Search 入口实体语义匹配 | Query Vector 与 Entity Description Vector 检索 | 典型实现需要 |
+| 传统 Dense RAG 或 Basic Search | Query Vector 与 Chunk Vector 检索 | 使用 Dense 时需要 |
+| 只按实体名称查找 | 精确/别名/关键词索引 | 不需要 |
+| 报告相关性路由（可选） | Report Embedding 的 TopK | 使用该优化时需要 |
+
+微软 GraphRAG 的**默认完整索引管线**通常也为实体描述、TextUnit 和社区报告构建 Embedding；但官方 [Bring Your Own Graph](https://github.com/microsoft/graphrag/blob/main/docs/index/byog.md) 指出：最小 Global Search 只需图和社区报告工作流，若要使用 Local、DRIFT、Basic 等模式再补充 TextUnit 和必要 Embedding。因此“GraphRAG 可以不依赖向量执行静态 Global”与“完整 GraphRAG 默认包含向量索引”并不矛盾。
+
+### 【GraphRAG 与 LLM Wiki 的知识关联不是同一个默认结构】
+
+前一章讨论了 [RAG 与 LLM Wiki](#第一节追问rag-与-llm-wiki-为什么是不同层面的知识体系)。普通 Wiki 的 `[[Token 生命周期]]` 是面向知识页面的链接，说明页面有关，但不一定定义关系类型、实体 ID 或原文证据。GraphRAG 的图节点通常是 Entity，图边是实体之间的 Relationship，来源标识可追溯 TextUnit，因此支持按关系查询和证据定位。**Wiki 页面链接图不自动等于结构化实体关系知识图谱**；但 Wiki 也可以额外抽取 Entity/Relationship，GraphRAG 的 Community Report 也可以作为 Wiki 素材。两者主要目标分别是**图辅助检索**与**长期维护、修订知识页面**。
+
+### 【在妙码 AI Flow 中应如何逐层落地】
+
+当前真实链路见 [文档处理](../apps/workflow/lib/services/document-processor.ts)、[Qdrant Store](../packages/ai-engine/src/knowledge/store/qdrant-store.ts) 与 [MultiKnowledgeRetriever](../packages/ai-engine/src/knowledge/retriever/multi-knowledge-retriever.ts)：`Document → Chunk → Dense + BM25 → Qdrant → RRF → LLM 上下文`。现有系统**尚未实现实体关系提取、实体描述向量索引、图查询、社区发现或 Global/Local Graph Search**。建议不替换已经能工作的 Dense/BM25，而是在离线构建时添加另一条图索引分支：
+
+~~~text
+Document → Parser / Chunk
+    ├→ 已有 Chunk Embedding + BM25 → Qdrant
+    └→ 新增实体关系抽取 → Entity/Relationship ↔ textUnitIds
+                  ├→ Entity Description Embedding → 实体向量索引（Local）
+                  └→ 分层社区发现 → Community Report（Global）
+在线：Query → 按问题选择传统 Chunk 检索、Local 图检索或 Global 报告综合
+             → 权限过滤与来源复核 → LLM
+~~~
+
+真正的第一步应是**保证 Entity 与 Relationship 的来源 textUnitIds 正确可追溯**，再实现 `Query Embedding → Entity IDs → Relationship → TextUnit IDs → 原文 Chunk` 的最短闭环。图、实体向量、社区报告要绑定 `knowledgeBaseId/indexId/documentIndexId` 等版本化身份，避免旧索引残留和跨权限来源泄露；只有真实存在大量全局主题问题时再评估社区发现和 Global Map-Reduce 的离线/在线成本。
+
+### 【验证方法与面试标准回答】
+
+测试应覆盖以下区分：Query 向量定位实体正确率、实体关系召回覆盖、`textUnitIds` 对原文的可定位性、证据忠实性、跨文档问题的答案完整度、Global 的主题覆盖与 Map/Reduce 成本、删除与撤权后的图失效。不要把实体向量 Cosine、关系权重、Map 重要性评分当成同一个“可靠性”指标。
+
+面试回答可以概括：**GraphRAG 离线从 Chunk 抽取实体和关系，记录到原文的映射，再按需构建实体描述向量索引和社区报告。Local Search 典型先把 Query 转成向量，在实体描述索引上定位入口 Entity；之后以结构化关系查邻居，通过来源 `textUnitIds` 按 ID 读取 Chunk，再结合实体/关系/报告组织 LLM Context。Local 的图关系查询和按 ID 读 Chunk 不需要二次向量检索。Global Search 主要基于离线生成的 Community Reports 进行 Map-Reduce，不在默认 Map 中对原始 Chunk 重新执行 TopK。向量索引解决语义定位，图索引解决实体关联，社区报告解决全局知识综合。**
+
+**官方资料**：[GraphRAG Indexing Dataflow](https://github.com/microsoft/graphrag/blob/main/docs/index/default_dataflow.md) · [Index Outputs](https://github.com/microsoft/graphrag/blob/main/docs/index/outputs.md) · [Local Search](https://microsoft.github.io/graphrag/query/local_search/) · [Global Search](https://microsoft.github.io/graphrag/query/global_search/) · [Bring Your Own Graph](https://github.com/microsoft/graphrag/blob/main/docs/index/byog.md)。
+
+
+
 ---
 
 ## 【第二节：Chunking——为什么 RAG 需要对文档进行切分？】
