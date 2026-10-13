@@ -4,6 +4,9 @@
 
 ## 【一、RAG 知识库的职责、来源与完整运行链路】
 
+本章用现有项目资料解释 RAG 的知识源、检索与生成边界。跨项目可复用的 Source/Document/Chunk 身份、版本、解析和发布机制，详见[通用 RAG 知识供给体系](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)；具体的项目实现与教学示例由本章保留，不由通用文档代替。
+
+
 ### 【RAG 为什么需要外部知识与企业问答架构】
 #### 【题目与学习目标】
 
@@ -303,6 +306,9 @@ RAG 也不等于 Agent：RAG 负责证据获取与生成增强，Agent 负责动
 
 
 ## 【二、文档切分与结构化知识表示】
+
+本章中的 MarkdownSplitter、headerPath、真实业务代码与切分示例，对应[通用 Chunking、结构化切分及 Embedding 数据契约](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/X-向量知识表示存储与索引完整链路.md)；项目实现中已存在的行为与多格式 Parser 的待实现设计须分别阅读。
+
 
 ### 【为什么需要 Chunking：从文档到检索单元】
 #### 【当前讨论的问题及边界】
@@ -821,6 +827,9 @@ RAG 中 Metadata 要经历切分、应用层对象转换、向量 Payload 构建
 
 ## 【三、Embedding 与向量表示】
 
+Embedding 兼容模型、Query 与 Document 编码及 Cosine/Dot/Euclidean 的通用机制，见[向量知识表示与索引的 Embedding 章节](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/X-向量知识表示存储与索引完整链路.md)；本章继续保留 AI Flow 中模型适配与参数传递的实际源码。
+
+
 ### 【Embedding 文本表示与模型调用】
 #### 【提问和业务背景】
 
@@ -1066,6 +1075,9 @@ const response = await this.client.search(this.collectionName, {
 
 
 ## 【四、Qdrant 存储、ANN/HNSW 与索引生命周期】
+
+Qdrant Point、Payload Filter、HNSW 建图、Segment 写入和跨 Segment Top-K 的完整通用原理，见[向量存储、ANN 和 Segment 的完整链路](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/X-向量知识表示存储与索引完整链路.md)。本章以项目调用及索引内部操作解释这些原理，不将“向量近邻图”和后续 GraphRAG 的实体关系图混为一谈。
+
 
 ### 【Qdrant Collection、Payload 与 Filter 的职责】
 #### 【提问】
@@ -2124,6 +2136,9 @@ Qdrant 的多个 Segment 独立搜索并聚合为全局 Top-K。完整获取各�
 
 ## 【五、GraphRAG 的实体关系检索与社区报告】
 
+本章包含 GraphRAG 的完整教学推演及 AI Flow 扩展接口；通用机制在[混合检索与 GraphRAG Local/Global 查询专题](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG混合检索过滤融合与重排序完整知识体系.md)中按 Entity Description 向量定位、Relationship 查询、textUnitIds 取 Chunk、Community Map-Reduce 逐步说明。当前 AI Flow 并未实现这些 GraphRAG 接口。
+
+
 ### 【GraphRAG 如何从自然语言定位实体、扩展关系并读取原始 Chunk】
 #### 【问题：GraphRAG 的图索引是否代替向量检索？实体到底是什么】
 
@@ -2440,6 +2455,9 @@ Document → Parser / Chunk
 
 ## 【六、LLM Wiki 的长期知识组织与更新】
 
+LLM Wiki 的 Raw/Wiki/Schema、Ingest/Query/Lint、来源修订和冲突管理已归入[通用 RAG 知识供给与维护文档](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG与知识库工程完整知识体系.md)；本章继续保留本项目能否组合 Wiki、已实现能力边界以及 WebSocket 鉴权资料的完整讨论。
+
+
 ### 【RAG 与 LLM Wiki 为什么是不同层面的知识体系】
 #### 【问题：系统是在回答问题，还是在持续整理知识】
 
@@ -2563,6 +2581,49 @@ LLM Wiki 与**知识图谱**也不是同一概念。Wiki 可通过页面链接�
 
 
 ## 【七、检索能力边界、综合验证与后续专题】
+
+本章将当前源码已实现的基础检索与后续 GraphRAG、Wiki 设计分开验收。通用的[证据充分性、补检与工具执行](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG上下文构建证据冲突与补检完整知识体系.md)、[Ground Truth 及相关性指标](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG检索目标GroundTruth与排序评测完整知识体系.md)和[端到端质量与成本归因](https://github.com/cxDlogver/cx-learn-notes/blob/main/Full-Stack-AI-NOTES/R-RAG端到端质量评测与失效归因完整知识体系.md)分别提供测试口径。
+
+
+### 【把实际源码可用性和设计扩展分别落到可复现的输入】
+
+对于当前 AI Flow，先用同一个已授权知识库 KB-A 的两个文档进行最小验收：C1“WebSocket 使用 Access Token 鉴权”、C2“Refresh Token Rotation 更新 Access Token”。上传成功后，记录 `Document.id`、`DocumentIndex` 与活动索引 ID；只有文档索引处于 READY 时，才能把对应 Point 当作可用于问答的证据。通过现有 `QdrantVectorStore` 与检索执行链，分别检查 Dense、BM25 和 Hybrid 的 Chunk ID、索引版本及权限过滤是否正确；如果实际没有部署 Ollama 或 Qdrant，应明确列为环境未验收，不能把源码具备调用逻辑写成线上已验证。
+
+~~~text
+已实现能力的测试输入：
+  KB-A（允许访问）→ Document D1/D2 → TextChunk C1/C2
+                     ↓
+             Ollama Embedding + BM25
+                     ↓
+          Qdrant Point（chunkId、indexId、metadata）
+                     ↓
+Query：“Token 更新与连接认证的关系”
+                     ↓
+      按当前授权 KB/Index 范围做检索与融合
+                     ↓
+  记录返回 Chunk IDs、score、rank、来源版本与耗时
+~~~
+
+这轮可用 `Evidence Recall@K`、候选过滤命中、最终证据引用和实际延迟进行验证。但它**不能**证明：GraphRAG 已支持按 Entity Description 定位入口实体、按 Relationship 找邻居、通过 textUnitIds 查原文；也不能证明 Wiki 已执行跨页面 Ingest、Query 和 Lint。
+
+对 GraphRAG 与 Wiki 的**未来能力验收**应使用同一原始资料但分开定义期望产物：
+
+~~~text
+GraphRAG 待实现：
+  C1/C2 → E_WebSocket、E_AccessToken、E_RefreshToken
+        → Relationship 与来源 C1/C2 的映射
+        → Query Embedding → Entity IDs → Related Relationship
+        → textUnitIds → C1/C2 → 有来源的 Context
+
+LLM Wiki 待实现：
+  Raw/D1、Raw/D2（保留原文与版本）
+        → Wiki《Token 生命周期》与《WebSocket 鉴权》
+        → 新来源接入后检查旧页面需修改的段落
+        → 带 sourceRefs 的 Patch、更新索引和冲突审查
+~~~
+
+前者需要验证 `Entity Recall、Relationship Source Coverage` 与原文可定位性；后者需要验证来源更新后关联页面是否完整修订、原文撤权能否传播到 Wiki 页面以及冲突是否保留来源。它们不能以“已有 Qdrant 点和普通 Markdown 文件”直接当作功能已完成。
+
 
 ### 【Hybrid Search、BM25 与 RRF 的后续知识衔接】
 讨论关键词与语义检索的互补、BM25 的词频/IDF/长度归一化以及 RRF 如何融合不同检索通道。**妙码 AI Flow 在 2026-10-13 的多空间改造中已使用 Qdrant 原生 BM25，旧版 textSearch() 的 scroll 扫描属于历史实现**。完整现行源码分析衔接：[多 Embedding 知识库构建、跨空间检索与补充召回完整分析](./RAG多Embedding知识库构建与跨空间检索及补充召回源码分析.md)。
