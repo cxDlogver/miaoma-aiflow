@@ -169,6 +169,190 @@ const document = await enqueueDocument(knowledgeBaseId, userId, {
 
 这样“文档存在而任务完全没有记录”的风险降低；HTTP 返回的“处理中”意味着数据库中已记录待处理工作，不等于向量已写入。独立 worker 必须实际启动，否则任务只会停留在等待状态。
 
+### 【多格式文档接入：统一解析协议与结构感知切分】
+
+#### 为什么不能让一个文本切分器直接处理 PDF、Word 和代码
+
+当知识库从 TXT、Markdown 扩展到 PDF、Word、HTML、CSV/JSON 和源代码时，应该统一的是**文档接入入口、解析后的数据结构与后续处理契约**，而不是用同一个字符串切分算法处理所有文件。需先区分三个过程：**Parser（按格式提取正文与结构）→ Normalizer（形成统一结构化表示）→ Chunker（按结构和长度生产检索片段）**。只有经过这些步骤才进入 Dense/BM25 编码与索引构建。
+
+当前 [上传 API](../apps/workflow/app/api/knowledge/%5Bid%5D/documents/route.ts) 的真实路径：
+
+~~~typescript
+const allowedTypes = [
+  'text/plain', 'text/markdown', 'application/json',
+  'text/csv', 'text/html',
+];
+const content = await file.text();
+if (!content.trim()) return apiError(ErrorCode.VALIDATION_ERROR, '文档内容不能为空');
+const document = await enqueueDocument(knowledgeBaseId, userId, {
+  name: file.name, mimeType: file.type || 'text/plain', size: file.size, content,
+});
+~~~
+
+接口校验用户是否拥有知识库、文件类型和 10MB 大小上限，但这里的 `file.text()` 只是对字节做文本解码，不会解析 PDF 的页面对象、DOCX 的 Office XML 关系，也不会建立 HTML DOM 或源码 AST。PDF/DOCX 当前不在允许类型之列；简单加入 MIME 允许名单而不实现二进制解析，会把乱码写入 `Document.content`。`text/plain` 类型的代码文件或 CSV/JSON/HTML 即便能上传，也**没有专门的语法/记录结构提取器**。
+
+[document-processor.ts](../apps/workflow/lib/services/document-processor.ts) 目前：
+
+~~~typescript
+const config = { chunkSize: index.chunkSize, chunkOverlap: index.chunkOverlap };
+const splitter = /\.(md|markdown)$/i.test(document.originalName)
+  ? createMarkdownSplitter(config)
+  : createTextSplitter(config);
+const chunks = splitter.split(document.content);
+~~~
+
+`MarkdownSplitter` 用 Markdown-It 标题 Token 识别层级，输出 `headerPath`，对超长章节再细切；`TextSplitter` 优先段落、标点和字符长度。它们是**现有切分器**，不是 PDF/Word/代码解析器。`split(string)` 只有已经提取出的文本内容，通常无法恢复 PDF 页码、合并单元格、原始代码行号等来源信息。
+
+#### 建议的输入、解析和索引构建链路
+
+现有 `PROCESS_DOCUMENT`、`DocumentIndex` 和 Qdrant 多空间索引可以继续使用；在 HTTP 上传与 Worker 分块之间增加按文件类型选择的 Parser 与统一内容表示即可：
+
+~~~text
+上传 / 同步文档
+  ↓ 用户权限、内容类型、字节大小、完整性与安全检查
+保存原始文件 + Document 元数据 + 持久处理任务
+  ↓ Worker 按可信格式解析，不直接假设扩展名可信
+DocumentParserRouter
+  ├─ TXT / Markdown → 文本、段落、标题、代码块
+  ├─ PDF          → 页面、阅读顺序、正文、表格；扫描件按需 OCR
+  ├─ DOCX         → 样式标题、段落、列表、表格
+  ├─ HTML         → DOM、主正文、标题/列表/链接
+  ├─ JSON / CSV   → 对象键路径、记录/列名、行号
+  └─ 代码文件      → AST、类/方法/函数及源码位置
+  ↓
+ParsedDocument：Blocks + Structure + SourceLocation + ParserVersion
+  ↓
+Normalizer：去噪/标准化，并保留来源结构
+  ↓
+ChunkerRouter：标题/段落/表格/记录/代码符号边界，超长再细分
+  ↓
+现有 Ollama Dense Embedding + Qdrant BM25 文本编码
+  ↓
+现有 Qdrant upsert + DocumentIndex READY + 在线检索与证据引用
+~~~
+
+将解析放在 Worker 内，是因为 PDF 版式抽取、DOCX 读取和 OCR 都可能比较耗时、可能失败；不能直接塞在 HTTP 请求中，也不应绕过现有租约、重试、文档删除和索引版本检查。**Parser 接口统一不等于解析器实现统一**：PDF/DOCX 可以由独立解析服务处理，代码可由 Node.js 本地语法解析器处理，最终都输出同一中间协议。
+
+#### ParsedDocument 是结构化中间产物，不是最终 Chunk
+
+如果一份 PDF 出现：
+
+~~~text
+第三章 员工休假制度
+3.1 年假申请
+员工需要提前三个工作日提交申请。
+3.2 审批流程
+直属主管负责审批。
+~~~
+
+直接按 500 字切分可能把“年假申请”的标题与正文拆开；即使取到了“提前三个工作日”，也可能无法说明它属于哪一章节或哪一页。先输出 `heading / paragraph` 等 Block，并为正文保存 `headerPath` 和 `page`，才可以做结构感知切分。
+
+建议的最小中间协议（**教学设计，当前仓库尚未实现**）：
+
+~~~typescript
+type BlockType = 'heading' | 'paragraph' | 'list' | 'table' | 'code' | 'record';
+
+interface SourceLocation {
+  page?: number;                       // PDF 页码
+  headerPath?: string[];               // 章节/小节
+  filePath?: string;                   // 代码相对路径
+  language?: string;
+  symbolPath?: string;                 // OrderService.createOrder
+  startLine?: number;
+  endLine?: number;
+  row?: number;                        // CSV 记录行
+  column?: string;
+  startOffset?: number;                // 仅在能映射回原文时填写
+  endOffset?: number;
+}
+
+interface ParsedBlock {
+  type: BlockType;
+  content: string;
+  location: SourceLocation;
+  attributes?: Record<string, unknown>; // 表头、AST 节点类别等
+}
+
+interface ParsedDocument {
+  documentId: string;
+  sourceFormat: string;
+  parserName: string;
+  parserVersion: string;
+  sourceHash: string;
+  blocks: ParsedBlock[];
+}
+~~~
+
+**Block 是解析单元；Chunk 是检索单元。** 一个函数可能是一个 `code` Block，但如果超过模型输入预算还要按语法子块拆分；一个短标题 Block 通常需要与其后段落组合。`ParsedBlock.content` 不等于要求原样作为 Embedding 输入。需要评估是否把标题路径、表头或代码符号名称加入索引文本，避免 Chunk 缺上下文；仅把 `headerPath` 存在 `metadata` 中，不会自动参与 Dense 编码。统一使用 Markdown 作为可读展示格式可以，但不能作为唯一结构来源：复杂表格、原始 PDF 坐标和 AST 关系可能无法无损地表达成 Markdown。
+
+后续将 `SourceLocation` 中可核实的字段映射到现有 `TextChunk.metadata`，并让 `ChunkWithVector` 在 Qdrant Payload 中继续保存 `content/metadata/documentId/indexId/documentIndexId`。不同格式的位置含义不同：PDF 页码不等于 UTF-8 字符偏移，代码行号不是 DOCX 段落偏移；不要通过累加字符串长度伪造来源定位。
+
+#### 各格式解析和切分的实际重点
+
+| 格式 | 解析阶段必须识别 | 推荐 Chunk 边界与注意事项 |
+| --- | --- | --- |
+| TXT | 编码、换行、空白、段落 | 按段落/句子优先，长度切分兜底 |
+| Markdown | 标题层级、代码围栏、列表 | 先按标题分节，超长再切；继承 `headerPath`，避免代码块中的 `#` 被当标题 |
+| PDF | 阅读顺序、页码、双栏、表格、图文位置 | 保留章节/页码；扫描 PDF 才按需 OCR；不要把整页默认当一个 Chunk |
+| DOCX | 标题样式、列表、表格、段落及图片等内容引用 | 保留层级与表格上下文；旧版 `.doc` 不是 DOCX，应单独转换或处理 |
+| HTML | DOM、主内容、导航和样式噪声 | 保留可见正文及标题；剔除菜单、脚本、样式，避免污染检索 |
+| CSV / JSON | 列名、记录 ID、嵌套键、数据类型 | 按行组/记录/对象子树；为每条记录保留表头、键路径 |
+| TS/JS/Python/Java | AST、类、函数、方法、注释、起止行号 | 优先按符号及逻辑单元切分；长函数可按语法子块切分，不要随意拆断函数 |
+
+代码示例：
+
+~~~typescript
+// 原始代码示意
+class OrderService {
+  createOrder() { /* ... */ }
+  cancelOrder() { /* ... */ }
+}
+
+// Parser 应识别 OrderService.createOrder 等符号，附加：
+// filePath / language / symbolPath / startLine / endLine
+// Chunker 根据整个方法与目标长度决定是否继续切分。
+~~~
+
+面向代码仓库还可增加定义/引用关系、仓库提交 SHA 和模块路径；但 `Tree-sitter` 能产生语法树，不等于已经实现调用图、跨文件符号解析或代码语义索引。项目已有的 Dense+BM25 可复用，精确符号检索则可能需要额外的 keyword/路径检索索引。
+
+#### 工具和部署选型如何接入，而不是重写所有解析算法
+
+可按需要选择成熟组件，**不是必须全部引入**：
+
+- [Docling](https://docling-project.github.io/docling/)：面向 PDF、DOCX 等办公文档的结构化提取候选；着重验证页码、表格、阅读顺序、OCR 与 `ParsedDocument` 适配。
+- [Unstructured](https://docs.unstructured.io/open-source/core-functionality/partitioning)：多种文件格式的元素化 Partition 接口；可作为 Docling 的替代而非叠加的必选依赖。
+- [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)：为代码文件生成语法树，识别函数、类等并给出位置；它解决代码解析，不负责 PDF/Word 解析。
+- 项目已有 [MarkdownSplitter](../packages/ai-engine/src/knowledge/chunking/markdown-splitter.ts) / [TextSplitter](../packages/ai-engine/src/knowledge/chunking/text-splitter.ts)：保持已有适用场景；简单 JSON/CSV 可使用成熟结构化数据解析库，不一定需要独立解析服务。
+
+先用固定样本评估准确性与成本。能够打开 PDF 不等于表格、标题和引用位置可用于 RAG；OCR 也不应该成为数字 PDF 的无条件必经步骤。
+
+#### 原始文件存储、版本和任务一致性需要一起设计
+
+当前 [Prisma Document](../apps/workflow/prisma/schema.prisma) 的 `content:String?` 主要用于保存按文本读取的内容；一旦接收二进制原件，只留解析后的 `content` 不足以支持未来切换 Parser 后重新提取。建议：
+
+1. 在接入层保存可恢复的**原始字节/对象存储位置、内容哈希、可信格式和大小**，Parser 产物可另存或以引用形式归档。`sourceHash` 用于确定内容版本，同名文件不等于同一版本。原始文件存储与数据库事务也不是天然原子的，需设计临时对象、提交标记和失败清理。
+2. `PROCESS_DOCUMENT` 任务应绑定已经验证的文件身份及目标 `DocumentIndex`，Worker 在租约下执行 `parse → normalize → chunk → embedding → upsert`；每一步失败可观察和重试，不应把部分成功的解析/Chunk 标为 READY。
+3. 记录 `parserName/parserVersion` 和 `chunkerName/chunkerVersion`，按需将切分协议冻结到索引版本。Parser 升级可能改变标题、表格展开或正文顺序，从而改变 Dense/BM25 的实际输入，即使原始文件哈希不变，也可能需要重新构建文档索引。解析版本与 Ollama 权重 digest、BM25_CONFIG_ID 是不同的身份维度。
+4. 只有完成与现有 `documentIndex.status=READY` 一致的持久化检查后，才能把新 Chunk 对外检索；删除、重建、超时和崩溃都继续复用现有任务租约、索引版本与 `deletedAt` 保护。
+5. PDF、Office、HTML 都是不可信输入，应校验文件内容而不只依赖 `file.type`/后缀，并限制页数、解压比、CPU/内存、解析时长和外部引用访问；禁用宏和活动内容，必要时隔离 Parser。OCR 失败、表格无法读取或文本缺失应有明确状态和日志，不能静默视为完整索引。
+
+尤其要避免把 “增加 Parser” 误写成修改现有 `EmbeddingSpace` 的语义：**不同 Dense 模型的空间隔离仍照旧，原始文档解析器和 Chunker 版本属于索引构建协议**。解析产物不同可能触发索引重建，但不意味着每种文件类型都必须独占一个 Qdrant Collection。
+
+#### 如何验证解析能力，而不是只看上传成功
+
+对同一份原始文档构造可以人工核对的参考文本、结构和证据问题：
+
+- PDF/DOCX：标题与正文归属、两栏阅读顺序、表格行列、页码/章节定位、扫描 OCR 是否正确；
+- Markdown/HTML：标题层级、代码围栏、可见正文提取与导航去噪；
+- CSV/JSON：表头/键路径、记录 ID、行与对象边界；
+- 代码文件：完整函数/类边界、长方法拆分、跨文件路径及源码行号；
+- 生命周期：重复解析同一原件得到稳定结果；Parser 升级重建；中途失败/删除不产生 READY 垃圾索引；旧格式继续兼容。
+
+在固定 Query 与 Qrels 上，比较当前纯文本分块与结构解析后分块的 `Evidence Recall@K`、`MRR/nDCG`、引用位置准确率，并记录解析耗时、失败率、内存及索引构建成本。不能凭“结构更完整”直接推断召回指标必定提高。
+
+**阶段结论**：当前系统已具备统一 Chunk 到 Dense/BM25 索引、异步任务与活动索引的能力，尚不具备 PDF/DOCX/源码 AST 的统一解析架构。应在离线处理入口加入 `DocumentParserRouter → ParsedDocument → ChunkerRouter`，按文件格式保留必需结构和来源位置，最终继续复用现有 Embedding Space、DocumentIndex、Qdrant 及权限链路。本节为**讨论形成的改进方案，尚未修改业务源码**。
+
+
 ### 【Worker 怎样生成和写入真实 Chunk】
 
 [常驻 worker 入口](../apps/workflow/scripts/knowledge-worker.ts) 循环调用 `runNextKnowledgeJob()`；[任务处理器](../apps/workflow/lib/services/knowledge-worker.ts) 认领任务后调用 `processDocument(documentIndexId, assertLease)`。后者见 [document-processor.ts](../apps/workflow/lib/services/document-processor.ts)：
