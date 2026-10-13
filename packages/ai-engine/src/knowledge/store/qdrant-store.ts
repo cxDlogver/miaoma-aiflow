@@ -29,36 +29,81 @@ export class QdrantVectorStore implements VectorStoreService {
      */
     async ensureCollection(dimensions: number): Promise<void> {
         try {
-            // 检查集合是否存在
+            if (!Number.isInteger(dimensions) || dimensions <= 0) {
+                throw new Error(`Invalid vector dimensions: ${dimensions}`)
+            }
+
             const collections = await this.client.getCollections()
             const exists = collections.collections.some(c => c.name === this.collectionName)
 
-            if (exists) {
-                return
+            if (!exists) {
+                try {
+                    await this.client.createCollection(this.collectionName, {
+                        vectors: {
+                            size: dimensions,
+                            distance: 'Cosine',
+                        },
+                        optimizers_config: {
+                            indexing_threshold: 10000,
+                        },
+                    })
+                } catch (createError) {
+                    // 并发文档处理可能同时创建集合；只有集合确实已创建时才继续验证。
+                    const latest = await this.client.getCollections()
+                    if (!latest.collections.some(c => c.name === this.collectionName)) {
+                        throw createError
+                    }
+                }
             }
 
-            // 创建集合
-            await this.client.createCollection(this.collectionName, {
-                vectors: {
-                    size: dimensions,
-                    distance: 'Cosine',
-                },
-                // 创建 payload 索引以加速过滤
-                optimizers_config: {
-                    indexing_threshold: 10000,
-                },
-            })
+            // 已有集合也必须验证实际配置，不能仅凭集合名称存在就允许写入。
+            const info = await this.client.getCollection(this.collectionName)
+            const vectors = info.config.params.vectors
 
-            // 创建 payload 索引
-            await this.client.createPayloadIndex(this.collectionName, {
-                field_name: 'knowledgeBaseId',
-                field_schema: 'keyword',
-            })
+            // 当前业务写入匿名 Dense Vector，不兼容仅包含 Named Vectors 的集合。
+            if (!vectors || typeof vectors !== 'object' || !('size' in vectors) || !('distance' in vectors)) {
+                throw new Error(`Collection ${this.collectionName} does not use a single unnamed dense vector`)
+            }
 
-            await this.client.createPayloadIndex(this.collectionName, {
-                field_name: 'documentId',
-                field_schema: 'keyword',
-            })
+            if (vectors.size !== dimensions) {
+                throw new Error(
+                    `Collection ${this.collectionName} vector dimension mismatch: expected ${dimensions}, actual ${String(vectors.size)}`
+                )
+            }
+
+            if (vectors.distance !== 'Cosine') {
+                throw new Error(
+                    `Collection ${this.collectionName} distance mismatch: expected Cosine, actual ${String(vectors.distance)}`
+                )
+            }
+
+            // 无论集合是新建还是已存在，都检查过滤索引，补建未完成的索引。
+            for (const fieldName of ['knowledgeBaseId', 'documentId']) {
+                const schema = info.payload_schema?.[fieldName]
+
+                if (schema) {
+                    if (schema.data_type !== 'keyword') {
+                        throw new Error(
+                            `Collection ${this.collectionName} payload index ${fieldName} must be keyword, actual ${schema.data_type}`
+                        )
+                    }
+                    continue
+                }
+
+                try {
+                    await this.client.createPayloadIndex(this.collectionName, {
+                        field_name: fieldName,
+                        field_schema: 'keyword',
+                        wait: true,
+                    })
+                } catch (indexError) {
+                    // 并发初始化可能已创建该索引；重新读取，仅对确认为 keyword 的结果放行。
+                    const latest = await this.client.getCollection(this.collectionName)
+                    if (latest.payload_schema?.[fieldName]?.data_type !== 'keyword') {
+                        throw indexError
+                    }
+                }
+            }
         } catch (error) {
             throw new Error(`Failed to ensure collection: ${error instanceof Error ? error.message : String(error)}`)
         }
