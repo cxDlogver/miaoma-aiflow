@@ -1,13 +1,16 @@
-# RAG 多 Embedding 模型知识库隔离与跨模型检索设计分析
+# RAG 多 Embedding 模型知识库构建与跨空间检索完整分析
 
-## 【讨论目标与事实边界】
+## 【知识目标与项目边界】
 
-本文讨论两个相连的问题：**不同知识库采用不同 Embedding 模型、输出维度或向量空间时，离线 Chunk 如何存储；一次查询同时命中这些知识库时，应如何编码查询、路由检索并合并结果。** 从具体输入和源码出发，分别解释当前实现、设计原因、建议改造与验证方法。本文是项目分析和设计方案，不代表以下建议已经开发上线或经过检索效果评测。
+本篇以**通用运行机制 → 妙码 AI Flow 实际源码 → 失败边界与验证**的顺序，解释：不同 Embedding 模型及维度为什么需要独立向量空间、一个知识库如何异步构建 Dense+BM25 索引、工作流如何跨模型检索并融合结果，以及重建、删除、权限和失败恢复怎样共同保证用户只看到有效证据。
 
-与项目其他知识点的联系：
-- [RAG 知识库构建与向量检索源码学习记录](./RAG知识库构建与向量检索源码学习记录.md)：文档上传、Chunking、Embedding、Qdrant Point 与向量检索的基础链路。
-- [RAG 检索能力评测与证据标注源码学习记录](./RAG检索能力评测与证据标注源码学习记录.md)：候选召回、RRF/Rerank、证据评测以及混合检索的工程边界。
-- [Qdrant 向量与 Named Vectors 官方文档](https://qdrant.tech/documentation/manage-data/vectors/)、[Collection](https://qdrant.tech/documentation/manage-data/collections/)、[多阶段与混合查询](https://qdrant.tech/documentation/search/hybrid-queries/)：以下设计涉及的数据库能力及限制。
+**事实基线**：依据 GitHub `cxDlogver/miaoma-aiflow` 的最新业务改造提交 `b4c0facca3fbc999d6ea3680466979bf1d01f362`（2026-10-13），本文叙述的是仓库中**已写入的代码机制**，不再把它误写成待执行改造计划。已有单元/集成测试代码不等于已在目标业务环境完成真实模型部署和质量评测；后文会区分源码已实现、测试覆盖、尚待验证与进一步优化。
+
+与其他学习内容的联系：
+- [RAG 知识库构建与向量检索源码学习记录](./RAG知识库构建与向量检索源码学习记录.md)：知识输入、Chunking、Embedding、索引及 HNSW 的基础主链。
+- [RAG 检索能力评测与证据标注源码学习记录](./RAG检索能力评测与证据标注源码学习记录.md)：相关证据、Qrels、Recall/nDCG、Dense/BM25/RRF 评测与排序依据。
+- 本篇深入该项目**多向量空间、BM25、索引版本、后台任务与发布权限**的实现。既不把旧的单 Collection/字符串匹配版本当作现状，也不因实现完成而省略方案取舍和边界。
+
 
 ## 【一、为什么不同知识库不能简单共用一份查询向量】
 
@@ -46,422 +49,463 @@
 3. 输出维度、向量类型（Dense／Sparse）和检索距离算法符合索引约定；如果模型支持截断维度，也必须将实际输出维度视为向量空间配置的一部分。
 4. 影响向量语义的清洗、文本拼装、指令前缀、归一化等处理策略受版本管理。Chunk 切分长度不同并不必然产生不同的**向量空间**，但会改变召回对象及证据粒度。
 
-所以分组键不应该只有 `dimensions`，也不应仅仅依赖 `model` 字符串。可将“向量空间”抽象为独立配置标识（建议设计）：
+
+所以分组键不能只用 `dimensions`，也不能只使用可变的模型名称；应由模型真实权重、Query/Document 编码协议及向量索引配置共同决定。下文结合当前仓库的 `EmbeddingSpace`、`KnowledgeBaseIndex`、`DocumentIndex` 等真实实现验证这一原则，示例中的 A/B/C 模型仅用于讲解，不代表本仓库已经安装对应模型。
+
+## 【二、当前项目的完整架构：知识库、向量空间、索引版本如何分层】
+
+### 【问题：为何不能让 KnowledgeBase 直接指向一个 Collection】
+
+一个知识库表示用户管理文档和授权的逻辑对象；Embedding Space 表示可以共用 Dense 向量坐标体系的一组编码配置；索引版本表示某个知识库的一次切分、向量化和提交结果。这三者生命周期不同：同一空间可以服务多个知识库；同一个知识库切分参数变化后需要重建索引，但可能仍使用同一个空间和 Collection；删除旧索引也不应删除其他知识库共用的 Collection。
+
+实际数据模型位于 [Prisma Schema](../apps/workflow/prisma/schema.prisma)：
+
+~~~text
+KnowledgeBase（知识库：拥有者、配置、deletedAt）
+   │ activeIndexId → 当前应当对外检索的索引
+   ├── KnowledgeBaseIndex（索引版本：空间 + chunkSize/Overlap + 状态）
+   │       ├── EmbeddingSpace（不可变 Dense 编码空间 → Collection）
+   │       └── DocumentIndex（每份文档在这个索引版本的完成状态）
+   └── Document（原始正文、文档状态、删除标记）
+
+KnowledgeIndexJob（独立持久任务）
+   ├── PROCESS_DOCUMENT
+   ├── DELETE_DOCUMENT
+   ├── DELETE_INDEX
+   └── DELETE_KNOWLEDGE_BASE
+~~~
+
+源码中的 `EmbeddingSpace` 保存 `provider`、`model`、`modelRevision`、`dimensions`、`distance`、`queryEncodingVersion`、`documentEncodingVersion`、`bm25ConfigId` 与 `collectionName`；`KnowledgeBaseIndex` 冻结 `embeddingSpaceId`、`chunkSize`、`chunkOverlap` 和 `status`；`DocumentIndex` 以 `(documentId, knowledgeBaseIndexId)` 唯一定位文档索引结果。`KnowledgeBase.activeIndexId` 指向当前索引。`KnowledgeIndexJob` 不通过外键级联依附被删除的文档，以便实体逻辑删除后仍能执行清理。
+
+注意 **Embedding Space 不等于索引版本**：A/B 知识库若空间相同，可共用 Collection，但每个知识库各有独立的 `indexId`；同库新旧索引也能在同一个 Collection 共存直到清理结束。这是之后为什么查询必须同时过滤 `knowledgeBaseId` 与 `indexId` 的根本原因。
+
+当前 [空间解析服务](../apps/workflow/lib/services/embedding-space-service.ts) `ensureEmbeddingSpace()` 计算空间身份的核心源码：
 
 ~~~typescript
-interface EmbeddingSpace {
-  id: string                  // 稳定的向量空间 ID，服务端分配或计算
-  provider: string
-  model: string
-  modelRevision: string       // 模型权重版本、digest 等不可变标识
-  dimensions: number
-  vectorType: 'dense' | 'sparse'
-  distance: 'Cosine' | 'Dot' | 'Euclid'
-  documentEncodingVersion: string
-  queryEncodingVersion: string
-  collectionName: string
+const protocol = {
+  provider: 'ollama',
+  model: config.embeddingModel,
+  modelRevision,
+  dimensions: config.dimensions,
+  distance: 'Cosine',
+  queryEncodingVersion: 'ollama-raw-v1',
+  documentEncodingVersion: 'ollama-raw-v1',
+  bm25ConfigId: BM25_CONFIG_ID,
+}
+const id = createHash('sha256')
+  .update(JSON.stringify(protocol))
+  .digest('hex')
+const collectionName = 'knowledge_v2_' + id
+~~~
+
+调用前通过 `getOllamaModelRevision()` 获取当前已安装模型的 digest，并做 Query Embedding 维度探测；之后 `ensureCollection(dimensions)` 验证目标 Qdrant Collection，最终 `prisma.embeddingSpace.upsert(...)` 创建或重用相同空间。这样同维度的两个不同模型不会误共享集合，同一模型的权重 digest 改变也会生成新的空间指纹。
+
+这里并不是向量降维：`dimensions` 描述模型实际输出维度。系统没有因为用户 Query 的长短而动态截断向量；维度与模型不符时探测或后续校验失败。
+
+### 【创建知识库：配置如何从界面走到索引】
+
+[知识库创建接口](../apps/workflow/app/api/knowledge/route.ts) 已支持从请求读取 `embeddingProvider=ollama`、`embeddingModel` 与 `dimensions`；当前没有泛化支持其他供应商。通过用户登录校验后，先调用 `ensureEmbeddingSpace`，再在 PostgreSQL 事务中创建 `KnowledgeBase`、初始 `KnowledgeBaseIndex(status='READY')` 并写回 `activeIndexId`。
+
+新建空知识库初始索引为 READY，是因为尚不存在要处理的文档；后续上传将单独排队处理。改变模型、维度、`chunkSize` 或 `chunkOverlap` 则不允许只修改字段：由 [知识库更新接口](../apps/workflow/app/api/knowledge/%5Bid%5D/route.ts) 转入 `rebuildKnowledgeBase()` 重新建索引。显式重建入口见 [reindex API](../apps/workflow/app/api/knowledge/%5Bid%5D/reindex/route.ts)。
+
+## 【三、离线构建：原文如何成为 Dense + BM25 的同一个 Point】
+
+### 【先说明两个表示是怎样产生的】
+
+Dense Embedding 使用 Ollama 的神经网络模型：每个 Chunk 输出固定维度 `number[]`，用于语义近邻检索。BM25 则根据词项、词频、文档长度和语料统计进行词法匹配；它不是另一个神经网络 Dense 模型，也不要求使用相同的 768/1024 维长度。
+
+Qdrant 为 BM25 提供稀疏表示与索引能力：BM25 文本编码最终表达为稀疏词项 ID/权重，并通过 Sparse Index 查询。当前项目选择**Qdrant 原生 BM25 服务端推理**，因此客户端不是自己生成 `indices/values`，而是传输符合 Qdrant Inference 协议的文本对象。
+
+[BM25 配置](../packages/ai-engine/src/knowledge/bm25.ts) 实际为：
+
+~~~typescript
+export const BM25_CONFIG_ID =
+  'qdrant-bm25-multilingual-v1-k1.2-b0.75-avg256'
+export const DENSE_VECTOR_NAME = 'dense'
+export const BM25_VECTOR_NAME = 'bm25'
+export const BM25_OPTIONS = {
+  tokenizer: 'multilingual',
+  language: 'none',
+  k: 1.2,
+  b: 0.75,
+  avg_len: 256,
+}
+export function bm25Document(text: string) {
+  return { text, model: 'qdrant/bm25', options: { ...BM25_OPTIONS } }
 }
 ~~~
 
-此结构为**建议的数据模型**，不是 AI Flow 已有 TypeScript 类型。模型身份还应结合实际供应商能力，例如 Ollama 模型 tag 可能随重新拉取而变化，`:latest` 不能单独充当可靠的不可变版本凭证。查询缓存键也应包含向量空间 ID 和处理协议版本。
+`k` 用于词频饱和，`b` 用于文档长度归一化；`avg_len=256` 是这份固定编码协议的参数，不是“每次检索动态统计出的实际平均 Chunk 长度”。写入和查询必须使用同一个协议；改变 Tokenizer、词项规则或 BM25 参数，需要建立新的向量空间及索引版本并重新构建。中文语料必须实际测试分词效果，不能因 `tokenizer='multilingual'` 就推断所有专有名词会被整体保留。Qdrant IDF 统计基于所在索引语料（Collection/Shard 的相关范围），Payload 的知识库过滤并不自动把 IDF 改成某个单独知识库的统计。
 
-## 【二、当前妙码 AI Flow 如何处理知识库配置】
-
-### 【2.1 配置从哪里来】
-
-Prisma 数据模型见 [apps/workflow/prisma/schema.prisma](../apps/workflow/prisma/schema.prisma) 的 `KnowledgeBase`：
-
-~~~prisma
-embeddingModel    String @default("mxbai-embed-large:latest")
-embeddingProvider String @default("ollama")
-dimensions        Int    @default(1024)
-chunkSize         Int    @default(500)
-chunkOverlap      Int    @default(50)
-retrievalMode     RetrievalMode @default(VECTOR)
-~~~
-
-每个知识库记录**分别拥有**这些字段，但拥有配置字段不等于整个写入与查询链路已经支持多向量空间。
-
-当前 [知识库创建接口](../apps/workflow/app/api/knowledge/route.ts) 只从请求体接受名称、描述和图标，Embedding 配置由数据库默认值填充。当前 [知识库更新接口](../apps/workflow/app/api/knowledge/%5Bid%5D/route.ts) 的校验 Schema 允许更新切分与检索选项，却**没有**提供修改 `embeddingModel`、`embeddingProvider` 或 `dimensions` 的请求字段。因此，多模型知识库在当前对外 API 中并非已经开放的完整能力；本篇讨论的是模型配置变化、未来扩展及历史数据并存时应具备的机制。
-
-### 【2.2 离线写入只使用一个固定集合】
-
-文件入口：用户上传 Markdown/TXT 等文档，接口将正文与知识库配置交给 [document-processor.ts](../apps/workflow/lib/services/document-processor.ts) 的 `processDocument()`：
+[QdrantVectorStore.ensureCollection](../packages/ai-engine/src/knowledge/store/qdrant-store.ts) 创建/校验的当前 Schema：
 
 ~~~typescript
-const embeddingService = createOllamaEmbeddingService({
-    model: embeddingModel,
-    dimensions,
+await this.client.createCollection(this.collectionName, {
+  vectors: {
+    dense: { size: dimensions, distance: 'Cosine' },
+  },
+  sparse_vectors: {
+    bm25: { modifier: 'idf' },
+  },
 })
-
-const embeddings = await embeddingService.embedTexts(
-    chunks.map(chunk => chunk.content)
-)
-
-const vectorStore = createQdrantVectorStore({
-    url: process.env.QDRANT_URL || 'http://localhost:6333',
-    collectionName: 'knowledge_chunks',
-})
-
-await vectorStore.ensureCollection(dimensions)
-await vectorStore.upsertVectors(vectorChunks)
 ~~~
 
-关键数据来源：`embeddingModel` 与 `dimensions` 由上传接口从 `knowledgeBase` 读取并传给 `processDocument()`；`chunks` 是切分器输出的文档片段；`embeddings` 与 Chunk 依下标配对，最终组装成 `ChunkWithVector`。
+这里的 `dense` 是**命名 Dense Vector**，`bm25` 是独立命名的 Sparse Vector。命名 Dense 仅为明确两种检索路径，不表示一个 Point 同时具备多个模型的 Dense Embedding。旧的单一匿名 Dense Collection 与此 Schema 不兼容。`ensureCollection` 还检查四个 keyword Payload 索引：`knowledgeBaseId`、`documentId`、`indexId` 和 `documentIndexId`。它们服务于精确过滤与删除，并不会被 BM25 取代。
 
-近期修改已在 `processDocument()` 中增加向量数量、维度和有限数值校验，也修复了 `metadata` 传递，但这**只保证单次请求的数据形状有效**，不能解决不同模型混用问题。
+### 【上传接口为何不再直接启动异步 Promise】
 
-向量存储实例始终使用固定 `knowledge_chunks`。在 [qdrant-store.ts](../packages/ai-engine/src/knowledge/store/qdrant-store.ts) 中，`ensureCollection(dimensions)` 目前已经会验证现有单一匿名 Dense Vector 的 `size`、`distance === 'Cosine'` 并补建 `knowledgeBaseId` 与 `documentId` 的 keyword Payload 索引；配置不兼容则报错，且不会自动删除历史集合。
-
-由此产生两种不同的结果：
-- **不同维度**：第一个知识库建成 1024 维后，另一个 768 维知识库写入会因 Collection 维度检查失败而被阻止，这是显式冲突。
-- **不同模型但相同维度**：检查可能通过，同一个 Collection 便会混存不兼容语义空间的向量；这是更加隐蔽的**语义污染风险**。即使 Payload 根据知识库 ID 能正确过滤，也不能让错误的查询编码变得可比。
-
-### 【2.3 单知识库查询已按照知识库配置选择模型】
-
-[apps/workflow/app/api/knowledge/[id]/search/route.ts](../apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts) 首先校验当前用户对目标知识库的访问权，再使用对应知识库的配置创建 Embedding 服务：
+过去接口直接调用 `processDocument(...).catch(...)` 并提前返回；进程退出后任务可能消失。当前 [文档上传接口](../apps/workflow/app/api/knowledge/%5Bid%5D/documents/route.ts) 在检查登录、库归属、文件类型、大小和非空正文后，把正文交给 [enqueueDocument](../apps/workflow/lib/services/knowledge-index-service.ts)：
 
 ~~~typescript
-const embeddingService = createOllamaEmbeddingService({
-    model: knowledgeBase.embeddingModel,
-    dimensions: knowledgeBase.dimensions,
+const document = await enqueueDocument(knowledgeBaseId, userId, {
+  name: file.name,
+  mimeType: file.type || 'text/plain',
+  size: file.size,
+  content,
 })
+~~~
 
-const retriever = createHybridRetriever(
-    embeddingService,
-    vectorStore,
-    fulltextProvider
-)
+`enqueueDocument` 先对知识库行加锁，读取其当前 READY 索引；若处于 `NEEDS_REBUILD`、`BUILDING` 等不可写状态则拒绝上传。随后在**同一 PostgreSQL 事务**创建原始 `Document`、对应 `DocumentIndex` 和一条 `PROCESS_DOCUMENT` 任务；任务 Payload 冻结 `documentIndexId`、`collectionName`，并更新计数和 `INDEXING` 状态。
 
+这样“文档存在而任务完全没有记录”的风险降低；HTTP 返回的“处理中”意味着数据库中已记录待处理工作，不等于向量已写入。独立 worker 必须实际启动，否则任务只会停留在等待状态。
+
+### 【Worker 怎样生成和写入真实 Chunk】
+
+[常驻 worker 入口](../apps/workflow/scripts/knowledge-worker.ts) 循环调用 `runNextKnowledgeJob()`；[任务处理器](../apps/workflow/lib/services/knowledge-worker.ts) 认领任务后调用 `processDocument(documentIndexId, assertLease)`。后者见 [document-processor.ts](../apps/workflow/lib/services/document-processor.ts)：
+
+~~~typescript
+const config = {
+  chunkSize: index.chunkSize,
+  chunkOverlap: index.chunkOverlap,
+}
+const splitter = /\.(md|markdown)$/i.test(document.originalName)
+  ? createMarkdownSplitter(config)
+  : createTextSplitter(config)
+const chunks = splitter.split(document.content)
+~~~
+
+这里首先使用**索引版本冻结的切分参数**，不是在任务重试时重新读取最新知识库设置。Markdown 分支保留标题路径等 Chunk Metadata；其机制继续参见[文档切分与入库专项](./RAG知识库构建与向量检索源码学习记录.md)。
+
+当前 [OllamaEmbeddingService](../packages/ai-engine/src/knowledge/embeddings/ollama-embeddings.ts) 通过真实的 `POST /api/embed` 调用 `{ model, input: texts.map(trim), truncate: false }`，文档以最多 16 个 Chunk 为一批编码，并在请求前后再次读取模型 digest 校验。`validateDenseVector` 对向量长度、有限数、非全零进行校验；返回结果数量必须与输入 Chunk 数量一致，不能丢项、补零或静默截断查询/文档。若 `mxbai-embed-large:latest` 底层权重被更新，即使 tag 名字未变，digest 不匹配仍会拒绝继续处理并要求重建。
+
+实际 Point 生成逻辑在 [qdrant-store.ts](../packages/ai-engine/src/knowledge/store/qdrant-store.ts)：
+
+~~~typescript
+vector: {
+  [DENSE_VECTOR_NAME]: c.vector,
+  [BM25_VECTOR_NAME]: bm25Document(c.content),
+},
+payload: {
+  chunkId: c.id,
+  content: c.content,
+  chunkIndex: c.index,
+  documentId: c.documentId,
+  knowledgeBaseId: c.knowledgeBaseId,
+  indexId: c.indexId,
+  documentIndexId: c.documentIndexId,
+  metadata: c.metadata ?? {},
+}
+~~~
+
+写入前为 Point 计算基于 `indexId + chunkId` 的确定性 UUID，避免不同索引版本互相覆盖。最多每 100 个 Point 组成一批 `upsert(..., wait:true)`。重试时先通过 `documentIndexId` 删除该文档索引已有 Point，再重新写入；不同版本用不同身份，防止新旧结果混写。
+
+向量 upsert 成功**不等于可以马上回答用户**。`processDocument` 写完后重新检查任务租约、知识库删除标记、文档删除标记和活动索引 ID；确认仍有效，才在事务中将 `DocumentIndex` 更新为 READY，将 `Document` 更新为 COMPLETED，并重新聚合统计。若处理期间发生删除或重建，则丢弃/清理旧版本 Point。`maybeActivateIndex` 在存活文档的 `DocumentIndex` 全部 READY 后将 BUILDING 索引切换到 READY。这解释了为何需要将存储成功与业务可检索状态分离。
+
+## 【四、如何保证异步建索引和删除在失败时可恢复】
+
+### 【持久任务不是“异步函数 + catch”】
+
+[KnowledgeIndexJob](../apps/workflow/prisma/schema.prisma) 保存 `kind/status/attempts/availableAt/lockedAt/leaseToken/errorMessage/payload`。Worker 用 `PENDING + availableAt` 选择新任务，也会恢复超过租约时间的 RUNNING 任务。关键执行约束：
+
+1. 使用 PostgreSQL session advisory lock，将同一知识库的任务尽量串行化；网络调用不长期占用数据库事务。
+2. 在事务中认领任务，设置 `status=RUNNING`、`leaseToken` 并递增 `attempts`。
+3. 执行期间每 10 秒更新租约时间；租约有效期设为 5 分钟。更新和完成均限制 `leaseToken`，防止旧 Worker 在任务被重新认领后改写新状态。
+4. 单次失败重排 `PENDING` 并指数退避，最多 5 次后 `FAILED`；失败的处理任务会标记文档/索引状态，并可通过 [jobs API](../apps/workflow/app/api/knowledge/%5Bid%5D/jobs/route.ts) 重试。
+5. 如果逻辑删除开始前仍有带有效租约的写任务，清理任务先等待，避免“删完后旧写入再次出现”。`assertLease` 在关键数据库事务和向量操作前后检查租约。
+
+这些措施改善了崩溃后的重试和清理可恢复性，但不要把它称为 PostgreSQL 与 Qdrant 的**分布式原子事务**。向量写入和数据库状态提交依然不能在单个事务中完成；系统通过索引状态过滤、幂等点 ID、版本检查与补偿删除约束用户可见数据。`Promise.race` 类超时也不能自动终止所有已经发送的外部请求，避免把超时策略误写成底层取消保证。
+
+### 【模型变更和重建：为什么这版选择阻断旧查询】
+
+[rebuildKnowledgeBase](../apps/workflow/lib/services/knowledge-index-service.ts) 先探测目标空间，随后锁知识库、检查配置未在探测过程中变化且没有仍在运行的任务；取消待处理旧建索引任务，将旧索引标为 RETIRED，创建带新切分参数的 BUILDING 索引并**立即更换 `activeIndexId`**，再为存活文档批量创建新的 `DocumentIndex` 和处理任务。空库可直接 READY。旧索引另外排队 `DELETE_INDEX` 清理。
+
+~~~text
+原索引 READY
+  ↓ 模型/维度/切分配置变更
+旧索引 RETIRED ───→ DELETE_INDEX（持久清理）
+  ↓
+新索引 BUILDING（activeIndexId 指向它）
+  ↓
+上传/检索暂时拒绝；后台重新切分 + Dense/BM25 建索引
+  ↓
+所有存活 DocumentIndex READY
+  ↓
+新索引 READY → 恢复检索
+~~~
+
+这与另一种“先构建新索引、旧索引继续服务、验证后再切换”的无缝双版本方案不同。**当前项目明确采用重建期间停用旧查询路径**，没有自动旧索引回滚；优点是状态和来源更清晰，代价是重建期间知识库不可检索、不可继续上传。不要将双版本无缝切换写成实际已实现的行为。
+
+**旧历史索引处理**也已经明确：新增迁移 [202610130002_require_index_rebuild](../apps/workflow/prisma/migrations/202610130002_require_index_rebuild/migration.sql) 将尚无活动索引的旧知识库标记 `NEEDS_REBUILD`，文档保留正文但标记需要重建。旧 `knowledge_chunks` 不会因迁移被自动清空，也**不会**被新查询重新解释为 `dense + bm25`。通过新 `knowledge_v2_<fingerprint>` Collection 重建后才能使用；缺少可重建正文的历史文档需重新上传。
+
+### 【删除为什么是“立即不可见 + 延后清理”】
+
+[文档/知识库删除服务](../apps/workflow/lib/services/knowledge-index-service.ts) 先设置 `deletedAt`，取消还没开始的上传处理任务，并将需要清理的 Collection 列表固化在 `DELETE_DOCUMENT`/`DELETE_KNOWLEDGE_BASE` 任务 Payload 中；接口立即返回 `cleanupPending`。后续 Worker 使用 Payload 定位 Qdrant Collection，按文档、索引或知识库范围删除，成功后才物理删除 PostgreSQL 实体。
+
+如果先物理删除数据库记录再删 Qdrant，清理失败就可能丢失索引定位信息；如果仅依赖 Qdrant 删除即时完成，一旦失败就可能把旧数据继续返回给调用者。因此搜索链路还必须通过 `DocumentIndex READY`、`Document.deletedAt IS NULL`、`KnowledgeBase.deletedAt IS NULL` 和 `activeIndexId` 校验可见性，而不是只信任向量库返回了某个 Point。
+
+## 【五、在线查询：从用户问题到多个向量空间的 TopK】
+
+### 【单知识库与工作流检索共享哪一层】
+
+现在 [单库搜索 API](../apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts) 在确认登录用户拥有该知识库后，调用：
+
+~~~typescript
+const retriever = createKnowledgeRetrievalService({
+  kind: 'user',
+  userId,
+})
 const results = await retriever.retrieve({
-    query,
-    knowledgeBaseIds: [knowledgeBaseId],
-    mode,
-    topK,
-    threshold,
-    vectorWeight: knowledgeBase.vectorWeight,
+  query,
+  knowledgeBaseIds: [knowledgeBaseId],
+  mode,
+  topK,
+  threshold,
+  vectorWeight: knowledgeBase.vectorWeight,
 })
 ~~~
 
-这条 HTTP API 的检索范围明确只有**一个**知识库。`HybridRetriever` 随后在向量检索分支调用 `embeddingService.embedText(query)`，再交给 `vectorStore.search()`；因此单库情况下已按库配置生成查询向量，不需要为了其他知识库额外编码。
-
-但它仍固定使用 `knowledge_chunks`，没有映射到独立的向量空间／Collection。若只有同一种模型，该设计在现有单 Collection 下可以工作；若多个模型与配置真正投入使用，写入和读取两端都必须同步调整。
-
-### 【2.4 工作流多知识库检索与单库 API 不同】
-
-[packages/ai-engine/src/nodes/executors/knowledge-executor.ts](../packages/ai-engine/src/nodes/executors/knowledge-executor.ts) 的 `KnowledgeExecutor` 接受 `knowledgeBaseIds: string[]`，但只在构造函数中配置**一个** Embedding 模型及维度，默认 `mxbai-embed-large:latest` / 1024；并只构造一个 `HybridRetriever`。它没有读取每个所选知识库的 Embedding 配置后进行分组的逻辑。
+它不再自己选择默认 Embedding Model，也不再硬编码 Collection。工作流 [KnowledgeExecutor](../packages/ai-engine/src/nodes/executors/knowledge-executor.ts) 也不再自己 new 一套固定 Embedding，而是通过构造函数取得服务端注入的 `KnowledgeRetrievalService`：
 
 ~~~typescript
-const embeddingService = createOllamaEmbeddingService({
-    model: this.embeddingModel,
-    dimensions: this.embeddingDimensions,
+if (!this.retrievalService) {
+  throw new Error('Authorized knowledge retrieval service is not configured')
+}
+const results = await this.retrievalService.retrieve({
+  query: query.trim(),
+  knowledgeBaseIds,
+  mode: retrievalMode,
+  topK,
+  threshold,
 })
+~~~
 
-const vectorStore = createQdrantVectorStore({
-    url: this.qdrantUrl,
-    collectionName: 'knowledge_chunks',
-})
+因此一个工作流节点仍只需配置 `knowledgeBaseIds: string[]`、`query`、`retrievalMode`、`topK` 等字段；用户不用在节点上填写 768/1024 维。`core/engine.ts` 通过 `WorkflowEngineConfig.knowledgeRetrieval` 注入服务，`createDefaultRegistry` 将它交给知识节点；缺少可信服务的节点选择显式报错，而非回退到默认模型或越权访问向量库。
 
-const retriever = createHybridRetriever(
-    embeddingService,
-    vectorStore,
-    fulltextProvider
+### 【真实分组算法：一份查询在何处变成多份向量】
+
+[MultiKnowledgeRetriever](../packages/ai-engine/src/knowledge/retriever/multi-knowledge-retriever.ts) 先验证 Query/TopK，去重知识库 ID，调用 `deps.resolveIndexes(ids)` 获取**已经授权**的 READY 活动索引。返回条数、每个请求 ID 和协议都要校验；只有 `provider=ollama`、`bm25ConfigId` 与编码版本匹配的描述符才可参与本次检索。
+
+代码中的关键步骤：
+
+~~~typescript
+const groups = new Map<string, KnowledgeIndexDescriptor[]>()
+for (const index of indexes) {
+  const group = groups.get(index.embeddingSpaceId) ?? []
+  group.push(index)
+  groups.set(index.embeddingSpaceId, group)
+}
+const candidateTopK = Math.min(
+  100,
+  Math.max(20, options.topK * 4)
 )
+~~~
 
-await retriever.retrieve({
-    query: query.trim(),
-    knowledgeBaseIds,
-    mode: retrievalMode,
-    topK,
-    threshold,
+同一个 `embeddingSpaceId` 内再校验模型、digest、维度、Collection、BM25 配置是否一致。之后按空间创建或复用 `QdrantVectorStore` 和 `OllamaEmbeddingService`。如果检索模式为 `fulltext`，代码**不创建 Dense Embedding Service**。各空间并发上限默认 3，单空间请求超时阈值默认 30 秒；任何必需空间失败，整个调用抛错，不默默返回部分库的结果。
+
+~~~text
+Query = “年假如何申请？”
+KB-A、KB-B → Space-A（一个 1024 维 Query 向量）
+KB-C       → Space-B（一个 768 维 Query 向量）
+                       ↓
+  每个空间按 mode 执行独立的 Qdrant Collection 检索
+                       ↓
+  每空间最多取扩展候选 candidateTopK
+                       ↓
+  对照授权的 (knowledgeBaseId, indexId) 校验候选
+                       ↓
+  仅保留 READY DocumentIndex + 未删除的文档/库
+                       ↓
+  再次解析授权和活动索引（防止查询期间撤权/切换）
+                       ↓
+  跨空间融合或单空间直通
+                       ↓
+  最后再过滤可见性，截取全局 TopK
+~~~
+
+注意分组不是对整个 Qdrant 实例盲搜；`resolveIndexes` 若发现缺少知识库、状态不是 READY、模型协议不符或权限错误就拒绝。对被查询之外的模型没有必要额外生成 Query Embedding。
+
+### 【Qdrant 检索为什么需要成对的 KB/Index 条件】
+
+实际的 [QdrantVectorStore.filter](../packages/ai-engine/src/knowledge/store/qdrant-store.ts) 构建：
+
+~~~typescript
+return {
+  should: scopes.map(s => ({
+    must: [
+      { key: 'knowledgeBaseId', match: { value: s.knowledgeBaseId } },
+      { key: 'indexId', match: { value: s.indexId } },
+    ],
+  })),
+}
+~~~
+
+表示对每一组身份做 `(KB=A AND Index=a) OR (KB=B AND Index=b)`。如果把 `knowledgeBaseId IN [A,B]` 和 `indexId IN [a,b]` 当作两个可独立组合的过滤条件，就可能混入错误的 KB/Index 配对。`QdrantVectorStore.search` 与 `textSearch` 共用这份过滤；Qdrant 的 Filter 是数据库召回约束，之后应用层还会做状态和权限复核。
+
+### 【vector / fulltext / hybrid 在代码里究竟执行什么】
+
+[HybridRetriever](../packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 将三种模式变成明确的检索路径：
+
+| 模式 | 实际动作 | 需要 Dense Query Embedding？ |
+| --- | --- | --- |
+| `vector` | Ollama Embed Query → `Qdrant client.query({using:'dense'})` | 是 |
+| `fulltext` | `bm25Document(Query)` → `Qdrant client.query({using:'bm25'})` | 否 |
+| `hybrid` | Dense 与 BM25 并行召回 → 组内加权 RRF | 是 |
+
+Qdrant 代码的两条路径分别为：
+
+~~~typescript
+// Dense：向量由当前空间的 Ollama 模型产生
+await this.client.query(this.collectionName, {
+  query: options.vector,
+  using: 'dense',
+  filter,
+  limit: options.topK,
+  score_threshold: options.threshold ?? 0,
+})
+
+// BM25：Query 原文由 Qdrant 原生推理产生稀疏表示
+await this.client.query(this.collectionName, {
+  query: bm25Document(options.query.trim()),
+  using: 'bm25',
+  filter,
+  limit: options.topK,
 })
 ~~~
 
-[hybrid-retriever.ts](../packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 中虽然已有 RRF，但那是把**单一路径向量召回**与**单一路径全文召回**按排名融合，并不是对多个模型／Collection 的检索结果做路由与跨空间融合。
+新 `textSearch()` 已经不再调用 `scroll(limit:1000)` 后逐条 `includes()` 或在 Node.js 用正则统计词频，而是从 Qdrant 稀疏索引返回 BM25 排名。BM25 与 Dense 仍然各自有局限：精确术语通常更利于词项匹配；同义改写通常更利于语义模型。`threshold` 仅作用于 Dense，不应直接拿 0～1 的 Cosine 阈值过滤 BM25 或 RRF。
 
-当前所谓“全文检索”来自 [qdrant-store.ts](../packages/ai-engine/src/knowledge/store/qdrant-store.ts) 的 `textSearch()`：`scroll(limit: 1000)` 后在 Node.js 内匹配文本，不是独立的 BM25 词项索引，也不能作为完整的跨模型词法召回能力来假定。
+## 【六、结果融合：为什么同时有“组内”和“跨空间”两层】
 
-**已核实的项目结论**：数据库可保存每库模型配置；单库搜索 API 选择该库模型；离线存储和在线查询仍共用固定 Collection；工作流多库检索只使用一份查询向量。项目目前**未实现**完整多向量空间存储和跨模型查询。
+### 【先看分数含义，再决定如何排序】
 
-## 【三、不同 Embedding 模型的离线入库如何设计】
+假设 Model-A 的候选分数为 0.82（Dense Cosine），Model-B 的某候选 BM25 分数为 5.7；这两个值不是同一量纲，不能简单相加。甚至两个 Dense 模型都使用 Cosine，其训练结果和分数分布也不一定可比。项目采用基于**排名**而非原始分数的 Reciprocal Rank Fusion（RRF）。
 
-目标是让每条向量在写入时就确定属于哪个空间，而不是等查询时根据向量长度猜测模型。
-
-~~~text
-上传文档（documentId、knowledgeBaseId、文本）
-        ↓
-读取知识库当前 Embedding 配置及版本
-        ↓
-解析或创建 embeddingSpaceId → collectionName
-        ↓
-按原有 Chunking 策略生成 TextChunk
-        ↓
-按该空间的 Document Encoding 规则批量 Embedding
-        ↓
-校验返回数量、维度、数值与目标 Collection Schema
-        ↓
-写入与该空间对应的 Qdrant Collection
-        ↓
-记录 Document 的索引空间／索引版本／处理状态
-~~~
-
-以一份文档为例：`knowledgeBaseId = kb-C`，配置为 Model-B / 768 维。文档被切成 5 个 Chunk 时，所有 Chunk 都使用 Model-B Document Encoder 生成 768 维向量，写入由 Model-B 向量空间标识映射出的 Collection，并保留 `documentId`、`knowledgeBaseId`、`chunkIndex`、`metadata`。**同一批 Document 向量不应该因模型响应异常而自动改用 Model-A，或随意填充／截断向量以凑维度。**
-
-### 【按向量空间分 Collection：建议作为现有项目的渐进式方案】
-
-~~~text
-Qdrant
-  ├── knowledge_space_A
-  │     ├── kb-A 的 Point
-  │     └── kb-B 的 Point
-  └── knowledge_space_B
-        └── kb-C 的 Point
-~~~
-
-一个 Collection 对应一种受版本约束的向量空间，多个知识库可共用空间并通过 Payload Filter 区分。**不是每个知识库单独创建 Collection**；Qdrant 官方明确提示，大量小 Collection 会带来资源开销，通常不建议按用户、文档等细粒度无差别创建。
-
-建议设计一个明确的映射层，由同一个 `resolveEmbeddingSpace()` 同时供离线写入、在线检索、重新索引、按库删除使用。仅修改离线 `collectionName` 而不同步检索和删除接口，会导致写入成功但读取不到数据或留下孤儿向量。
+当前 [rank-fusion.ts](../packages/ai-engine/src/knowledge/retriever/rank-fusion.ts) 核心计算：
 
 ~~~typescript
-// 建议示意：仅说明配置解析与路由职责，不是现有项目可直接调用的 API。
-type ResolvedKnowledgeBase = {
-  id: string
-  embeddingSpaceId: string
-  collectionName: string
-  model: string
-  dimensions: number
-}
-
-function groupByEmbeddingSpace(
-  bases: ResolvedKnowledgeBase[]
-): Map<string, ResolvedKnowledgeBase[]> {
-  const groups = new Map<string, ResolvedKnowledgeBase[]>()
-  for (const kb of bases) {
-    const group = groups.get(kb.embeddingSpaceId) ?? []
-    group.push(kb)
-    groups.set(kb.embeddingSpaceId, group)
-  }
-  return groups
-}
+const contribution = list.weight / (60 + rank + 1)
+const key = evidenceKey(result)
+candidates.set(key, {
+  ...result,
+  score: (previous?.score ?? 0) + contribution,
+  scoreType: 'rrf',
+  sources: [...(previous?.sources ?? []), ...originInfo],
+})
 ~~~
 
-Collection 命名建议使用稳定、受约束的空间标识，而不是直接拼接用户可输入的模型名称；服务端应保存 `embeddingSpaceId → collectionName` 的映射。模型更换时需创建新空间或显式启动迁移，不应让旧模型的 Point 默默变成新模型的向量。
+上面是对实际代码关键语句的简化展示，完整 `sources` 处理详见源码。对同一证据，RRF 在其出现的每份有权重候选列表中累加 `weight/(60+rank)`。组内 `hybrid` 使用 `vectorWeight` 与 `1-vectorWeight` 分别作为 Dense/BM25 权重；跨空间列表则使用等权重 1。融合结果按 RRF 分数降序，分数相同时按稳定的证据键排序。
 
-### 【Named Vectors 是另一种可选方案】
+[HybridRetriever.hybrid](../packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts) 先将每一路候选数扩充为 `ceil(topK×1.5)`（上限 100），通过 `fuseRankedLists(...)` 合并，截取本空间候选列表；随后 [MultiKnowledgeRetriever](../packages/ai-engine/src/knowledge/retriever/multi-knowledge-retriever.ts) 对不同空间的候选列表再次 RRF，并最后按节点的全局 `topK` 截断。跨空间默认候选数量 `min(100,max(20,topK×4))`，不是每个模型最后各返回 5 条直接拼接。
 
-Qdrant 支持同一 Collection 的 Point 包含多个不同维度的**命名向量**。例如配置：
+去重不能只看正文是否相似。当前 `evidenceKey()` 将 `knowledgeBaseId`、`indexId`、`documentId` 和 `chunkId` 拼为身份，确保同一个 Chunk 在 Dense/BM25 中命中时能够融合，但新旧索引版本即使内容相似也不会错误合并为同一条记录。
 
-~~~json
-{
-  "vectors": {
-    "dense_model_a": { "size": 1024, "distance": "Cosine" },
-    "dense_model_b": { "size": 768, "distance": "Cosine" }
-  }
-}
-~~~
+`RetrievalResult` 保留 `scoreType`（`cosine`、`bm25`、`rrf`）、`sources`（各来源分数、名次、空间及索引版本）、`metadata` 与正文；`KnowledgeExecutor` 的 JSON 输出以 `{...r}` 保留这些字段，而 `text` 输出仍按原有方式拼接文本。
 
-注意这段是**Qdrant Collection 配置示例**。实际写入 Point 和查询都要指定正确的向量名称（`using` 等），当前 AI Flow 的匿名 `vector: number[]` 写法不能不改就支持它。
+**RRF 的重要边界**：不同 Collection 的 Chunk 列表往往没有交集，同名次可能得到相同贡献，最终结果并不代表模型相关性已“统一标定”。当前项目**没有实现统一 Reranker**，也不能凭“有两层 RRF”就断言 Evidence Recall/nDCG 已得到提升。需要使用问题-证据标注集做跨空间排序评测。
 
-Named Vectors 适合同一个逻辑 Point 的 Payload 需要多种向量表示、需要在同一集合内发起多路检索或多模态检索的场景。对于知识库各自只使用一个模型、模型分组可能独立扩缩容的当前场景，按空间分 Collection 更便于保持写入、查询和生命周期的一致性。两种方案都不是永远正确：若日后要为**同一 Chunk** 同时建立多个模型的向量，可再评估 Named Vectors。
+## 【七、权限与可见性：检索范围不是客户端传来的任意 ID】
 
-## 【四、一次查询怎样检索多个不同模型的知识库】
+当前 [KnowledgeRetrievalService 业务适配器](../apps/workflow/lib/services/knowledge-retrieval.ts) 支持两种服务端作用域：
 
-### 【先确定查询范围，不能先向全部模型广播】
+- `{kind:'user', userId}`：单知识库 API 与编辑器测试，需确认库归属当前登录用户；
+- `{kind:'published', appId, publishedAppId}`：API Key、SSE 和公开 WebApp，需确认应用仍已发布、发布版本仍激活、指定库在发布节点静态声明范围内，并且仍归属应用所有者。
 
-假设一次工作流请求指定 `knowledgeBaseIds = ['kb-A', 'kb-B', 'kb-C']`。首先验证调用者是否对每个知识库有权访问，读取这些知识库的有效配置和可用索引版本，再按 `embeddingSpaceId` 分组。不能用“Qdrant 可以跨 Collection 查询”代替授权；Qdrant 的 `knowledgeBaseId` Payload Filter 也不应取代应用层身份权限校验。
-
-经过分组：
+发布时由 [collectPublishedKnowledgeBaseIds](../packages/ai-engine/src/knowledge/published-knowledge.ts) 读取知识节点中的静态 `knowledgeBaseIds`，不接受动态变量在调用期间扩大知识库范围；[publish API](../apps/workflow/app/api/apps/%5Bid%5D/publish/route.ts) 还检查库归属和 READY 索引。实际服务适配器分别位于 [workflow](../apps/workflow/lib/services/knowledge-retrieval.ts)、[api-server](../apps/api-server/src/modules/workflow/knowledge-retrieval.ts)、[webapp](../apps/webapp/lib/services/knowledge-retrieval.ts)。
 
 ~~~text
-输入：Query = “员工年假如何申请？”
-授权知识库 = [kb-A, kb-B, kb-C]
+用户登录的编辑器测试：
+  当前用户身份 → 校验知识库归属 → 解析活动 READY 索引
 
-EmbeddingSpace-A：kb-A、kb-B
-EmbeddingSpace-B：kb-C
+公开/发布调用：
+  激活发布版本 → 收集快照静态知识库 ID
+              → 逐库核验归属及 READY 活动索引
+              → 只允许快照范围的检索
 ~~~
 
-然后只对每组调用一次对应的 Query Encoder（同组查询结果也可以按 Query + 空间 ID 做受控缓存）：
+**快照冻结的是节点可访问的知识库 ID，不是知识库正文快照**：发布后同一知识库新完成的文档可以进入后续检索；取消发布、库归属变化、活动索引切换或删除标记会在执行时重新检查。`filterVisibleResults` 还会去 PostgreSQL 查询 `DocumentIndex.status='READY'`、文档和知识库未删除、`(documentIndexId, documentId, indexId)` 配对正确。`MultiKnowledgeRetriever` 在查询前、查询后及输出前再次确认授权/索引版本和数据可见性，避免“Qdrant 已返回旧 Point”直接变成可引用证据。
 
-~~~text
-同一条原始 Query
-        ↓
-按 EmbeddingSpace 去重
-        ├── QueryEncoder-A(query) → vector-A → Collection-A，过滤 kb-A、kb-B
-        └── QueryEncoder-B(query) → vector-B → Collection-B，过滤 kb-C
-                                     ↓
-                            各组候选 TopK
-                                     ↓
-                           统一证据候选列表
-~~~
+这也说明为什么 `KnowledgeExecutor` 不应该相信普通 `WorkflowInput` 中的 `userId` 或 `collectionName`：它们可以被调用者伪造。模型调用、数据访问和授权的装配需要发生在可信业务服务端。
 
-**特殊情况**：
-- 只检索 kb-A：只编码 Model-A 一份 Query。
-- 同时检索 kb-A / kb-B 且它们共用空间：只编码一份 Query，向量检索用 `knowledgeBaseId IN [...]` 过滤。
-- 同时检索 kb-A / kb-C 且模型不同：编码两份 Query，分别检索，结果在应用层合并。
-- 仅做独立词法检索：不需要 Dense Query Embedding，但仍需使用真正覆盖目标索引范围的词法检索服务。
+## 【八、当前实现的选择、未完成部分与验证方法】
 
-### 【路由的接口与伪代码】
+### 【为什么采用按空间分 Collection，而不是所有库共享一个向量表】
 
-建议把跨库聚合置于 **Retrieval Orchestrator**，而不是让原本封装单个模型及单个向量库的 `HybridRetriever` 在内部偷偷判断所有知识库的配置。
+| 方案 | 可行性 | 当前取舍 |
+| --- | --- | --- |
+| 所有库共享匿名 Dense Collection | 只能满足单一维度/空间；相同维度的异模型会语义污染 | 已停止作为新索引方案 |
+| 每个 KnowledgeBase 建独立 Collection | 可隔离，但同模型多库重复索引资源，库数量扩大后管理开销增加 | 当前未采用 |
+| 每个不可变 Embedding Space 一个 Collection | 各模型有独立 Dense Schema；同空间多库可共享 Query Embedding 和 Collection，并通过 KB/Index Filter 隔离 | **当前已实现** |
+| 同一个 Point 配多套 Dense Named Vectors | 适合同一 Chunk 要由多种模型表示、进行多 Dense 查询的情况 | 当前不需要；命名 `dense` 不等于多模型多 Dense |
 
-~~~typescript
-// 建议伪代码：具体仓库依赖注入、鉴权、错误类型和结果 Schema 需另行落地。
-async function retrieveAcrossKnowledgeBases(
-  query: string,
-  requestedKbIds: string[],
-  principal: Principal
-): Promise<RetrievalResult[]> {
-  // 先鉴权并加载每个知识库的有效 Embedding Space。
-  const bases = await authorizeAndResolveBases(principal, requestedKbIds)
-  const groups = groupByEmbeddingSpace(bases)
+Qdrant 的 Collection 在这里不是独立的 PostgreSQL 数据库；当前仍使用 Qdrant 服务，Collection 由不可变空间指纹寻址。`bm25` 虽然共用命名字段，但其词项协议冻结为一个 `BM25_CONFIG_ID`；不同 Dense Space 仍要向各自 Collection 发送 BM25 Query，不能因 BM25 编码器相同而误认为一个查询自动搜索了所有 Collection。
 
-  const resultLists = await Promise.all(
-    [...groups.values()].map(async group => {
-      const space = await loadEmbeddingSpace(group[0].embeddingSpaceId)
-      const queryVector = await encodeQuery(space, query)
-      assertQueryVectorCompatible(space, queryVector)
+### 【状态边界和运行前提】
 
-      return searchCollection({
-        collectionName: space.collectionName,
-        vector: queryVector,
-        knowledgeBaseIds: group.map(kb => kb.id),
-        topK: 20,
-      })
-    })
-  )
+此次代码覆盖了存储空间、索引版本、任务生命周期与权限链路；但**代码存在不等于业务数据已部署、真实模型已安装或检索效果达标**。当前仓库中包含 [multi-knowledge 单元测试](../packages/ai-engine/src/knowledge/__tests__/multi-knowledge.test.ts)、[Qdrant Store 测试](../packages/ai-engine/src/knowledge/__tests__/qdrant-store.test.ts)、[知识库生命周期集成测试](../packages/ai-engine/tests/integration/knowledge-lifecycle.test.ts)。集成测试用 `KNOWLEDGE_INTEGRATION_DATABASE_URL` 和 `QDRANT_INTEGRATION_URL` 控制条件运行：缺少这些环境变量时会 skip，不能只看测试文件存在就声称在目标业务环境跑通。
 
-  const candidates = mergeAndDeduplicate(resultLists)
-  return rerankAndSelect(query, candidates, 5)
-}
-~~~
+[Docker Compose](../docker/docker-compose.yml) 已将 Qdrant 镜像固定为 `qdrant/qdrant:v1.16.2`；部署仍需要应用迁移、实际 Ollama 模型、`DATABASE_URL`、`QDRANT_URL`、常驻 worker 及发布入口的端到端验证。原独立实施计划提到过一份“部署与验证记录”，但本次仓库读取未找到该文件，因此这里不作不存在的记录引用，也不据此声称已复核完整线上验收结果。
 
-上述名称 `Principal`、`authorizeAndResolveBases()`、`encodeQuery()`、`mergeAndDeduplicate()` 等都为**建议抽象，不是仓库已有函数**。
+### 【验收应从实际输入到最终证据逐层进行】
 
-跨库与同库差异主要发生在**召回编排层**：下游 Chunk 仍保留统一的 `knowledgeBaseId`、`documentId`、`chunkId`、`content`、`metadata`，最后再做 Context Construction 和引用，不要求下游 LLM 理解多个向量空间的数学细节。引入多模型后也需要保留证据来源和空间版本，以便复核检索结果。
-
-## 【五、多个模型的检索结果为什么不能按原始分数直接排序】
-
-设两个模型各返回候选：
-
-| 检索来源 | Chunk | 相似度（教学示例） |
-| --- | --- | ---: |
-| Model-A | 年假申请流程 | 0.82 |
-| Model-B | 休假审批规定 | 0.91 |
-
-这两个分数的生成空间、训练分布和标定方式不同。**不能仅凭 0.91 大于 0.82 就认定第二段证据更相关。**即使同为 Cosine 分数，也不意味着跨模型已经校准。
-
-常用处理思路：
-
-**第一步：每个空间独立召回候选。** 各组设置合理候选数，避免最终 TopK=5 时某个空间的潜在证据因过早截断而丢失。空间内可以保留本模型的相似度和阈值校验；跨模型不能直接套用一个通用阈值。
-
-**第二步：合并、去重，保留来源。** 返回类型至少携带 `chunkId`、`documentId`、`knowledgeBaseId`、`embeddingSpaceId`、`sourceRank`、`sourceScore`。合并不能丢失用于引用、授权复核和故障归因的信息。
-
-**第三步：使用适合跨模型的统一排序机制。**
-
-- **RRF（Reciprocal Rank Fusion）**按照各列表中的名次而非原始相似度累积分数。经典形式：对于候选 d，将所有包含 d 的列表贡献 `1 / (k + rank(d))` 相加（使用的名次起点和常数由实现定义）。它避免直接比较异构模型的距离尺度。
-- **统一 Reranker**把 Query 与不同来源的文本 Chunk 交给同一个相关性模型评分，然后选择最终 TopK。它能在跨模型候选来源不一致时，提供更统一的证据相关性判断；仍须对延迟、费用和质量进行验证。
-- **工程推荐**：先按空间完成召回，形成足够大的候选池；跨空间优先考虑统一 Reranker，需要时辅以 RRF；通过标注集比较不同融合方案，而不是预设某个一定更优。
-
-RRF 的一个重要边界：如果每个知识库只有自己独有的 Chunk、不同空间结果列表几乎没有重合，则同名次的结果容易获得相同或接近的 RRF 分数。此时 RRF 更接近**按排名交错合并**，未必能判断两个列表中究竟哪个第一名更适合回答。因此不能把“支持 RRF”直接等同于“已经实现可靠的跨模型相关性排序”。
-
-项目当前 `HybridRetriever` 的 RRF 用于向量检索和简易文本匹配结果融合；跨模型多 Collection 的排序、统一 Reranker 与两者的效果评测均**尚未实现**。Qdrant Query API 的多路 `prefetch + RRF` 可用于同一 Collection 内的多向量查询；对于此处采用的**不同 Collection**，仍需要由应用层协调结果，不应误认为一次 Qdrant Collection 查询即可自动搜索全部集合。
-
-## 【六、当前结构之外必须同时考虑的工程边界】
-
-### 【6.1 一份知识库改用新模型，不等于只改 model 字符串】
-
-知识库已有文档向量是由旧模型生成的。若把知识库配置直接指向新模型而不重建索引，在线 Query Encoder 与旧 Document Encoder 将不匹配。对于维度相同的新模型尤其隐蔽，因为数据库可能不报错。
-
-安全迁移应按版本处理：
-
-~~~text
-旧索引 space-A（持续服务查询）
-        ↓
-创建 space-B（保留旧索引）
-        ↓
-从可信原始文档重新切分／重新 Embedding
-        ↓
-校验 space-B 的覆盖、查询结果和权限
-        ↓
-原子切换知识库的 activeEmbeddingSpace / indexVersion
-        ↓
-监控、可回滚；清理不再被引用的旧版本
-~~~
-
-这只是**建议迁移流程**，不是 AI Flow 已有的索引版本机制。离线任务开始时应持久化采用的模型、配置和索引版本快照；上传期间临时修改知识库模型不应让同一批 Chunk 有的用旧模型、有的用新模型。原模型 `:latest` tag 变化也应按相同原则审查。
-
-### 【6.2 读取、删除和更新也必须按空间定位】
-
-当前 `deleteDocumentVectors(documentId)` 通过固定 `knowledge_chunks` 删除；知识库删除接口中还有 `TODO: 同时删除 Qdrant 中的向量数据`。引入多 Collection 后，删除不可以靠遍历所有可能集合猜测，而应由文档索引记录解析其所在空间，删除目标版本的 Point，并核对是否存在迁移中的新旧双版本。
-
-PostgreSQL 文档记录和 Qdrant Point 不是同一个事务。模型迁移、并发删除和重试需要额外的状态、幂等键及清理策略；本篇不将其误写成已经具备的跨库事务保证。
-
-### 【6.3 模型服务失败与部分空间召回失败】
-
-多模型查询会增加一次请求涉及的模型调用数量和失败点。假设 Model-A 正常、Model-B 超时，系统要显式决定：
-- **严格模式**：整个查询失败，避免以不完整证据回答；
-- **允许降级模式**：仅返回 Model-A 已授权且有效的结果，但必须向调用方标明未覆盖的知识库与失败空间，不能伪装成完整召回。
-
-这些行为应按业务安全与答案完整性要求定义；特别是合规、权限或高风险场景，不能在未声明的情况下静默降级。针对同一空间的 Query Embedding 可以去重、缓存或适度并发，但不能以牺牲鉴权范围为代价。日志中优先记录空间、耗时、模型版本、结果数量及错误分类，不默认输出原始敏感 Query／Document 内容。
-
-### 【6.4 模型空间数量和查询成本】
-
-每新增一个不同向量空间，查询可能多一次模型调用和一个检索请求，因此查询时延、显存占用和内存成本会增长。空间数很多时，可以考虑需求限定的知识库选择、语义或规则路由、批量编码、缓存和受控并发，不应默认向全部模型广播。反过来，也不应在未取得覆盖率基线前通过过度路由过滤掉本该被召回的知识库。
-
-## 【七、适用于当前项目的渐进式改造方案】
-
-建议分阶段推进，不一次性重写所有检索能力。
-
-### 【第一阶段：建立向量空间身份并统一写入／读取配置】
-
-1. 在数据库中增加向量空间记录或可核查的 `embeddingSpaceId` 映射，绑定模型、权重版本、维度、编码策略和 Collection。知识库持有当前活跃的索引空间；文档或索引任务持有写入快照。
-2. 将 `document-processor.ts` 的固定 `collectionName: 'knowledge_chunks'` 改为统一的空间解析结果；仍保留现有 Chunk 与 Embedding 完整性校验。
-3. 将单知识库搜索 API 的 Collection 也由同一解析器获取；保证上传与查询读取同一空间。
-4. 删除和重建索引等生命周期操作同步依据空间记录执行，不因名称变化遗留孤儿数据。
-5. 对当前共享集合中的历史 Point 先做模型来源清点和迁移方案，不能直接变更原 Collection Schema 或假设旧数据都属于新空间。若当前实际只有一种默认模型，可评估保留旧集合为默认空间并做兼容映射。
-
-### 【第二阶段：工作流多知识库分组检索】
-
-1. 在工作流侧通过受控服务加载并授权 `knowledgeBaseIds`，将配置注入 AI Engine；避免让底层通用引擎直接依赖 Prisma。
-2. 将 `KnowledgeExecutor` 的单实例 Embedding 检索改为按 `embeddingSpaceId` 分组、每组独立 Query Embedding、按组 Collection + Payload Filter 召回。
-3. 将跨空间合并、去重和统一重排放在检索编排层，原有单空间 `HybridRetriever` 作为可复用的组内检索组件。
-4. 定义各组失败的整体错误或明确降级返回方式，并让 `results` 输出保留来源、路径与缺失覆盖范围。
-
-### 【第三阶段：通过数据评估是否有必要提升复杂度】
-
-比较单模型基线、跨空间 RRF、跨空间统一 Reranker 等组合；记录查询向量生成次数、检索延迟、候选数量、最终 Evidence Recall／nDCG、引用正确性、错误率及单位查询成本。没有充分收益证据前，不急于把同一 Chunk 建立多套 Named Vectors，也不把多模型路由和模型迁移做成一个难以验证的大改动。
-
-**本次文档只提出改造路线；以上第一至第三阶段均未因创建本文而自动落实到代码。**
-
-## 【八、验证思路与典型追问】
-
-| 场景 | 预期行为与验收重点 |
+| 需要回答的问题 | 可复核的测试与期望 |
 | --- | --- |
-| A/B 使用完全兼容的同一空间 | 一次 Query Embedding；统一过滤 A/B；返回结果有完整来源 |
-| A/C 使用不同维度 | 两份向量分别命中各自 Collection；不会尝试把 768 维写入 1024 维匿名字段 |
-| A/C 同为 1024 维但不同模型 | 系统按空间 ID 隔离，不能仅凭维度相等合并搜索 |
-| A/C 中 C 未授权 | C 既不参与空间路由，也不出现在 Qdrant Filter、候选或最终回答中 |
-| C 的模型服务超时 | 严格失败或显式部分结果；不能将 C 的向量偷偷替换成 A 的向量 |
-| A 从旧模型迁移到新模型 | 旧查询持续可用，目标空间数据完成并验证后切换，失败可回滚 |
-| 同一问题通过不同模型返回高分 | 不直接比较原始 Cosine 分数，以标注证据集检查融合与重排质量 |
-| 用户只查一个知识库／仅全文检索 | 不额外调用不需要的 Embedding 模型 |
+| 同模型、同空间两个知识库 | 一次 Query Dense Embedding；Filter 严格限定两对 KB/Index |
+| 不同维度（如 1024/768） | 对应空间各自生成正确维度并进入匹配 Collection；不补零、不截断 |
+| 维度相同但模型不同 | `EmbeddingSpace` digest/协议指纹不同；不能误共享 Collection |
+| BM25 是否真替换旧扫描 | `fulltext` 只调用 `using:'bm25'`，不请求 Dense；超过 1000 Chunk 仍可通过词项索引召回 |
+| `hybrid` 与 TopK | Dense + BM25 组内 RRF，空间间 RRF；最终统一 TopK；原始分数与来源保留 |
+| 中文及技术词 | 测试完整中文、空白/标点、`E1042`、`C++` 等；区分词项匹配与精确身份匹配 |
+| 未授权、撤权、重建、删除 | 在调用前后校验当前库/索引状态；只返回 READY 的存活文档 |
+| 宕机、任务失败、并发删除 | 重试租约恢复、状态幂等、软删即时隐藏、清理补偿可追踪 |
+| 发布态执行 | 静态知识库 ID 快照 + 当前应用拥有者权限；取消发布或索引不可用时拒绝 |
+| 检索质量和成本 | 固定 Qrels，比较 Dense、BM25、Hybrid 的 Evidence Recall@K、MRR/nDCG、耗时和失败率 |
 
-面试时可以沿一条逻辑回答：**先判断向量空间是否兼容 → 决定离线存储隔离粒度 → 在线按授权知识库及空间分组 → 每个空间各自生成查询向量与召回 → 对异构候选进行统一融合和证据验证 → 说明模型迁移、失败和成本边界。** 重点不是强调“一定要生成很多向量”，而是说明为什么**查询向量必须与其目标索引所使用的编码协议配对**。
+### 【仍需继续验证与演进的点】
 
-## 【资料与源码索引】
+1. **真实部署与模型可用性**：不同 Ollama 模型的 digest、维度、吞吐与超时要在实际目标环境完成联调；现有端到端代码并不自动保证每种模型已安装。
+2. **中文 BM25 词项质量**：`multilingual` Tokenizer 不保证业务编号整体匹配；对明确需要完全相等的合同编号、工单号应再设计精确字段匹配或额外 Analyzer，不应把 BM25 相关性检索当作业务主键查询。
+3. **分数校准和全局排序**：当前 Dense threshold 仍是全空间共用的节点参数，不具备按模型概率意义的自动标定；多列表 RRF 的平分和来源公平性需要标注集，必要时引入统一 Reranker。
+4. **可用性取舍**：重建期间不允许查询和上传；若将来需求要求零停机，就要另外设计旧索引服务与新索引构建的版本切换，不能把未实现的双写/回滚描述成现状。
+5. **跨系统一致性**：PostgreSQL 与 Qdrant 不具备单个原子事务，依靠工作任务、版本状态、最终授权过滤维持“未准备好的数据不对外可见”；应通过故障注入检验极端并发下的补偿和清理。
+6. **检索资源消耗**：空间数量增加会放大 Query Embedding 与 Qdrant 请求；当前限制并发数和候选数，但需要基于真实负载评估缓存、限流、按需路由。超时由 `Promise.race` 实现，不代表底层外部调用已被真正取消。
 
-项目源码：
-1. [知识库 Prisma 模型与默认配置](../apps/workflow/prisma/schema.prisma)——`KnowledgeBase`。
-2. [知识库创建 API](../apps/workflow/app/api/knowledge/route.ts)、[详情与更新 API](../apps/workflow/app/api/knowledge/%5Bid%5D/route.ts)——当前模型配置的对外读写边界。
-3. [文档上传接口](../apps/workflow/app/api/knowledge/%5Bid%5D/documents/route.ts)、[Document Processor](../apps/workflow/lib/services/document-processor.ts)——离线配置传递、Embedding 与写入。
-4. [QdrantVectorStore](../packages/ai-engine/src/knowledge/store/qdrant-store.ts)、[向量检索相关类型](../packages/ai-engine/src/knowledge/types.ts)——Collection、Payload Filter 与 Point。
-5. [单知识库检索 API](../apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts)、[HybridRetriever](../packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)、[KnowledgeExecutor](../packages/ai-engine/src/nodes/executors/knowledge-executor.ts)——单库与多库检索差异及当前 RRF 使用范围。
+## 【九、从源码到面试回答：为什么这样设计、怎样验证】
 
-官方参考：
-1. [Qdrant：Collections](https://qdrant.tech/documentation/manage-data/collections/)——单向量字段维度／距离约束及 Named Vectors。
-2. [Qdrant：Vectors](https://qdrant.tech/documentation/manage-data/vectors/)——Named Vectors 的存储模型。
-3. [Qdrant：Hybrid and Multi-Stage Queries](https://qdrant.tech/documentation/search/hybrid-queries/)——Prefetch、RRF、DBSF 及融合机制。
-4. [Qdrant：FAQ](https://qdrant.tech/documentation/faq/)——Named Vectors 与独立 Collections 的选型，避免过多小集合。
-5. [Qdrant：Multitenancy](https://qdrant.tech/documentation/examples/multitenancy/)——共享 Collection 下的 Payload 过滤隔离。
-6. [Qdrant：Embedding Model Migration](https://qdrant.tech/documentation/tutorials-operations/embedding-model-migration/)——向量模型迁移的不同策略；实际能力应核对部署的 Qdrant 版本。
+**问题一：一次查询多个不同维度知识库，必须生成几份向量？** 不按知识库数量算，而按本次授权目标中的兼容 Embedding Space 数量算。A/B 同空间、C 另一空间，则 Dense Query Embedding 两次。BM25 为独立的词项检索路径，`fulltext` 模式不需要 Dense Query；三个知识库依然分别由空间和索引范围过滤。
+
+**问题二：为何不同模型同为 1024 维仍要隔离？** 向量维度只决定张量形状，不定义坐标语义。此项目使用模型 digest、模型名、维度、距离、编码版本及 BM25 协议生成空间指纹，防止同维异模型混存。
+
+**问题三：为何引入 DocumentIndex 而非只存 Document.status？** 同一文档可能经历多个知识库索引版本，只有 `DocumentIndex(documentId, knowledgeBaseIndexId)` 才能准确说明哪一份向量已构建完成；Qdrant 返回旧 Point 时也能够依该状态拒绝不可用证据。
+
+**问题四：为什么 BM25 也叫 Sparse Vector？** 这是 Qdrant 为词项及权重提供的检索表示，不是 Dense Embedding；当前通过原生 `qdrant/bm25` 把 Query/Document 文本交给推理接口并生成稀疏索引。它擅长词项匹配，和 Dense 的语义召回互补。
+
+**问题五：多个空间的分数如何统一？** 不直接相加 Cosine 和 BM25，也不能跨不同模型直接比 Cosine。当前按候选排名做空间内加权 RRF 和空间间等权 RRF，保留来源原始分数；最终 TopK 统一裁剪，效果仍需 Qrels 评测。
+
+**问题六：如何保证异步入库和删除可靠？** 上传原子创建任务，worker 认领后带租约执行，Point 身份按版本稳定生成，索引 READY 后才可检索；删除先设置 `deletedAt` 即时隐藏，再用持久清理任务删除历史 Point。它是可恢复的最终一致性流程，不是跨 PostgreSQL/Qdrant 的分布式原子事务。
+
+## 【源码与官方参考资料】
+
+**源码主链路**：
+- [Prisma 模型与索引版本状态](../apps/workflow/prisma/schema.prisma)、[Embedding Space 创建](../apps/workflow/lib/services/embedding-space-service.ts)、[模型 digest 获取](../packages/ai-engine/src/knowledge/embeddings/model-revision.ts)
+- [知识库创建 API](../apps/workflow/app/api/knowledge/route.ts)、[配置更新](../apps/workflow/app/api/knowledge/%5Bid%5D/route.ts)、[索引重建 API](../apps/workflow/app/api/knowledge/%5Bid%5D/reindex/route.ts)
+- [文档上传](../apps/workflow/app/api/knowledge/%5Bid%5D/documents/route.ts)、[任务排队与重建](../apps/workflow/lib/services/knowledge-index-service.ts)、[文档处理](../apps/workflow/lib/services/document-processor.ts)、[Worker](../apps/workflow/lib/services/knowledge-worker.ts)
+- [BM25 固定协议](../packages/ai-engine/src/knowledge/bm25.ts)、[Ollama 向量编码](../packages/ai-engine/src/knowledge/embeddings/ollama-embeddings.ts)、[Qdrant Store](../packages/ai-engine/src/knowledge/store/qdrant-store.ts)
+- [单库检索 API](../apps/workflow/app/api/knowledge/%5Bid%5D/search/route.ts)、[授权索引解析](../apps/workflow/lib/services/knowledge-retrieval.ts)、[跨空间检索](../packages/ai-engine/src/knowledge/retriever/multi-knowledge-retriever.ts)、[组内 Hybrid](../packages/ai-engine/src/knowledge/retriever/hybrid-retriever.ts)、[RRF](../packages/ai-engine/src/knowledge/retriever/rank-fusion.ts)
+- [KnowledgeExecutor](../packages/ai-engine/src/nodes/executors/knowledge-executor.ts)、[引擎服务注入](../packages/ai-engine/src/core/engine.ts)、[发布态知识库静态声明](../packages/ai-engine/src/knowledge/published-knowledge.ts)
+- [代码级单元测试](../packages/ai-engine/src/knowledge/__tests__/multi-knowledge.test.ts)、[数据库与 Qdrant 生命周期集成测试](../packages/ai-engine/tests/integration/knowledge-lifecycle.test.ts)
+
+**官方机制参考**：
+- [Qdrant Collections](https://qdrant.tech/documentation/manage-data/collections/)、[Qdrant Vectors](https://qdrant.tech/documentation/manage-data/vectors/)、[Qdrant Hybrid Queries](https://qdrant.tech/documentation/search/hybrid-queries/)
+- [Qdrant BM25](https://qdrant.tech/documentation/inference/inference-bm25/)、[Qdrant v1.16.2 BM25 实现](https://github.com/qdrant/qdrant/blob/v1.16.2/src/common/inference/bm25.rs)
+- [Ollama Embed API](https://docs.ollama.com/api/embed)
 
